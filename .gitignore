@@ -1,5 +1,5 @@
 # Rust
-daemon/target/
+/target/
 **/*.rs.bk
 
 # Traces
