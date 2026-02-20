@@ -1,0 +1,13 @@
+# Rust
+daemon/target/
+**/*.rs.bk
+
+# Traces
+traces.jsonl
+*.jsonl
+
+# Node
+node_modules/
+
+# OS
+.DS_Store

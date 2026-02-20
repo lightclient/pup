@@ -1,0 +1,62 @@
+[workspace]
+members = [
+    "crates/pup-ipc",
+    "crates/pup-core",
+    "crates/pup-telegram",
+    "crates/pup-daemon",
+]
+resolver = "3"
+
+[workspace.lints.rust]
+elided_lifetimes_in_paths = "warn"
+missing_debug_implementations = "warn"
+single_use_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unreachable_pub = "warn"
+unsafe_code = "deny"
+unused_import_braces = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+derive_partial_eq_without_eq = "warn"
+needless_pass_by_value = "warn"
+or_fun_call = "warn"
+redundant_clone = "warn"
+significant_drop_tightening = "warn"
+clone_on_ref_ptr = "warn"
+dbg_macro = "warn"
+if_then_some_else_none = "warn"
+map_err_ignore = "warn"
+needless_raw_strings = "warn"
+print_stderr = "warn"
+print_stdout = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+str_to_string = "warn"
+undocumented_unsafe_blocks = "warn"
+unneeded_field_pattern = "warn"
+unwrap_used = "warn"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+dirs = "6"
+futures = "0.3"
+notify = "7"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
