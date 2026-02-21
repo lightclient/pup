@@ -509,12 +509,14 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::Connected { ref info } => {
                 self.sessions.push(info.clone());
 
-                // Topics mode: create a topic and post recent history.
+                // Topics mode: create (or reuse) a topic and post recent history.
                 if let Some(ref mut topics) = self.topics {
                     match topics.create_topic(&self.bot, info).await {
-                        Ok(thread_id) => {
-                            // Post recent history so the topic is immediately useful.
-                            if !info.history.is_empty() {
+                        Ok((thread_id, reused)) => {
+                            // Only post history for newly created topics.
+                            // Reused topics already have their history from the
+                            // previous daemon run.
+                            if !reused && !info.history.is_empty() {
                                 let msgs = format_history(
                                     &info.history,
                                     self.config.history_turns,

@@ -331,12 +331,48 @@ impl TopicsManager {
         }
     }
 
-    /// Create a topic for a new session.
+    /// Create or reuse a topic for a session.
+    ///
+    /// If a persisted mapping exists and the topic is still alive in Telegram,
+    /// reuses it (renaming to the current name). Otherwise creates a new one.
+    /// Returns `(thread_id, reused)`.
     pub async fn create_topic(
         &mut self,
         bot: &BotClient,
         info: &SessionInfo,
-    ) -> Result<i64> {
+    ) -> Result<(i64, bool)> {
+        // Check for an existing persisted topic.
+        if let Some(&thread_id) = self.session_topics.get(&info.session_id) {
+            let name = self.topic_name(info).await;
+            // Verify it still exists by attempting a rename.
+            match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
+                Ok(_) => {
+                    // Topic still alive — reuse it.
+                    self.thread_sessions
+                        .insert(thread_id, info.session_id.clone());
+                    info!(
+                        session_id = %info.session_id,
+                        thread_id,
+                        topic_name = %name,
+                        "reusing existing topic"
+                    );
+                    return Ok((thread_id, true));
+                }
+                Err(e) => {
+                    // Topic gone — clean up stale mapping.
+                    warn!(
+                        session_id = %info.session_id,
+                        thread_id,
+                        error = %e,
+                        "persisted topic gone, creating new one"
+                    );
+                    self.session_topics.remove(&info.session_id);
+                    self.thread_sessions.remove(&thread_id);
+                    self.known_threads.remove(&thread_id);
+                }
+            }
+        }
+
         let name = self.topic_name(info).await;
         info!(session_id = %info.session_id, topic_name = %name, "creating topic");
 
@@ -352,7 +388,7 @@ impl TopicsManager {
         self.save_state();
 
         info!(session_id = %info.session_id, thread_id, "topic created");
-        Ok(thread_id)
+        Ok((thread_id, false))
     }
 
     /// Delete the topic for a disconnected session.
