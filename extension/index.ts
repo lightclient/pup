@@ -561,54 +561,10 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	function teardown() {
-		// Stop timers.
-		if (namePollTimer) {
-			clearInterval(namePollTimer);
-			namePollTimer = null;
-		}
-		if (socketCheckTimer) {
-			clearInterval(socketCheckTimer);
-			socketCheckTimer = null;
-		}
-
-		// Broadcast session end.
-		broadcastEvent("session_end");
-
-		// Close all clients.
-		for (const client of clients) {
-			client.destroy();
-		}
-		clients.clear();
-
-		// Close server.
-		if (server) {
-			server.close();
-			server = null;
-		}
-
-		// Remove socket file.
-		if (socketPath) {
-			try {
-				fs.unlinkSync(socketPath);
-			} catch {
-				// ignore
-			}
-			socketPath = null;
-		}
-
-		// Remove alias.
-		if (aliasPath) {
-			try {
-				fs.unlinkSync(aliasPath);
-			} catch {
-				// ignore
-			}
-			aliasPath = null;
-		}
-	}
-
 	// ── Event subscriptions ─────────────────────────────────────
+	// No explicit teardown — when pi exits the process dies and the OS
+	// cleans up the socket. The daemon detects the broken IPC connection
+	// and deletes the topic.
 
 	pi.on("session_start", async (_event, ctx) => {
 		if (server) {
