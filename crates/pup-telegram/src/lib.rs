@@ -2,8 +2,8 @@ pub mod bot;
 pub mod dm;
 pub mod outbox;
 pub mod render;
-pub mod streaming;
 pub mod topics;
+pub mod turn_tracker;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -19,9 +19,9 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use bot::{BotClient, Update};
 use dm::{DmCommand, DmState, ResolveResult};
 use outbox::{Outbox, OutboxOp};
-use render::{escape_html, format_history, format_tool_call, format_user_message};
-use streaming::StreamingManager;
+use render::{escape_html, format_history, format_user_message};
 use topics::TopicsManager;
+use turn_tracker::TurnTracker;
 
 /// Configuration for the Telegram backend.
 #[derive(Debug, Clone)]
@@ -50,8 +50,8 @@ pub struct TelegramBackend {
     bot_user_id: i64,
     /// Outbox for rate-limited API calls.
     outbox: Outbox,
-    /// Streaming message manager.
-    streaming: StreamingManager,
+    /// Per-session turn tracker (single message per agent turn).
+    turn_tracker: TurnTracker,
     /// DM state (per-user, but we only support one user for now).
     dm: DmState,
     /// Topics manager (if topics mode enabled).
@@ -71,7 +71,7 @@ impl TelegramBackend {
     pub fn new(config: TelegramConfig) -> Self {
         let bot = BotClient::new(&config.bot_token);
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
-        let streaming = StreamingManager::new(config.edit_interval_ms);
+        let turn_tracker = TurnTracker::new(config.edit_interval_ms);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
@@ -91,7 +91,7 @@ impl TelegramBackend {
             bot,
             bot_user_id: 0,
             outbox,
-            streaming,
+            turn_tracker,
             dm: DmState::default(),
             topics,
             update_offset: 0,
@@ -574,75 +574,66 @@ impl ChatBackend for TelegramBackend {
             }
             SessionEvent::AgentStart { ref session_id } => {
                 debug!(session_id, "agent started");
-            }
-            SessionEvent::AgentEnd { ref session_id } => {
-                debug!(session_id, "agent ended");
-                // Flush any remaining outbox operations.
-                while self.outbox.flush_one().await {}
-            }
-            SessionEvent::MessageStart {
-                ref session_id,
-                ref message_id,
-            } => {
-                // Start streaming: send placeholder.
+
+                // Start a new turn — the tracker will send the first
+                // Telegram message lazily on the first tool/delta event.
                 if let Some(ref topics) = self.topics {
                     if let Some(thread_id) = topics.thread_for_session(session_id) {
-                        self.streaming.start_in_topic(
-                            message_id,
+                        self.turn_tracker.start_turn(
                             session_id,
                             topics.chat_id(),
-                            thread_id,
-                            &mut self.outbox,
+                            Some(thread_id),
                         );
                     }
                 } else if self.dm.attached.as_deref() == Some(session_id.as_str())
-                    && let Some(chat_id) = self.dm_chat_id {
-                        self.streaming
-                            .start(message_id, session_id, chat_id, &mut self.outbox);
-                    }
+                    && let Some(chat_id) = self.dm_chat_id
+                {
+                    self.turn_tracker.start_turn(session_id, chat_id, None);
+                }
+            }
+            SessionEvent::AgentEnd { ref session_id } => {
+                debug!(session_id, "agent ended");
+                self.turn_tracker.end_turn(session_id, &mut self.outbox);
+                // Flush any remaining outbox operations.
+                while self.outbox.flush_one().await {}
+            }
+            SessionEvent::MessageStart { .. } => {
+                // Nothing to do — the turn tracker already has the message.
             }
             SessionEvent::MessageDelta {
-                ref message_id,
+                ref session_id,
                 ref text,
                 ..
             } => {
-                self.streaming.delta(message_id, text, &mut self.outbox);
+                self.turn_tracker
+                    .message_delta(session_id, text, &mut self.outbox);
             }
             SessionEvent::MessageEnd {
-                ref message_id,
+                ref session_id,
                 ref content,
                 ..
             } => {
-                self.streaming.end(message_id, content, &mut self.outbox);
+                // Update the turn with the final content and flush an
+                // edit. Does NOT finalize the turn — AgentEnd does that.
+                self.turn_tracker
+                    .message_end_with_content(session_id, content, &mut self.outbox);
             }
             SessionEvent::ToolStart {
                 ref session_id,
                 ref tool_name,
                 ..
             } => {
-                if self.dm.verbose || self.config.verbose {
-                    debug!(session_id, tool_name, "tool started");
-                }
+                self.turn_tracker
+                    .tool_start(session_id, tool_name, &mut self.outbox);
             }
             SessionEvent::ToolEnd {
                 ref session_id,
                 ref tool_name,
-                ref content,
                 is_error,
                 ..
             } => {
-                if self.dm.verbose || self.config.verbose {
-                    let msg = format_tool_call(tool_name, &serde_json::Value::Null, content, is_error);
-
-                    // Send to topic.
-                    self.send_to_topic(session_id, &msg);
-
-                    // Send to DM if attached.
-                    if self.dm.attached.as_deref() == Some(session_id.as_str())
-                        && let Some(chat_id) = self.dm_chat_id {
-                            self.send_dm(chat_id, &msg);
-                        }
-                }
+                self.turn_tracker
+                    .tool_end(session_id, tool_name, is_error, &mut self.outbox);
             }
             SessionEvent::UserMessage {
                 ref session_id,
