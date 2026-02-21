@@ -1,0 +1,9 @@
+{
+  "name": "pup",
+  "version": "0.1.0",
+  "description": "Pickup your pi sessions on the go — bridge to Telegram and other chat platforms",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["extension"]
+  }
+}

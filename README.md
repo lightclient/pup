@@ -38,19 +38,29 @@ clients are connected.
 
 ## Install
 
+### Extension
+
+Install the pi extension so every pi session exposes its socket:
+
 ```bash
-# 1. Install the extension
+# via pi's package manager (recommended)
+pi install git:github.com/anthropics/pup
+
+# or manually
 mkdir -p ~/.pi/agent/extensions/pup
 cp extension/index.ts ~/.pi/agent/extensions/pup/
+```
 
-# 2. Build the daemon
+### Daemon
+
+```bash
+# build
 cargo build --release
-# binary at: target/release/pup
 
-# 3. Run setup (creates ~/.config/pup/config.toml)
+# run setup (creates ~/.config/pup/config.toml)
 ./target/release/pup setup
 
-# 4. Start
+# start
 ./target/release/pup
 ```
 
@@ -104,6 +114,7 @@ supergroup_id = -1001234567890
 ## Project structure
 
 ```
+├── package.json                Pi package manifest (for pi install)
 ├── extension/index.ts          Pi extension (TypeScript)
 ├── crates/
 │   ├── pup-ipc/                IPC protocol types + Unix socket client
