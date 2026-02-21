@@ -367,6 +367,101 @@ export default function (pi: ExtensionAPI) {
 		updateAlias(ctx);
 	}
 
+	// ── Slash command handling ──────────────────────────────────
+	// When a message arrives via IPC that starts with "/", check if it
+	// matches a pi slash command and execute it via the extension API
+	// instead of sending it to the LLM as a user message.
+	//
+	// pi.sendUserMessage() goes directly to the agent — it does NOT
+	// pass through the TUI's slash command parser. So "/new" would be
+	// interpreted as a conversation message by the LLM.
+
+	function handleSlashCommand(
+		client: net.Socket,
+		id: string | undefined,
+		message: string,
+		ctx: ExtensionContext,
+	): boolean {
+		const trimmed = message.trim();
+		if (!trimmed.startsWith("/")) return false;
+
+		// Parse: "/name foo bar" → cmd="name", args="foo bar"
+		const spaceIdx = trimmed.indexOf(" ");
+		const cmd = spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx);
+		const args = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+
+		switch (cmd) {
+			case "new":
+				if (savedNewSession) {
+					savedNewSession().catch(() => {});
+				} else {
+					// Fallback: compact() triggers session_shutdown + session_start
+					// which the daemon sees as session_reset. Not identical to /new
+					// (retains a context summary) but achieves the same topic behavior.
+					ctx.compact();
+				}
+				sendResponse(client, "send", id, true);
+				return true;
+
+			case "compact": {
+				ctx.compact(args ? { customInstructions: args } : undefined);
+				sendResponse(client, "send", id, true);
+				return true;
+			}
+
+			case "name": {
+				if (!args) {
+					sendResponse(client, "send", id, false, undefined, "Usage: /name <name>");
+					return true;
+				}
+				pi.setSessionName(args);
+				sendResponse(client, "send", id, true);
+				return true;
+			}
+
+			case "quit":
+			case "exit":
+				ctx.shutdown();
+				sendResponse(client, "send", id, true);
+				return true;
+
+			case "model": {
+				if (!args) {
+					// No arg — can't open the interactive model selector via IPC.
+					// Forward as a user message so the agent sees it.
+					return false;
+				}
+				// Try to set model by name. setModel is async but we fire-and-forget.
+				pi.setModel(args as any).catch(() => {});
+				sendResponse(client, "send", id, true);
+				return true;
+			}
+
+			default:
+				// Not a known slash command — fall through to sendUserMessage.
+				return false;
+		}
+	}
+
+	// Pi slash commands (/new, /compact, /name, /quit) must be handled
+	// directly by the extension, NOT forwarded via sendUserMessage().
+	// sendUserMessage() sends text to the LLM agent, bypassing pi's
+	// command parser entirely.
+	//
+	// For /new we need ExtensionCommandContext.newSession(), which is only
+	// available in registerCommand handlers. We register a "pup-new"
+	// command and capture the newSession function on first invocation,
+	// then reuse it for subsequent IPC /new requests.
+	let savedNewSession: (() => Promise<{ cancelled: boolean }>) | null = null;
+
+	pi.registerCommand("pup-new", {
+		description: "Start a new session (used by pup)",
+		handler: async (_args, cmdCtx) => {
+			savedNewSession = () => cmdCtx.newSession();
+			await cmdCtx.newSession();
+		},
+	});
+
 	function handleCommand(
 		client: net.Socket,
 		msg: Record<string, unknown>,
@@ -382,6 +477,11 @@ export default function (pi: ExtensionAPI) {
 
 				if (!message) {
 					sendResponse(client, "send", id, false, undefined, "message is required");
+					return;
+				}
+
+				// Check for slash commands first.
+				if (handleSlashCommand(client, id, message, ctx)) {
 					return;
 				}
 

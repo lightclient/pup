@@ -167,11 +167,23 @@ impl TelegramBackend {
                 && let Some(session_id) = topics.session_for_thread(thread_id) {
                     let session_id = session_id.to_owned();
 
+                    // Strip @botname suffix from slash commands. Telegram
+                    // appends @botname when the user picks a command from the
+                    // autocomplete menu in a group (e.g. "/new@my_bot" → "/new").
+                    let cleaned_text = if text.starts_with('/') {
+                        let first_word_end = text.find(' ').unwrap_or(text.len());
+                        let first_word = &text[..first_word_end];
+                        if let Some(at_pos) = first_word.find('@') {
+                            format!("{}{}", &text[..at_pos], &text[first_word_end..])
+                        } else {
+                            text.clone()
+                        }
+                    } else {
+                        text.clone()
+                    };
+
                     // Check for /cancel command in topic.
-                    // Strip @botname suffix that Telegram appends when
-                    // the user picks a command from the autocomplete menu
-                    // in a group (e.g. "/cancel@my_pup_bot" → "/cancel").
-                    let cmd = text.trim().split('@').next().unwrap_or("");
+                    let cmd = cleaned_text.trim().split(' ').next().unwrap_or("");
                     if cmd == "/cancel" {
                         let _ = self.incoming_tx.send(IncomingMessage {
                             session_id,
@@ -183,10 +195,10 @@ impl TelegramBackend {
                     }
 
                     // Determine send mode.
-                    let (msg_text, mode) = if let Some(stripped) = text.strip_prefix(">>") {
+                    let (msg_text, mode) = if let Some(stripped) = cleaned_text.strip_prefix(">>") {
                         (stripped.trim().to_owned(), SendMode::FollowUp)
                     } else {
-                        (text.clone(), SendMode::Steer)
+                        (cleaned_text, SendMode::Steer)
                     };
 
                     let _ = self.incoming_tx.send(IncomingMessage {
@@ -450,8 +462,8 @@ impl ChatBackend for TelegramBackend {
                 "telegram bot connected"
             );
 
-            // Register commands.
-            let commands = vec![
+            // Register commands for DMs (pup-specific commands).
+            let dm_commands = vec![
                 ("ls".to_owned(), "List active pi sessions".to_owned()),
                 ("attach".to_owned(), "Attach to a session".to_owned()),
                 ("detach".to_owned(), "Detach from session".to_owned()),
@@ -459,7 +471,37 @@ impl ChatBackend for TelegramBackend {
                 ("verbose".to_owned(), "Toggle tool call visibility".to_owned()),
                 ("help".to_owned(), "Show help".to_owned()),
             ];
-            let _ = self.bot.set_my_commands(&commands).await;
+            let _ = self
+                .bot
+                .set_my_commands_scoped(
+                    &dm_commands,
+                    &serde_json::json!({"type": "all_private_chats"}),
+                )
+                .await;
+
+            // Register commands for group topics (pi slash commands).
+            // These are forwarded to pi via IPC and executed by the extension.
+            let group_commands = vec![
+                ("cancel".to_owned(), "Cancel current operation".to_owned()),
+                ("new".to_owned(), "Start a new session".to_owned()),
+                ("compact".to_owned(), "Compact session context".to_owned()),
+                ("name".to_owned(), "Set session name".to_owned()),
+                ("quit".to_owned(), "Quit pi session".to_owned()),
+            ];
+            let _ = self
+                .bot
+                .set_my_commands_scoped(
+                    &group_commands,
+                    &serde_json::json!({"type": "all_group_chats"}),
+                )
+                .await;
+
+            // Default commands (fallback).
+            let default_commands = vec![
+                ("cancel".to_owned(), "Cancel current operation".to_owned()),
+                ("help".to_owned(), "Show help".to_owned()),
+            ];
+            let _ = self.bot.set_my_commands(&default_commands).await;
 
             // Validate topics setup if enabled, scan for orphaned topics,
             // and clean up stale ones.

@@ -336,6 +336,31 @@ impl BotClient {
         .await
     }
 
+    /// Register commands with a specific scope.
+    pub async fn set_my_commands_scoped(
+        &self,
+        commands: &[(String, String)],
+        scope: &serde_json::Value,
+    ) -> Result<bool> {
+        let cmds: Vec<serde_json::Value> = commands
+            .iter()
+            .map(|(cmd, desc)| {
+                serde_json::json!({
+                    "command": cmd,
+                    "description": desc,
+                })
+            })
+            .collect();
+        self.call(
+            "setMyCommands",
+            &serde_json::json!({
+                "commands": cmds,
+                "scope": scope,
+            }),
+        )
+        .await
+    }
+
     /// Get bot info (getMe).
     pub async fn get_me(&self) -> Result<User> {
         self.call("getMe", &serde_json::json!({})).await

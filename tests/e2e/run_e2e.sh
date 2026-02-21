@@ -550,6 +550,110 @@ trap teardown EXIT
 setup
 
 TESTS="${1:-all}"
+test_s01() {
+  log "S01 — /name via Telegram renames the topic"
+  start_pi "e2e-s01"
+  if ! wait_topic "e2e-s01" 20 >/dev/null; then
+    fail "S01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s01")
+  $TG send "$SUPERGROUP" "$tid" "/name e2e-s01-renamed" 2>/dev/null >/dev/null
+  sleep 10
+  if wait_topic "e2e-s01-renamed" 10 >/dev/null; then
+    pass "S01"
+  else
+    fail "S01" "topic not renamed to e2e-s01-renamed"
+  fi
+  exit_pi "e2e-s01"
+  wait_all_topics_gone 20 || true
+}
+
+test_s02() {
+  log "S02 — /quit via Telegram kills session and deletes topic"
+  start_pi "e2e-s02"
+  if ! wait_topic "e2e-s02" 20 >/dev/null; then
+    fail "S02" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s02")
+  $TG send "$SUPERGROUP" "$tid" "/quit" 2>/dev/null >/dev/null
+  if wait_all_topics_gone 20; then
+    pass "S02"
+  else
+    fail "S02" "topic not deleted after /quit"
+  fi
+}
+
+test_s03() {
+  log "S03 — /new via Telegram resets session (topic persists)"
+  start_pi "e2e-s03"
+  if ! wait_topic "e2e-s03" 20 >/dev/null; then
+    fail "S03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s03")
+  # Send a prompt first so there's context
+  $TG send "$SUPERGROUP" "$tid" "say BEFORE_NEW" 2>/dev/null >/dev/null
+  wait_bot_msg "$tid" "BEFORE_NEW" 60 >/dev/null || true
+  # Now send /new
+  $TG send "$SUPERGROUP" "$tid" "/new" 2>/dev/null >/dev/null
+  sleep 10
+  # Topic should still exist
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    # Verify session is functional after /new
+    local active_tid
+    active_tid=$(get_any_topic_id)
+    $TG send "$SUPERGROUP" "$active_tid" "say AFTER_NEW" 2>/dev/null >/dev/null
+    if wait_bot_msg "$active_tid" "AFTER_NEW" 60 >/dev/null; then
+      pass "S03"
+    else
+      fail "S03" "no response after /new"
+    fi
+  else
+    fail "S03" "topic disappeared after /new"
+  fi
+  exit_pi "e2e-s03"
+  wait_all_topics_gone 20 || true
+}
+
+test_s04() {
+  log "S04 — /compact via Telegram (topic persists)"
+  start_pi "e2e-s04"
+  if ! wait_topic "e2e-s04" 20 >/dev/null; then
+    fail "S04" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s04")
+  # Build up some context
+  $TG send "$SUPERGROUP" "$tid" "say BEFORE_COMPACT" 2>/dev/null >/dev/null
+  wait_bot_msg "$tid" "BEFORE_COMPACT" 60 >/dev/null || true
+  # Compact
+  $TG send "$SUPERGROUP" "$tid" "/compact" 2>/dev/null >/dev/null
+  sleep 10
+  # Topic should still exist and session should work
+  local active_tid
+  active_tid=$(get_any_topic_id)
+  if [ -n "$active_tid" ]; then
+    $TG send "$SUPERGROUP" "$active_tid" "say AFTER_COMPACT" 2>/dev/null >/dev/null
+    if wait_bot_msg "$active_tid" "AFTER_COMPACT" 60 >/dev/null; then
+      pass "S04"
+    else
+      fail "S04" "no response after /compact"
+    fi
+  else
+    fail "S04" "topic disappeared after /compact"
+  fi
+  exit_pi "e2e-s04"
+  wait_all_topics_gone 20 || true
+}
+
 if [ "$TESTS" = "all" ]; then
   test_t01
   test_t02
@@ -564,6 +668,10 @@ if [ "$TESTS" = "all" ]; then
   test_t17
   test_t19
   test_t21
+  test_s01
+  test_s02
+  test_s03
+  test_s04
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do
