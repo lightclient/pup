@@ -861,6 +861,122 @@ test_s04() {
   wait_all_topics_gone 20 || true
 }
 
+# ─── Additional topic tests ─────────────────────────────────────
+
+test_t20() {
+  log "T20 — Session name persists (or updates) across /new"
+  start_pi "e2e-t20-orig"
+  if ! wait_topic "e2e-t20-orig" 20 >/dev/null; then
+    fail "T20" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-t20-orig" "/new"
+  sleep 10
+  # Topic should still exist — either with original name or fallback
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    pass "T20"
+  else
+    fail "T20" "topic disappeared after /new"
+  fi
+  exit_pi "e2e-t20-orig"
+  wait_all_topics_gone 20 || true
+}
+
+test_t12() {
+  log "T12 — Multiple tool calls produce response in correct order"
+  start_pi "e2e-t12"
+  if ! wait_topic "e2e-t12" 20 >/dev/null; then
+    fail "T12" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t12")
+  # Send a prompt that triggers ordered tool calls and a final word
+  $TG send "$SUPERGROUP" "$tid" 'run these 3 commands in order: echo AAA, echo BBB, echo CCC. Then reply with only the word ORDERING_DONE' 2>/dev/null >/dev/null
+  # Wait for the final summary response
+  if wait_bot_msg "$tid" "ORDERING_DONE" 90 >/dev/null; then
+    pass "T12"
+  else
+    fail "T12" "no final response within timeout"
+  fi
+  exit_pi "e2e-t12"
+  wait_all_topics_gone 20 || true
+}
+
+# ─── Additional Telegram slash command tests ────────────────────
+
+test_s05() {
+  log "S05 — /name@bot suffix stripped when sent from Telegram"
+  start_pi "e2e-s05"
+  if ! wait_topic "e2e-s05" 20 >/dev/null; then
+    fail "S05" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s05")
+  # Simulate Telegram appending @botname to the command
+  $TG send "$SUPERGROUP" "$tid" "/name@reidwalkerbot e2e-s05-atbot" 2>/dev/null >/dev/null
+  sleep 10
+  if wait_topic "e2e-s05-atbot" 10 >/dev/null; then
+    pass "S05"
+  else
+    fail "S05" "topic not renamed (maybe @bot suffix not stripped)"
+  fi
+  exit_pi "e2e-s05"
+  wait_all_topics_gone 20 || true
+}
+
+test_s06() {
+  log "S06 — Unknown slash command via Telegram forwarded to pi"
+  start_pi "e2e-s06"
+  if ! wait_topic "e2e-s06" 20 >/dev/null; then
+    fail "S06" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s06")
+  # Send an unknown slash command — should be forwarded to pi as text
+  $TG send "$SUPERGROUP" "$tid" "/nonexistent_command" 2>/dev/null >/dev/null
+  sleep 10
+  # Session should still be alive (no crash)
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word ALIVE_S06" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "ALIVE_S06" 60 >/dev/null; then
+    pass "S06"
+  else
+    fail "S06" "session not responsive after unknown slash command"
+  fi
+  exit_pi "e2e-s06"
+  wait_all_topics_gone 20 || true
+}
+
+test_s07() {
+  log "S07 — /cancel@botname stripped in group topics"
+  start_pi "e2e-s07"
+  if ! wait_topic "e2e-s07" 20 >/dev/null; then
+    fail "S07" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-s07")
+  # Start a long prompt
+  $TG send "$SUPERGROUP" "$tid" "write a very long and detailed essay about the entire history of computing from the abacus to modern quantum computers" 2>/dev/null >/dev/null
+  sleep 8
+  # Cancel with @bot suffix
+  $TG send "$SUPERGROUP" "$tid" "/cancel@reidwalkerbot" 2>/dev/null >/dev/null
+  sleep 15
+  # Session should still work
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word CANCEL_AT_OK" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "CANCEL_AT_OK" 60 >/dev/null; then
+    pass "S07"
+  else
+    fail "S07" "session not responsive after /cancel@bot"
+  fi
+  exit_pi "e2e-s07"
+  wait_all_topics_gone 20 || true
+}
+
 # ─── Pedantic tests (crash, race, adversarial) ──────────────────
 
 test_p01() {
@@ -1210,8 +1326,17 @@ if [ "$TESTS" = "all" ]; then
   test_c01   # /cancel via Telegram
   test_c02   # cancel via TUI (Escape)
 
+  # Additional topic tests
+  test_t20   # session name persists across /new
+  test_t12   # message ordering (tool calls)
+
   # Follow-up
   test_f01   # >> prefix via Telegram
+
+  # Additional Telegram slash commands
+  test_s05   # /name@bot suffix stripped
+  test_s06   # unknown slash command forwarded to pi
+  test_s07   # /cancel@bot suffix stripped
 
   # Pedantic: crash & recovery
   test_p01   # SIGKILL pup mid-stream
