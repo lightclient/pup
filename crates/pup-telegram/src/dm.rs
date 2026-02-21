@@ -31,10 +31,14 @@ pub fn parse_command(text: &str) -> DmCommand {
     let trimmed = text.trim();
 
     if trimmed.starts_with('/') {
-        let (cmd, args) = match trimmed.split_once(' ') {
+        let (raw_cmd, args) = match trimmed.split_once(' ') {
             Some((c, a)) => (c, a.trim()),
             None => (trimmed, ""),
         };
+
+        // Strip @botname suffix that Telegram appends when the user picks
+        // a command from the autocomplete menu (e.g. "/ls@my_pup_bot").
+        let cmd = raw_cmd.split('@').next().unwrap_or(raw_cmd);
 
         match cmd {
             "/ls" | "/list" => DmCommand::List,
@@ -232,6 +236,24 @@ mod tests {
         match parse_command("/verbose on") {
             DmCommand::Verbose { toggle } => assert_eq!(toggle, Some(true)),
             _ => panic!("expected Verbose"),
+        }
+    }
+
+    #[test]
+    fn test_parse_commands_with_bot_suffix() {
+        // Telegram appends @botname when user picks from autocomplete in groups.
+        assert!(matches!(parse_command("/ls@my_pup_bot"), DmCommand::List));
+        assert!(matches!(parse_command("/cancel@my_pup_bot"), DmCommand::Cancel));
+        assert!(matches!(parse_command("/detach@my_pup_bot"), DmCommand::Detach));
+        assert!(matches!(parse_command("/help@my_pup_bot"), DmCommand::Help));
+        assert!(matches!(parse_command("/start@my_pup_bot"), DmCommand::Help));
+        match parse_command("/verbose@my_pup_bot on") {
+            DmCommand::Verbose { toggle } => assert_eq!(toggle, Some(true)),
+            _ => panic!("expected Verbose"),
+        }
+        match parse_command("/attach@my_pup_bot myproject") {
+            DmCommand::Attach { reference } => assert_eq!(reference, "myproject"),
+            _ => panic!("expected Attach"),
         }
     }
 }

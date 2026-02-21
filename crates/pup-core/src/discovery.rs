@@ -64,18 +64,39 @@ impl Discovery {
 
             info!("watching for socket changes");
 
-            // React to filesystem events.
+            // Periodic rescan interval (catches missed events, e.g. after
+            // the directory is deleted and recreated).
+            let mut rescan_interval = tokio::time::interval(Duration::from_secs(5));
+            rescan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the first immediate tick.
+            rescan_interval.tick().await;
+
+            // React to filesystem events + periodic rescan.
             loop {
-                match fs_rx.recv().await {
-                    Some(Ok(event)) => {
-                        self.handle_fs_event(&event).await;
+                tokio::select! {
+                    event = fs_rx.recv() => {
+                        match event {
+                            Some(Ok(event)) => {
+                                self.handle_fs_event(&event).await;
+                            }
+                            Some(Err(e)) => {
+                                warn!(error = %e, "filesystem watcher error");
+                            }
+                            None => {
+                                debug!("filesystem watcher channel closed");
+                                break;
+                            }
+                        }
                     }
-                    Some(Err(e)) => {
-                        warn!(error = %e, "filesystem watcher error");
-                    }
-                    None => {
-                        debug!("filesystem watcher channel closed");
-                        break;
+                    _ = rescan_interval.tick() => {
+                        // Re-ensure the directory exists (it may have been
+                        // deleted and recreated by an extension).
+                        let _ = tokio::fs::create_dir_all(&self.socket_dir).await;
+                        if let Err(e) = self.scan().await {
+                            debug!(error = %e, "periodic rescan failed");
+                        }
+                        // Re-watch in case the directory was recreated (new inode).
+                        let _ = watcher.watch(&self.socket_dir, RecursiveMode::NonRecursive);
                     }
                 }
             }
@@ -88,7 +109,7 @@ impl Discovery {
 
     /// Scan the socket directory for existing `.sock` files.
     async fn scan(&mut self) -> Result<()> {
-        let span = info_span!("discovery_scan");
+        let span = debug_span!("discovery_scan");
         async {
             let mut dir = tokio::fs::read_dir(&self.socket_dir)
                 .await
@@ -129,7 +150,7 @@ impl Discovery {
                 }
             }
 
-            info!(socket_count, alive_count, "initial scan complete");
+            debug!(socket_count, alive_count, "initial scan complete");
             Ok(())
         }
         .instrument(span)

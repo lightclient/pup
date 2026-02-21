@@ -6,8 +6,19 @@ use tracing::debug;
 use crate::bot::BotClient;
 use crate::outbox::{Outbox, OutboxOp};
 use crate::render::{
-    cancel_keyboard, empty_keyboard, split_message, to_telegram_html, MAX_BODY_CHARS,
+    cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html, MAX_BODY_CHARS,
 };
+
+/// A tracked tool call for verbose rendering.
+#[derive(Debug)]
+struct TrackedTool {
+    tool_name: String,
+    args: serde_json::Value,
+    #[allow(dead_code)]
+    content: Option<String>,
+    is_error: bool,
+    done: bool,
+}
 
 /// State for one agent turn in one session.
 #[derive(Debug)]
@@ -32,6 +43,10 @@ struct TurnState {
     dirty: bool,
     /// Sender to stop the typing indicator loop (dropped on turn end).
     typing_stop: Option<tokio::sync::watch::Sender<bool>>,
+    /// Whether to show tool call details.
+    verbose: bool,
+    /// Tracked tool calls in order.
+    tools: Vec<TrackedTool>,
 }
 
 impl TurnState {
@@ -61,14 +76,43 @@ impl TurnState {
 
     /// Render the current turn state as Telegram HTML.
     fn render(&self) -> String {
-        // Show streaming text if we have any, otherwise a placeholder.
+        let mut parts = Vec::new();
+
+        // Verbose tool call summaries.
+        if self.verbose {
+            for tool in &self.tools {
+                let mut line = format!("🔧 <b>{}</b>", escape_html(&tool.tool_name));
+                // Show command or path arg if present.
+                if let Some(cmd) = tool.args.get("command").and_then(|v| v.as_str()) {
+                    let truncated = if cmd.len() > 200 { &cmd[..200] } else { cmd };
+                    line.push_str(&format!("\n<pre>{}</pre>", escape_html(truncated)));
+                } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
+                    line.push_str(&format!(" <code>{}</code>", escape_html(path)));
+                }
+                if tool.is_error {
+                    line.push_str(" ❌");
+                } else if tool.done {
+                    line.push_str(" ✓");
+                } else {
+                    line.push_str(" ⏳");
+                }
+                parts.push(line);
+            }
+        }
+
+        // Streaming text.
         if !self.streaming_text.is_empty() {
             let html = to_telegram_html(&self.streaming_text);
             if !html.is_empty() {
-                return html;
+                parts.push(html);
             }
         }
-        "…".to_owned()
+
+        if parts.is_empty() {
+            "…".to_owned()
+        } else {
+            parts.join("\n\n")
+        }
     }
 
     /// Enqueue an edit (or initial send) for the current state.
@@ -113,6 +157,8 @@ pub struct TurnTracker {
     turns: HashMap<String, TurnState>,
     /// Minimum interval between edits.
     edit_interval_ms: u64,
+    /// Whether to show tool call details.
+    verbose: bool,
 }
 
 impl TurnTracker {
@@ -120,7 +166,13 @@ impl TurnTracker {
         Self {
             turns: HashMap::new(),
             edit_interval_ms,
+            verbose: false,
         }
+    }
+
+    /// Enable or disable verbose mode (tool call visibility).
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
     }
 
     /// Start tracking a new agent turn.
@@ -163,6 +215,8 @@ impl TurnTracker {
                 last_edit: Instant::now(),
                 dirty: false,
                 typing_stop: Some(stop_tx),
+                verbose: self.verbose,
+                tools: Vec::new(),
             },
         );
     }
@@ -195,18 +249,54 @@ impl TurnTracker {
     }
 
     /// Note that a tool started. Ensures the Telegram message exists.
-    pub fn tool_start(&mut self, session_id: &str, _tool_name: &str, outbox: &mut Outbox) {
+    pub fn tool_start(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        args: &serde_json::Value,
+        outbox: &mut Outbox,
+    ) {
+        if let Some(state) = self.turns.get_mut(session_id) {
+            if state.verbose {
+                state.tools.push(TrackedTool {
+                    tool_name: tool_name.to_owned(),
+                    args: args.clone(),
+                    content: None,
+                    is_error: false,
+                    done: false,
+                });
+                state.dirty = true;
+            }
+        }
         self.ensure_message(session_id, "…", outbox);
+        // Flush the tool start state.
+        if let Some(state) = self.turns.get_mut(session_id) {
+            state.flush(outbox, self.edit_interval_ms);
+        }
     }
 
-    /// Note that a tool finished. No-op (typing indicator covers visibility).
+    /// Note that a tool finished.
     pub fn tool_end(
         &mut self,
-        _session_id: &str,
-        _tool_name: &str,
-        _is_error: bool,
-        _outbox: &mut Outbox,
+        session_id: &str,
+        tool_name: &str,
+        is_error: bool,
+        outbox: &mut Outbox,
     ) {
+        if let Some(state) = self.turns.get_mut(session_id) {
+            if state.verbose {
+                // Find the last matching tool and mark it done.
+                for tool in state.tools.iter_mut().rev() {
+                    if tool.tool_name == tool_name && !tool.done {
+                        tool.done = true;
+                        tool.is_error = is_error;
+                        break;
+                    }
+                }
+                state.dirty = true;
+                state.flush(outbox, self.edit_interval_ms);
+            }
+        }
     }
 
     /// Accumulate a streaming text delta.
@@ -258,6 +348,14 @@ impl TurnTracker {
         content: &str,
         outbox: &mut Outbox,
     ) {
+        // If no deltas were received (e.g. very short response with extended
+        // thinking), ensure a Telegram message is created with the final content.
+        if !content.is_empty() {
+            let html = to_telegram_html(content);
+            let initial = if html.is_empty() { "…".to_owned() } else { html };
+            self.ensure_message(session_id, &initial, outbox);
+        }
+
         let Some(state) = self.turns.get_mut(session_id) else {
             return;
         };
@@ -284,34 +382,47 @@ impl TurnTracker {
         // Resolve message ID if still pending.
         state.try_resolve_message_id();
 
-        let Some(tg_msg_id) = state.telegram_message_id else {
-            return;
-        };
-
         // Final render.
         let rendered = state.render();
         let chunks = split_message(&rendered, MAX_BODY_CHARS);
 
-        if let Some(first) = chunks.first() {
-            outbox.enqueue(OutboxOp::Edit {
-                chat_id: state.chat_id,
-                message_id: tg_msg_id,
-                text: first.clone(),
-                parse_mode: Some("HTML".to_owned()),
-                reply_markup: Some(empty_keyboard()),
-            });
-        }
+        if let Some(tg_msg_id) = state.telegram_message_id {
+            // Edit the existing message with final content and remove cancel keyboard.
+            if let Some(first) = chunks.first() {
+                outbox.enqueue(OutboxOp::Edit {
+                    chat_id: state.chat_id,
+                    message_id: tg_msg_id,
+                    text: first.clone(),
+                    parse_mode: Some("HTML".to_owned()),
+                    reply_markup: Some(empty_keyboard()),
+                });
+            }
 
-        // Overflow chunks as separate messages.
-        for chunk in chunks.iter().skip(1) {
-            outbox.enqueue(OutboxOp::Send {
-                chat_id: state.chat_id,
-                text: chunk.clone(),
-                parse_mode: Some("HTML".to_owned()),
-                reply_markup: None,
-                message_thread_id: state.thread_id,
-                result_tx: None,
-            });
+            // Overflow chunks as separate messages.
+            for chunk in chunks.iter().skip(1) {
+                outbox.enqueue(OutboxOp::Send {
+                    chat_id: state.chat_id,
+                    text: chunk.clone(),
+                    parse_mode: Some("HTML".to_owned()),
+                    reply_markup: None,
+                    message_thread_id: state.thread_id,
+                    result_tx: None,
+                });
+            }
+        } else if !state.streaming_text.is_empty() {
+            // No Telegram message was ever created (e.g. no deltas arrived,
+            // or the send is still in flight). Send the final content as a
+            // new message without a cancel keyboard.
+            for (i, chunk) in chunks.iter().enumerate() {
+                outbox.enqueue(OutboxOp::Send {
+                    chat_id: state.chat_id,
+                    text: chunk.clone(),
+                    parse_mode: Some("HTML".to_owned()),
+                    reply_markup: if i == 0 { Some(empty_keyboard()) } else { None },
+                    message_thread_id: state.thread_id,
+                    result_tx: None,
+                });
+            }
         }
     }
 

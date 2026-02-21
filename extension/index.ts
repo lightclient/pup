@@ -13,10 +13,16 @@ import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import * as crypto from "node:crypto";
 
 const SOCKET_DIR = path.join(os.homedir(), ".pi", "pup");
 const DEFAULT_HISTORY_TURNS = 5;
 const NAME_POLL_INTERVAL = 1000;
+const SOCKET_CHECK_INTERVAL = 2000;
+
+// Stable identifier for this pi process. Persists across /new and /compact
+// so the daemon keeps the same topic for the lifetime of the process.
+const INSTANCE_ID = crypto.randomUUID();
 
 export default function (pi: ExtensionAPI) {
 	let server: net.Server | null = null;
@@ -26,6 +32,8 @@ export default function (pi: ExtensionAPI) {
 	let sessionId: string | null = null;
 	let currentName: string | undefined;
 	let namePollTimer: ReturnType<typeof setInterval> | null = null;
+	let socketCheckTimer: ReturnType<typeof setInterval> | null = null;
+	let savedCtx: ExtensionContext | null = null;
 
 	// ── Echo suppression ────────────────────────────────────────
 	// Track messages we sent via IPC so we can tag their input events as echoes.
@@ -182,11 +190,9 @@ export default function (pi: ExtensionAPI) {
 	function createSocketServer(ctx: ExtensionContext) {
 		ensureSocketDir();
 
-		const sid = ctx.sessionManager.getSessionId();
-		if (!sid) return;
-
-		sessionId = sid;
-		socketPath = path.join(SOCKET_DIR, `${sid}.sock`);
+		savedCtx = ctx;
+		sessionId = ctx.sessionManager.getSessionId() ?? null;
+		socketPath = path.join(SOCKET_DIR, `${INSTANCE_ID}.sock`);
 
 		// Clean up stale socket.
 		try {
@@ -199,8 +205,11 @@ export default function (pi: ExtensionAPI) {
 			clients.add(client);
 
 			// Send hello + history on connect.
+			// Use savedCtx (not a captured ctx) so clients connecting after
+			// a /new or /compact always get the latest session state.
+			const ctx = savedCtx!;
 			const helloData: Record<string, unknown> = {
-				session_id: sessionId,
+				session_id: INSTANCE_ID,
 				cwd: ctx.cwd,
 			};
 
@@ -233,7 +242,7 @@ export default function (pi: ExtensionAPI) {
 					if (!line.trim()) continue;
 					try {
 						const msg = JSON.parse(line);
-						handleCommand(client, msg, ctx);
+						handleCommand(client, msg, savedCtx!);
 					} catch {
 						sendResponse(client, "unknown", undefined, false, undefined, "invalid JSON");
 					}
@@ -273,9 +282,89 @@ export default function (pi: ExtensionAPI) {
 				if (newName) {
 					broadcastEvent("session_name_changed", { name: newName });
 				}
-				updateAlias(ctx);
+				if (savedCtx) updateAlias(savedCtx);
 			}
 		}, NAME_POLL_INTERVAL);
+
+		// Start socket file monitor — recreate if deleted (e.g. directory wiped).
+		socketCheckTimer = setInterval(() => {
+			if (!socketPath || !server) return;
+			try {
+				fs.statSync(socketPath);
+			} catch {
+				// Socket file is gone. Recreate it.
+				console.error("[pup] socket file missing, recreating...");
+				if (savedCtx) recreateSocket(savedCtx);
+			}
+		}, SOCKET_CHECK_INTERVAL);
+	}
+
+	function recreateSocket(ctx: ExtensionContext) {
+		if (!server) return;
+
+		// Close old server (socket is gone, no cleanup needed).
+		try { server.close(); } catch { /* ignore */ }
+		for (const client of clients) {
+			client.destroy();
+		}
+		clients.clear();
+		server = null;
+
+		// Recreate directory and socket.
+		ensureSocketDir();
+		socketPath = path.join(SOCKET_DIR, `${INSTANCE_ID}.sock`);
+
+		server = net.createServer((client) => {
+			clients.add(client);
+
+			const ctx = savedCtx!;
+			const helloData: Record<string, unknown> = {
+				session_id: INSTANCE_ID,
+				cwd: ctx.cwd,
+			};
+			const name = pi.getSessionName();
+			if (name) helloData.session_name = name;
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (sessionFile) helloData.session_file = sessionFile;
+			helloData.thinking_level = pi.getThinkingLevel();
+			sendToClient(client, "hello", helloData);
+
+			const turns = getHistory(ctx);
+			sendToClient(client, "history", {
+				turns,
+				streaming: isStreaming,
+				...(isStreaming && accumulatedText ? { partial_text: accumulatedText } : {}),
+			});
+
+			let buffer = "";
+			client.on("data", (data) => {
+				buffer += data.toString();
+				const lines = buffer.split("\n");
+				buffer = lines.pop() ?? "";
+				for (const line of lines) {
+					if (!line.trim()) continue;
+					try {
+						const msg = JSON.parse(line);
+						handleCommand(client, msg, savedCtx!);
+					} catch {
+						sendResponse(client, "unknown", undefined, false, undefined, "invalid JSON");
+					}
+				}
+			});
+			client.on("close", () => { clients.delete(client); });
+			client.on("error", () => { clients.delete(client); });
+		});
+
+		server.listen(socketPath, () => {
+			try { fs.chmodSync(socketPath!, 0o700); } catch { /* ignore */ }
+		});
+
+		server.on("error", (err) => {
+			console.error("[pup] recreated socket server error:", err.message);
+		});
+
+		// Recreate alias.
+		updateAlias(ctx);
 	}
 
 	function handleCommand(
@@ -323,7 +412,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			case "get_info": {
 				const info: Record<string, unknown> = {
-					session_id: sessionId,
+					session_id: INSTANCE_ID,
 					cwd: ctx.cwd,
 				};
 				const name = pi.getSessionName();
@@ -373,10 +462,14 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function teardown() {
-		// Stop name polling.
+		// Stop timers.
 		if (namePollTimer) {
 			clearInterval(namePollTimer);
 			namePollTimer = null;
+		}
+		if (socketCheckTimer) {
+			clearInterval(socketCheckTimer);
+			socketCheckTimer = null;
 		}
 
 		// Broadcast session end.
@@ -418,11 +511,29 @@ export default function (pi: ExtensionAPI) {
 	// ── Event subscriptions ─────────────────────────────────────
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (server) {
+			// Session reset (/new or /compact) — reuse existing socket.
+			// The daemon keeps the same connection and topic.
+			savedCtx = ctx;
+			sessionId = ctx.sessionManager.getSessionId() ?? null;
+			isStreaming = false;
+			currentMessageId = null;
+			accumulatedText = "";
+			broadcastEvent("session_reset");
+			updateAlias(ctx);
+			return;
+		}
 		createSocketServer(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
-		teardown();
+		// Don't teardown — the socket stays alive for the pi process lifetime.
+		// If this is /new or /compact, session_start will fire next and reuse
+		// the socket. If pi is exiting, the process dies and the daemon detects
+		// the broken connection.
+		isStreaming = false;
+		currentMessageId = null;
+		accumulatedText = "";
 	});
 
 	pi.on("agent_start", async () => {

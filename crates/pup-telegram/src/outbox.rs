@@ -139,6 +139,13 @@ impl Outbox {
         self.queue.is_empty()
     }
 
+    /// Clear the per-message edit cooldown so the next edit goes through
+    /// immediately. Used at end-of-turn to ensure the final edit (removing
+    /// the cancel keyboard) isn't blocked by a recent content edit.
+    pub fn clear_edit_cooldown(&mut self) {
+        self.last_edit.clear();
+    }
+
     /// Flush one operation from the queue, respecting rate limits.
     ///
     /// Returns `true` if an operation was executed, `false` if the queue is

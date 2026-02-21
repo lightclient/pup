@@ -86,6 +86,8 @@ pub enum IpcEvent {
     ModelChanged { model: String },
     UserMessage { content: String, source: String, echo: bool },
     SessionEnd,
+    /// The pi session was reset (/new or /compact). Same process, new conversation.
+    SessionReset,
     /// An event type we don't specifically handle.
     Unknown { event: String, data: serde_json::Value },
 }
@@ -345,6 +347,7 @@ impl IpcEvent {
                     .unwrap_or(false),
             },
             "session_end" => Self::SessionEnd,
+            "session_reset" => Self::SessionReset,
             _ => Self::Unknown {
                 event: event.to_owned(),
                 data: data.clone(),

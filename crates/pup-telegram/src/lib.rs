@@ -71,7 +71,8 @@ impl TelegramBackend {
     pub fn new(config: TelegramConfig) -> Self {
         let bot = BotClient::new(&config.bot_token);
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
-        let turn_tracker = TurnTracker::new(config.edit_interval_ms);
+        let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
+        turn_tracker.set_verbose(config.verbose);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
@@ -167,7 +168,11 @@ impl TelegramBackend {
                     let session_id = session_id.to_owned();
 
                     // Check for /cancel command in topic.
-                    if text.trim() == "/cancel" {
+                    // Strip @botname suffix that Telegram appends when
+                    // the user picks a command from the autocomplete menu
+                    // in a group (e.g. "/cancel@my_pup_bot" → "/cancel").
+                    let cmd = text.trim().split('@').next().unwrap_or("");
+                    if cmd == "/cancel" {
                         let _ = self.incoming_tx.send(IncomingMessage {
                             session_id,
                             text: String::new(),
@@ -572,6 +577,19 @@ impl ChatBackend for TelegramBackend {
                         warn!(error = %e, "failed to rename topic");
                     }
             }
+            SessionEvent::SessionReset { ref session_id } => {
+                info!(session_id, "session reset");
+                // End any in-progress turn cleanly.
+                self.outbox.clear_edit_cooldown();
+                self.turn_tracker.end_turn(session_id, &mut self.outbox);
+                // Post a notification in the topic.
+                self.send_to_topic(session_id, "🔄 <i>Session reset</i>");
+
+                if self.dm.attached.as_deref() == Some(session_id.as_str())
+                    && let Some(chat_id) = self.dm_chat_id {
+                        self.send_dm(chat_id, "🔄 <i>Session reset</i>");
+                    }
+            }
             SessionEvent::AgentStart { ref session_id } => {
                 debug!(session_id, "agent started");
 
@@ -596,6 +614,9 @@ impl ChatBackend for TelegramBackend {
             }
             SessionEvent::AgentEnd { ref session_id } => {
                 debug!(session_id, "agent ended");
+                // Clear edit cooldowns so the final edit (removing the cancel
+                // keyboard) goes through even if a recent content edit just ran.
+                self.outbox.clear_edit_cooldown();
                 self.turn_tracker.end_turn(session_id, &mut self.outbox);
                 // Flush any remaining outbox operations.
                 while self.outbox.flush_one().await {}
@@ -624,10 +645,11 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::ToolStart {
                 ref session_id,
                 ref tool_name,
+                ref args,
                 ..
             } => {
                 self.turn_tracker
-                    .tool_start(session_id, tool_name, &mut self.outbox);
+                    .tool_start(session_id, tool_name, args, &mut self.outbox);
             }
             SessionEvent::ToolEnd {
                 ref session_id,
@@ -635,8 +657,12 @@ impl ChatBackend for TelegramBackend {
                 is_error,
                 ..
             } => {
-                self.turn_tracker
-                    .tool_end(session_id, tool_name, is_error, &mut self.outbox);
+                self.turn_tracker.tool_end(
+                    session_id,
+                    tool_name,
+                    is_error,
+                    &mut self.outbox,
+                );
             }
             SessionEvent::UserMessage {
                 ref session_id,

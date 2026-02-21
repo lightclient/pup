@@ -369,6 +369,9 @@ impl SessionManager {
                 echo,
                 source: MessageSource::from_str(&source),
             },
+            IpcEvent::SessionReset => SessionEvent::SessionReset {
+                session_id: session_id.to_owned(),
+            },
             IpcEvent::SessionEnd => {
                 self.disconnect_session(session_id, "session ended").await;
                 return;

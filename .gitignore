@@ -9,5 +9,12 @@ traces.jsonl
 # Node
 node_modules/
 
+# E2E test artifacts (keep test definitions)
+tests/e2e/*.log
+tests/e2e/tg.toml
+tests/e2e/*.session
+tests/e2e/.*.session
+tests/e2e/__pycache__/
+
 # OS
 .DS_Store

@@ -46,6 +46,8 @@ pub enum SessionEvent {
         content: String,
         is_error: bool,
     },
+    /// The pi session was reset (/new or /compact). Same process, new conversation.
+    SessionReset { session_id: String },
     /// A user message was sent (from pi TUI or another backend).
     /// `echo` is true if this message originated from pup (via IPC send command).
     UserMessage {
