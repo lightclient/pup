@@ -8,12 +8,17 @@ use tracing::info;
 
 use crate::config::default_config_path;
 
+/// Read a line from stdin (blocking).
+fn prompt(msg: &str) -> Result<String> {
+    print!("{msg}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().lock().read_line(&mut buf)?;
+    Ok(buf.trim().to_owned())
+}
+
 /// Run the interactive setup wizard.
 pub(crate) async fn run_setup() -> Result<()> {
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-    let mut reader = stdin.lock();
-
     println!("pup — setup");
     println!("============\n");
 
@@ -22,11 +27,8 @@ pub(crate) async fn run_setup() -> Result<()> {
     println!("── Telegram ──\n");
 
     // Bot token
-    print!("1. Create a bot via @BotFather and paste the token.\n   Bot token: ");
-    stdout.flush()?;
-    let mut bot_token = String::new();
-    reader.read_line(&mut bot_token)?;
-    let bot_token = bot_token.trim().to_owned();
+    let bot_token =
+        prompt("1. Create a bot via @BotFather and paste the token.\n   Bot token: ")?;
 
     if bot_token.is_empty() {
         anyhow::bail!("Bot token is required.");
@@ -47,45 +49,69 @@ pub(crate) async fn run_setup() -> Result<()> {
     }
 
     // User ID
-    print!("2. Get your Telegram user ID from @userinfobot.\n   User ID: ");
-    stdout.flush()?;
-    let mut user_id_str = String::new();
-    reader.read_line(&mut user_id_str)?;
+    let user_id_str =
+        prompt("2. Get your Telegram user ID from @userinfobot.\n   User ID: ")?;
     let user_id: i64 = user_id_str
-        .trim()
         .parse()
         .context("Invalid user ID — must be a number")?;
     println!("   ✓ Saved\n");
 
     // Topics mode
-    print!("3. Topics mode (optional):\n   Enable topics? [y/N]: ");
-    stdout.flush()?;
-    let mut topics_answer = String::new();
-    reader.read_line(&mut topics_answer)?;
-    let topics_enabled = topics_answer.trim().eq_ignore_ascii_case("y");
+    let topics_answer = prompt("3. Topics mode (optional):\n   Enable topics? [y/N]: ")?;
+    let topics_enabled = topics_answer.eq_ignore_ascii_case("y");
 
     let mut supergroup_id: Option<i64> = None;
 
     if topics_enabled {
-        print!("   Supergroup chat ID: ");
-        stdout.flush()?;
-        let mut sg_str = String::new();
-        reader.read_line(&mut sg_str)?;
-        let sg_id: i64 = sg_str
-            .trim()
-            .parse()
-            .context("Invalid supergroup ID — must be a number")?;
-        supergroup_id = Some(sg_id);
+        // Drain any old updates so we only see fresh ones.
+        let _ = bot.get_updates(0, 0).await;
+        let drain = bot.get_updates(0, 0).await.unwrap_or_default();
+        let mut offset: i64 = drain
+            .iter()
+            .map(|u| u.update_id + 1)
+            .max()
+            .unwrap_or(0);
 
-        // Verify
+        println!("   Add the bot to your supergroup as an admin (with Manage Topics),");
+        println!("   then send any message in the group. Waiting...");
+        io::stdout().flush()?;
+
+        let sg_id = loop {
+            let updates = bot.get_updates(offset, 30).await.unwrap_or_default();
+            for update in &updates {
+                if update.update_id >= offset {
+                    offset = update.update_id + 1;
+                }
+                if let Some(ref msg) = update.message {
+                    if msg.chat.chat_type == "supergroup" {
+                        break; // not the outer loop — handled below
+                    }
+                }
+            }
+            // Check if any update contained a supergroup message.
+            if let Some(sg) = updates.iter().find_map(|u| {
+                u.message
+                    .as_ref()
+                    .filter(|m| m.chat.chat_type == "supergroup")
+                    .map(|m| m.chat.id)
+            }) {
+                break sg;
+            }
+        };
+
+        println!("   ✓ Detected supergroup: {sg_id}");
+
+        // Verify permissions.
         let me = bot.get_me().await?;
         match pup_telegram::topics::TopicsManager::validate(&bot, sg_id, me.id).await {
-            Ok(()) => println!("   ✓ Supergroup verified, bot has permissions\n"),
+            Ok(()) => println!("   ✓ Bot has required permissions\n"),
             Err(e) => {
                 println!("   ⚠ Warning: {e}");
                 println!("   (You can fix this later and re-run setup)\n");
             }
         }
+
+        supergroup_id = Some(sg_id);
     }
 
     // ── Generate config ─────────────────────────────────────────
