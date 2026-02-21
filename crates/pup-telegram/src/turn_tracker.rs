@@ -6,16 +6,8 @@ use tracing::debug;
 use crate::bot::BotClient;
 use crate::outbox::{Outbox, OutboxOp};
 use crate::render::{
-    cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html, MAX_BODY_CHARS,
+    cancel_keyboard, empty_keyboard, split_message, to_telegram_html, MAX_BODY_CHARS,
 };
-
-/// A tool call within the current turn.
-#[derive(Debug)]
-struct ToolEntry {
-    name: String,
-    completed: bool,
-    is_error: bool,
-}
 
 /// State for one agent turn in one session.
 #[derive(Debug)]
@@ -32,8 +24,6 @@ struct TurnState {
     send_pending: bool,
     /// Channel to receive the sent message ID.
     send_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<crate::bot::SentMessage>>>,
-    /// Tool calls so far in this turn.
-    tools: Vec<ToolEntry>,
     /// Accumulated streaming text for the current assistant message.
     streaming_text: String,
     /// Last time we sent an edit to Telegram.
@@ -71,45 +61,14 @@ impl TurnState {
 
     /// Render the current turn state as Telegram HTML.
     fn render(&self) -> String {
-        let mut parts = Vec::new();
-
-        // Tool summary line: ✅ bash · ✅ read · 🔧 bash
-        if !self.tools.is_empty() {
-            let tool_parts: Vec<String> = self
-                .tools
-                .iter()
-                .map(|t| {
-                    let icon = if !t.completed {
-                        "🔧"
-                    } else if t.is_error {
-                        "❌"
-                    } else {
-                        "✅"
-                    };
-                    format!("{icon} {}", escape_html(&t.name))
-                })
-                .collect();
-            parts.push(tool_parts.join(" · "));
-        }
-
-        // Streaming text below tool summary.
+        // Show streaming text if we have any, otherwise a placeholder.
         if !self.streaming_text.is_empty() {
             let html = to_telegram_html(&self.streaming_text);
             if !html.is_empty() {
-                if !parts.is_empty() {
-                    parts.push(String::new()); // blank line separator
-                }
-                parts.push(html);
+                return html;
             }
         }
-
-        let text = parts.join("\n");
-        if text.is_empty() {
-            // Telegram rejects empty edits; shouldn't happen but guard.
-            "…".to_owned()
-        } else {
-            text
-        }
+        "…".to_owned()
     }
 
     /// Enqueue an edit (or initial send) for the current state.
@@ -200,7 +159,6 @@ impl TurnTracker {
                 telegram_message_id: None,
                 send_pending: false,
                 send_rx: None,
-                tools: Vec::new(),
                 streaming_text: String::new(),
                 last_edit: Instant::now(),
                 dirty: false,
@@ -236,49 +194,19 @@ impl TurnTracker {
         state.last_edit = Instant::now();
     }
 
-    /// Record a tool starting.
-    pub fn tool_start(&mut self, session_id: &str, tool_name: &str, outbox: &mut Outbox) {
-        // Send the message on first event if needed.
-        let initial = format!("🔧 {}", escape_html(tool_name));
-        self.ensure_message(session_id, &initial, outbox);
-
-        let Some(state) = self.turns.get_mut(session_id) else {
-            return;
-        };
-
-        state.tools.push(ToolEntry {
-            name: tool_name.to_owned(),
-            completed: false,
-            is_error: false,
-        });
-        state.dirty = true;
-        state.flush(outbox, self.edit_interval_ms);
+    /// Note that a tool started. Ensures the Telegram message exists.
+    pub fn tool_start(&mut self, session_id: &str, _tool_name: &str, outbox: &mut Outbox) {
+        self.ensure_message(session_id, "…", outbox);
     }
 
-    /// Record a tool finishing.
+    /// Note that a tool finished. No-op (typing indicator covers visibility).
     pub fn tool_end(
         &mut self,
-        session_id: &str,
-        tool_name: &str,
-        is_error: bool,
-        outbox: &mut Outbox,
+        _session_id: &str,
+        _tool_name: &str,
+        _is_error: bool,
+        _outbox: &mut Outbox,
     ) {
-        let Some(state) = self.turns.get_mut(session_id) else {
-            return;
-        };
-
-        // Mark the matching tool as completed.
-        if let Some(entry) = state
-            .tools
-            .iter_mut()
-            .rev()
-            .find(|t| t.name == tool_name && !t.completed)
-        {
-            entry.completed = true;
-            entry.is_error = is_error;
-        }
-        state.dirty = true;
-        state.flush(outbox, self.edit_interval_ms);
     }
 
     /// Accumulate a streaming text delta.
