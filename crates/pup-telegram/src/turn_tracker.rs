@@ -1,6 +1,9 @@
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use tracing::debug;
+
+use crate::bot::BotClient;
 use crate::outbox::{Outbox, OutboxOp};
 use crate::render::{
     cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html, MAX_BODY_CHARS,
@@ -37,6 +40,8 @@ struct TurnState {
     last_edit: Instant,
     /// Whether content has changed since the last edit.
     dirty: bool,
+    /// Sender to stop the typing indicator loop (dropped on turn end).
+    typing_stop: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl TurnState {
@@ -161,9 +166,31 @@ impl TurnTracker {
 
     /// Start tracking a new agent turn.
     ///
-    /// Does NOT send a message yet — that happens on the first event
-    /// (tool_start or message_delta) so the user never sees a placeholder.
-    pub fn start_turn(&mut self, session_id: &str, chat_id: i64, thread_id: Option<i64>) {
+    /// Spawns a background typing indicator loop that keeps the "typing…"
+    /// status alive in Telegram until the turn ends. Does NOT send a
+    /// content message yet — that happens on the first tool/delta event.
+    pub fn start_turn(
+        &mut self,
+        session_id: &str,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        bot: &BotClient,
+    ) {
+        // Spawn typing indicator loop. Dropping the tx end stops it.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let bot = bot.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
+                    debug!(error = %e, "typing indicator failed");
+                }
+                tokio::select! {
+                    _ = stop_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                }
+            }
+        });
+
         self.turns.insert(
             session_id.to_owned(),
             TurnState {
@@ -177,6 +204,7 @@ impl TurnTracker {
                 streaming_text: String::new(),
                 last_edit: Instant::now(),
                 dirty: false,
+                typing_stop: Some(stop_tx),
             },
         );
     }
@@ -321,6 +349,9 @@ impl TurnTracker {
         let Some(mut state) = self.turns.remove(session_id) else {
             return;
         };
+
+        // Stop the typing indicator (dropping the sender closes the channel).
+        state.typing_stop.take();
 
         // Resolve message ID if still pending.
         state.try_resolve_message_id();

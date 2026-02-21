@@ -340,4 +340,21 @@ impl BotClient {
     pub async fn get_me(&self) -> Result<User> {
         self.call("getMe", &serde_json::json!({})).await
     }
+
+    /// Send a chat action (e.g. "typing").
+    pub async fn send_chat_action(
+        &self,
+        chat_id: i64,
+        action: &str,
+        message_thread_id: Option<i64>,
+    ) -> Result<bool> {
+        let mut params = serde_json::json!({
+            "chat_id": chat_id,
+            "action": action,
+        });
+        if let Some(tid) = message_thread_id {
+            params["message_thread_id"] = tid.into();
+        }
+        self.call("sendChatAction", &params).await
+    }
 }

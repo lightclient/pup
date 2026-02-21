@@ -577,18 +577,21 @@ impl ChatBackend for TelegramBackend {
 
                 // Start a new turn — the tracker will send the first
                 // Telegram message lazily on the first tool/delta event.
+                // Also starts a typing indicator loop in the background.
                 if let Some(ref topics) = self.topics {
                     if let Some(thread_id) = topics.thread_for_session(session_id) {
                         self.turn_tracker.start_turn(
                             session_id,
                             topics.chat_id(),
                             Some(thread_id),
+                            &self.bot,
                         );
                     }
                 } else if self.dm.attached.as_deref() == Some(session_id.as_str())
                     && let Some(chat_id) = self.dm_chat_id
                 {
-                    self.turn_tracker.start_turn(session_id, chat_id, None);
+                    self.turn_tracker
+                        .start_turn(session_id, chat_id, None, &self.bot);
                 }
             }
             SessionEvent::AgentEnd { ref session_id } => {
