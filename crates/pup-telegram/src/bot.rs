@@ -41,6 +41,14 @@ pub struct Message {
     pub chat: Chat,
     pub text: Option<String>,
     pub message_thread_id: Option<i64>,
+    /// Present on service messages when a forum topic is created.
+    pub forum_topic_created: Option<ForumTopicCreatedMsg>,
+}
+
+/// Service message: a forum topic was created.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ForumTopicCreatedMsg {
+    pub name: String,
 }
 
 /// A Telegram user.

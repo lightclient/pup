@@ -5,6 +5,9 @@ pub mod render;
 pub mod streaming;
 pub mod topics;
 
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use pup_core::types::{IncomingMessage, MessageSource, SessionEvent, SessionInfo};
@@ -16,7 +19,7 @@ use tracing::{debug, info, info_span, warn, Instrument};
 use bot::{BotClient, Update};
 use dm::{DmCommand, DmState, ResolveResult};
 use outbox::{Outbox, OutboxOp};
-use render::{escape_html, format_tool_call, format_user_message};
+use render::{escape_html, format_history, format_tool_call, format_user_message};
 use streaming::StreamingManager;
 use topics::TopicsManager;
 
@@ -33,6 +36,10 @@ pub struct TelegramConfig {
     pub edit_interval_ms: u64,
     pub verbose: bool,
     pub history_turns: usize,
+    /// Path to `~/.pi/pup/` — used to scan for live sessions on startup.
+    pub socket_dir: PathBuf,
+    /// Path to the topics state file for persisting the topic mapping.
+    pub topics_state_path: PathBuf,
 }
 
 /// The Telegram chat backend.
@@ -69,7 +76,11 @@ impl TelegramBackend {
 
         let topics = if config.topics_enabled {
             config.supergroup_id.map(|id| {
-                TopicsManager::new(id, config.topic_icon.clone())
+                TopicsManager::new(
+                    id,
+                    config.topic_icon.clone(),
+                    config.topics_state_path.clone(),
+                )
             })
         } else {
             None
@@ -326,6 +337,94 @@ impl TelegramBackend {
                 });
             }
     }
+
+    /// Drain `getUpdates` from `offset`, recording any `forum_topic_created`
+    /// service messages in the supergroup whose name matches our icon.
+    ///
+    /// Returns the new offset to use for normal polling (one past the last
+    /// update we consumed). Does NOT process messages — they're stale.
+    async fn scan_updates_for_topics(
+        bot: &BotClient,
+        mut offset: i64,
+        supergroup_id: i64,
+        topic_icon: &str,
+        topics: &mut TopicsManager,
+    ) -> i64 {
+        let mut total_updates = 0u64;
+        let mut discovered = 0u64;
+
+        loop {
+            // timeout=0 → return immediately with whatever's available.
+            let updates = match bot.get_updates(offset, 0).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(error = %e, "failed to scan updates for topics");
+                    break;
+                }
+            };
+
+            if updates.is_empty() {
+                break;
+            }
+
+            for update in &updates {
+                if update.update_id >= offset {
+                    offset = update.update_id + 1;
+                }
+                total_updates += 1;
+
+                // Only look at messages in our supergroup.
+                let Some(ref msg) = update.message else {
+                    continue;
+                };
+                if msg.chat.id != supergroup_id {
+                    continue;
+                }
+
+                // Check for forum_topic_created service messages with our icon.
+                if let Some(ref ftc) = msg.forum_topic_created
+                    && ftc.name.starts_with(topic_icon)
+                    && let Some(thread_id) = msg.message_thread_id
+                {
+                    debug!(
+                        thread_id,
+                        topic_name = %ftc.name,
+                        "discovered topic from update scan"
+                    );
+                    topics.record_discovered_thread(thread_id);
+                    discovered += 1;
+                }
+            }
+        }
+
+        topics.set_scan_checkpoint(offset);
+
+        info!(
+            total_updates,
+            discovered,
+            new_offset = offset,
+            "topic scan complete"
+        );
+
+        offset
+    }
+}
+
+/// Enumerate session IDs from `.sock` files in the socket directory.
+async fn scan_live_sessions(socket_dir: &Path) -> HashSet<String> {
+    let mut live = HashSet::new();
+    let Ok(mut dir) = tokio::fs::read_dir(socket_dir).await else {
+        return live;
+    };
+    while let Ok(Some(entry)) = dir.next_entry().await {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("sock")
+            && let Some(session_id) = path.file_stem().and_then(|s| s.to_str())
+        {
+            live.insert(session_id.to_owned());
+        }
+    }
+    live
 }
 
 #[async_trait]
@@ -357,11 +456,41 @@ impl ChatBackend for TelegramBackend {
             ];
             let _ = self.bot.set_my_commands(&commands).await;
 
-            // Validate topics setup if enabled.
-            if let Some(ref topics) = self.topics {
+            // Validate topics setup if enabled, scan for orphaned topics,
+            // and clean up stale ones.
+            if let Some(ref mut topics) = self.topics {
                 TopicsManager::validate(&self.bot, topics.chat_id(), self.bot_user_id)
                     .await
                     .context("topics validation failed")?;
+
+                // Drain pending getUpdates from our checkpoint to discover
+                // topic creations we might have missed (crashes, pre-persistence
+                // era, etc.). Only records threads whose name matches our icon.
+                let scan_offset = topics.scan_checkpoint();
+                let supergroup_id = topics.chat_id();
+                let icon = topics.topic_icon().to_owned();
+                let new_offset = Self::scan_updates_for_topics(
+                    &self.bot,
+                    scan_offset,
+                    supergroup_id,
+                    &icon,
+                    topics,
+                )
+                .await;
+
+                // Start normal polling from wherever the scan left off.
+                if new_offset > self.update_offset {
+                    self.update_offset = new_offset;
+                }
+
+                // Determine which sessions are currently alive.
+                let live_sessions = scan_live_sessions(&self.config.socket_dir).await;
+                info!(live_count = live_sessions.len(), "scanned for live sessions");
+
+                // Delete every known topic that doesn't match a live session.
+                topics
+                    .cleanup_stale_topics(&self.bot, &live_sessions)
+                    .await;
             }
 
             info!(
@@ -380,11 +509,33 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::Connected { ref info } => {
                 self.sessions.push(info.clone());
 
-                // Topics mode: create a topic.
-                if let Some(ref mut topics) = self.topics
-                    && let Err(e) = topics.create_topic(&self.bot, info).await {
-                        warn!(error = %e, "failed to create topic");
+                // Topics mode: create a topic and post recent history.
+                if let Some(ref mut topics) = self.topics {
+                    match topics.create_topic(&self.bot, info).await {
+                        Ok(thread_id) => {
+                            // Post recent history so the topic is immediately useful.
+                            if !info.history.is_empty() {
+                                let msgs = format_history(
+                                    &info.history,
+                                    self.config.history_turns,
+                                );
+                                for msg in msgs {
+                                    self.outbox.enqueue(OutboxOp::Send {
+                                        chat_id: topics.chat_id(),
+                                        text: msg,
+                                        parse_mode: Some("HTML".to_owned()),
+                                        reply_markup: None,
+                                        message_thread_id: Some(thread_id),
+                                        result_tx: None,
+                                    });
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "failed to create topic");
+                        }
                     }
+                }
             }
             SessionEvent::Disconnected { ref session_id } => {
                 self.sessions.retain(|s| s.session_id != *session_id);
@@ -522,36 +673,39 @@ impl ChatBackend for TelegramBackend {
     }
 
     async fn recv_incoming(&mut self) -> Result<Option<IncomingMessage>> {
-        // Poll for Telegram updates.
-        match self
-            .bot
-            .get_updates(self.update_offset, 30)
-            .await
-        {
-            Ok(updates) => {
-                for update in updates {
-                    if update.update_id >= self.update_offset {
-                        self.update_offset = update.update_id + 1;
+        loop {
+            // Poll for Telegram updates (long-polls for up to 30s).
+            match self
+                .bot
+                .get_updates(self.update_offset, 30)
+                .await
+            {
+                Ok(updates) => {
+                    for update in updates {
+                        if update.update_id >= self.update_offset {
+                            self.update_offset = update.update_id + 1;
+                        }
+                        self.handle_update(update).await;
                     }
-                    self.handle_update(update).await;
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to poll Telegram updates");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
             }
-            Err(e) => {
-                warn!(error = %e, "failed to poll Telegram updates");
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            // Drain any incoming messages generated by handle_update.
+            if let Some(ref mut rx) = self.incoming_rx {
+                match rx.try_recv() {
+                    Ok(msg) => return Ok(Some(msg)),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No messages this cycle, continue long-polling.
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
+                }
             }
         }
-
-        // Drain any incoming messages generated by handle_update.
-        if let Some(ref mut rx) = self.incoming_rx {
-            match rx.try_recv() {
-                Ok(msg) => return Ok(Some(msg)),
-                Err(mpsc::error::TryRecvError::Empty) => {}
-                Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
-            }
-        }
-
-        Ok(None)
     }
 
     async fn shutdown(&mut self) -> Result<()> {

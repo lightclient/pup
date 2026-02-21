@@ -331,6 +331,39 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Format conversation history turns for posting into a topic.
+///
+/// Returns a vec of HTML messages — one per turn — most recent last.
+/// Each message shows the user prompt and the (possibly truncated) assistant
+/// reply.  Only the last `max_turns` turns are included.
+pub fn format_history(turns: &[pup_ipc::Turn], max_turns: usize) -> Vec<String> {
+    let start = turns.len().saturating_sub(max_turns);
+    let mut msgs = Vec::new();
+
+    for (i, turn) in turns[start..].iter().enumerate() {
+        let mut parts = Vec::new();
+
+        if let Some(ref user) = turn.user {
+            parts.push(format!("👤 <i>{}</i>", escape_html(&user.content)));
+        }
+        if let Some(ref asst) = turn.assistant {
+            let rendered = to_telegram_html(&asst.content);
+            parts.push(rendered);
+        }
+
+        if !parts.is_empty() {
+            let label = format!(
+                "<i>— turn {}/{} —</i>\n",
+                start + i + 1,
+                turns.len()
+            );
+            msgs.push(format!("{label}{}", parts.join("\n\n")));
+        }
+    }
+
+    msgs
+}
+
 /// Build the cancel inline keyboard markup.
 pub fn cancel_keyboard(session_id: &str) -> serde_json::Value {
     serde_json::json!({

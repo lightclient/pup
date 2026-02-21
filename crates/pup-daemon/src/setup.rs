@@ -101,13 +101,19 @@ pub(crate) async fn run_setup() -> Result<()> {
 
         println!("   ✓ Detected supergroup: {sg_id}");
 
-        // Verify permissions.
+        // Verify permissions — loop until the bot has what it needs.
         let me = bot.get_me().await?;
-        match pup_telegram::topics::TopicsManager::validate(&bot, sg_id, me.id).await {
-            Ok(()) => println!("   ✓ Bot has required permissions\n"),
-            Err(e) => {
-                println!("   ⚠ Warning: {e}");
-                println!("   (You can fix this later and re-run setup)\n");
+        loop {
+            match pup_telegram::topics::TopicsManager::validate(&bot, sg_id, me.id).await {
+                Ok(()) => {
+                    println!("   ✓ Bot has required permissions\n");
+                    break;
+                }
+                Err(e) => {
+                    println!("   ✗ {e}");
+                    println!("   Make the bot an admin with \"Manage Topics\" permission.");
+                    prompt("   Press Enter to re-check...")?;
+                }
             }
         }
 

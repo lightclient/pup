@@ -383,10 +383,13 @@ impl SessionManager {
     }
 
     /// Fan out a session event to all backends.
+    ///
+    /// Uses `send().await` to apply backpressure rather than dropping events
+    /// when the backend is busy with slow API calls.
     async fn fanout(&self, event: SessionEvent) {
         for tx in &self.backend_txs {
-            if tx.try_send(event.clone()).is_err() {
-                warn!("backend channel full or closed, dropping event");
+            if tx.send(event.clone()).await.is_err() {
+                warn!("backend channel closed, dropping event");
             }
         }
     }

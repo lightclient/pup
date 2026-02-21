@@ -179,6 +179,8 @@ impl Config {
             .as_ref()
             .map_or(default_max_message_length(), |d| d.max_message_length);
 
+        let socket_dir = self.socket_dir();
+
         Some(pup_telegram::TelegramConfig {
             bot_token: tg.bot_token.clone(),
             allowed_user_ids: tg.allowed_user_ids.clone(),
@@ -190,6 +192,8 @@ impl Config {
             edit_interval_ms: self.streaming.edit_interval_ms,
             verbose: self.display.verbose,
             history_turns: self.display.history_turns,
+            topics_state_path: socket_dir.join("topics_state.json"),
+            socket_dir,
         })
     }
 }

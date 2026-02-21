@@ -128,7 +128,53 @@ pub struct Turn {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnMessage {
     pub content: String,
+    /// Timestamp — accepts both integer (epoch ms) and ISO 8601 string.
+    #[serde(deserialize_with = "deserialize_flexible_timestamp")]
     pub timestamp: u64,
+}
+
+/// Deserialize a timestamp that may be either a u64 (epoch ms) or an ISO 8601 string.
+fn deserialize_flexible_timestamp<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct TimestampVisitor;
+
+    impl de::Visitor<'_> for TimestampVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a u64 epoch-ms or an ISO 8601 date string")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            Ok(v as u64)
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<u64, E> {
+            Ok(v as u64)
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            // Try parsing as ISO 8601 (e.g. "2026-02-21T15:11:53.270Z").
+            // Fall back to treating it as a numeric string.
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
+                Ok(dt.timestamp_millis() as u64)
+            } else if let Ok(n) = v.parse::<u64>() {
+                Ok(n)
+            } else {
+                Err(de::Error::custom(format!("unrecognised timestamp: {v}")))
+            }
+        }
+    }
+
+    deserializer.deserialize_any(TimestampVisitor)
 }
 
 /// A tool call within a turn.
