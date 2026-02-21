@@ -550,6 +550,165 @@ trap teardown EXIT
 setup
 
 TESTS="${1:-all}"
+# ─── TUI-path tests for commands missing TUI coverage ────────────
+
+test_t18() {
+  log "T18 — /compact via TUI preserves the topic"
+  start_pi "e2e-t18"
+  if ! wait_topic "e2e-t18" 20 >/dev/null; then
+    fail "T18" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t18")
+  # Build context so compact has something to work with
+  $TG send "$SUPERGROUP" "$tid" "say BEFORE_COMPACT_TUI" 2>/dev/null >/dev/null
+  wait_bot_msg "$tid" "BEFORE_COMPACT_TUI" 60 >/dev/null || true
+  # Run /compact via TUI
+  pi_send "e2e-t18" "/compact"
+  sleep 12
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    local active_tid
+    active_tid=$(get_any_topic_id)
+    $TG send "$SUPERGROUP" "$active_tid" "say AFTER_COMPACT_TUI" 2>/dev/null >/dev/null
+    if wait_bot_msg "$active_tid" "AFTER_COMPACT_TUI" 60 >/dev/null; then
+      pass "T18"
+    else
+      fail "T18" "no response after /compact via TUI"
+    fi
+  else
+    fail "T18" "topic disappeared after /compact via TUI"
+  fi
+  exit_pi "e2e-t18"
+  wait_all_topics_gone 20 || true
+}
+
+test_t22() {
+  log "T22 — /quit via TUI deletes the topic"
+  start_pi "e2e-t22"
+  if ! wait_topic "e2e-t22" 20 >/dev/null; then
+    fail "T22" "topic never appeared"
+    return
+  fi
+  # /quit via TUI (unlike /exit which the agent intercepts, /quit is a real pi command)
+  pi_send "e2e-t22" "/quit"
+  sleep 3
+  # /quit should close pi; close the shell too
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t22" "exit" Enter 2>/dev/null || true
+  if wait_all_topics_gone 20; then
+    pass "T22"
+  else
+    fail "T22" "topic not deleted after /quit via TUI"
+  fi
+}
+
+test_t23() {
+  log "T23 — Plain message via TUI produces response in topic"
+  start_pi "e2e-t23"
+  if ! wait_topic "e2e-t23" 20 >/dev/null; then
+    fail "T23" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t23")
+  # Send a prompt via the TUI, expect it to appear in the topic
+  pi_send "e2e-t23" "say exactly MANGO_TUI"
+  if wait_bot_msg "$tid" "MANGO_TUI" 60 >/dev/null; then
+    pass "T23"
+  else
+    fail "T23" "TUI prompt response not visible in topic"
+  fi
+  exit_pi "e2e-t23"
+  wait_all_topics_gone 20 || true
+}
+
+# ─── Cancel tests ────────────────────────────────────────────────
+
+test_c01() {
+  log "C01 — /cancel via Telegram aborts the agent"
+  start_pi "e2e-c01"
+  if ! wait_topic "e2e-c01" 20 >/dev/null; then
+    fail "C01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-c01")
+  # Start a long prompt
+  $TG send "$SUPERGROUP" "$tid" "write a very long and detailed essay about the entire history of computing from the abacus to modern quantum computers" 2>/dev/null >/dev/null
+  sleep 8
+  # Cancel
+  $TG send "$SUPERGROUP" "$tid" "/cancel" 2>/dev/null >/dev/null
+  # Wait for abort to settle — pi needs time to process the abort,
+  # finish any in-flight API call, and become idle again.
+  sleep 15
+  # The agent should have stopped. Send a quick follow-up to verify session works.
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word CANCEL_OK" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "CANCEL_OK" 60 >/dev/null; then
+    pass "C01"
+  else
+    fail "C01" "session not responsive after /cancel"
+  fi
+  exit_pi "e2e-c01"
+  wait_all_topics_gone 20 || true
+}
+
+test_c02() {
+  log "C02 — cancel via TUI (Escape) aborts and topic stays"
+  start_pi "e2e-c02"
+  if ! wait_topic "e2e-c02" 20 >/dev/null; then
+    fail "C02" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-c02")
+  # Start a long prompt via Telegram
+  $TG send "$SUPERGROUP" "$tid" "write a very long and detailed essay about the entire history of computing from the abacus to modern quantum computers" 2>/dev/null >/dev/null
+  sleep 8
+  # Cancel via TUI (Escape key aborts in pi)
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-c02" Escape
+  # Wait for abort to settle
+  sleep 15
+  # Verify session still works
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word CANCEL_TUI_OK" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "CANCEL_TUI_OK" 60 >/dev/null; then
+    pass "C02"
+  else
+    fail "C02" "session not responsive after TUI cancel"
+  fi
+  exit_pi "e2e-c02"
+  wait_all_topics_gone 20 || true
+}
+
+# ─── Follow-up (>>) tests ───────────────────────────────────────
+
+test_f01() {
+  log "F01 — >> follow-up via Telegram"
+  start_pi "e2e-f01"
+  if ! wait_topic "e2e-f01" 20 >/dev/null; then
+    fail "F01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-f01")
+  # Send a prompt that keeps the agent busy
+  $TG send "$SUPERGROUP" "$tid" "count from 1 to 50, one number per line" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a follow-up while streaming
+  $TG send "$SUPERGROUP" "$tid" ">> after counting, say exactly PAPAYA_FOLLOWUP" 2>/dev/null >/dev/null
+  # Wait for the follow-up response
+  if wait_bot_msg "$tid" "PAPAYA_FOLLOWUP" 90 >/dev/null; then
+    pass "F01"
+  else
+    fail "F01" "follow-up response not found"
+  fi
+  exit_pi "e2e-f01"
+  wait_all_topics_gone 20 || true
+}
+
+# ─── Telegram slash command tests ────────────────────────────────
+
 test_s01() {
   log "S01 — /name via Telegram renames the topic"
   start_pi "e2e-s01"
@@ -655,23 +814,38 @@ test_s04() {
 }
 
 if [ "$TESTS" = "all" ]; then
-  test_t01
-  test_t02
-  test_t03
-  test_t04
-  test_t05
-  test_t09
-  test_t13
-  test_t14
-  test_t15
-  test_t16
-  test_t17
-  test_t19
-  test_t21
-  test_s01
-  test_s02
-  test_s03
-  test_s04
+  # Core lifecycle
+  test_t01   # topic created
+  test_t02   # topic deleted on exit
+  test_t03   # message via Telegram → response
+  test_t23   # message via TUI → response in topic
+  test_t04   # parallel sessions
+  test_t05   # /name via TUI
+  test_t09   # tool calls visible
+  test_t13   # fast response timing
+  test_t14   # concurrent prompts
+
+  # Session reset via TUI
+  test_t15   # /new via TUI preserves topic
+  test_t16   # messages work after /new via TUI
+  test_t17   # multiple /new via TUI
+  test_t18   # /compact via TUI preserves topic
+  test_t19   # /new then exit via TUI
+  test_t22   # /quit via TUI deletes topic
+  test_t21   # unnamed session fallback naming
+
+  # Slash commands via Telegram
+  test_s01   # /name via Telegram
+  test_s02   # /quit via Telegram
+  test_s03   # /new via Telegram
+  test_s04   # /compact via Telegram
+
+  # Cancel
+  test_c01   # /cancel via Telegram
+  test_c02   # cancel via TUI (Escape)
+
+  # Follow-up
+  test_f01   # >> prefix via Telegram
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do
