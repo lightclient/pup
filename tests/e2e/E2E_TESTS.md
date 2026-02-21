@@ -38,6 +38,26 @@ mkdir -p "$SOCKET_DIR"
 SOCKET="$SOCKET_DIR/pup-e2e.sock"
 ```
 
+## Isolated socket directory
+
+To prevent the test pi sessions from mixing with your personal pi sessions,
+the extension supports `PUP_SOCKET_DIR` as an env override for its socket
+directory. Set this when starting test pi sessions AND in the pup config:
+
+```bash
+PUP_SOCKET_DIR=/tmp/pup-e2e-sockets
+export PUP_SOCKET_DIR
+mkdir -p "$PUP_SOCKET_DIR"
+```
+
+The pup `--config` flag should point to a test config with matching
+`socket_dir`:
+
+```toml
+[pup]
+socket_dir = "/tmp/pup-e2e-sockets"
+```
+
 ## Key concept: topics map to pi processes, not sessions
 
 A Telegram topic is tied to a running **pi process**, not a pi session.
@@ -60,10 +80,10 @@ anything.
 # Create a temp dir for the session to work in
 WORK=$(mktemp -d)
 
-# Start pi in a new tmux window
+# Start pi in a new tmux window (PUP_SOCKET_DIR isolates from other sessions)
 tmux -S "$SOCKET" new-window -t e2e -n "pi-NAME"
 tmux -S "$SOCKET" send-keys -t e2e:pi-NAME \
-  "cd $WORK && pi --dangerously-skip-permissions" Enter
+  "cd $WORK && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
 ```
 
 After pi starts, name the session with `/name`:
@@ -80,10 +100,15 @@ tmux -S "$SOCKET" send-keys -t e2e:pi-NAME \
   "say hello world" Enter
 ```
 
-To exit a pi session:
+To exit a pi session (Ctrl-D, not `/exit` — the agent intercepts `/exit`
+as a user message instead of treating it as a pi slash command):
 
 ```bash
-tmux -S "$SOCKET" send-keys -t e2e:pi-NAME "/exit" Enter
+tmux -S "$SOCKET" send-keys -t e2e:pi-NAME C-c   # interrupt if mid-turn
+sleep 0.5
+tmux -S "$SOCKET" send-keys -t e2e:pi-NAME C-d   # EOF → pi exits
+sleep 2
+tmux -S "$SOCKET" send-keys -t e2e:pi-NAME "exit" Enter  # close the shell
 ```
 
 ## Starting pup in tmux
@@ -92,7 +117,7 @@ tmux -S "$SOCKET" send-keys -t e2e:pi-NAME "/exit" Enter
 tmux -S "$SOCKET" new-session -d -s e2e -n pup
 sleep 1
 tmux -S "$SOCKET" send-keys -t e2e:pup \
-  "cd /root/handoff/main && rm -f ~/.pi/pup/*.sock ~/.pi/pup/*.alias && RUST_LOG=info ./target/debug/pup" Enter
+  "cd /root/handoff/main && RUST_LOG=info ./target/debug/pup --config /tmp/pup-e2e-config.toml" Enter
 ```
 
 Wait for `telegram backend started` in the output before proceeding:
@@ -113,11 +138,22 @@ done
 
 ## Teardown (after all tests)
 
-1. Exit all pi sessions (`/exit`)
+1. Exit all pi sessions (Ctrl-D)
 2. Wait a few seconds for topic cleanup
 3. Stop pup (`Ctrl-C`)
 4. Kill tmux: `tmux -S "$SOCKET" kill-server`
 5. Verify no leftover topics besides "General"
+
+## Automated runner
+
+```bash
+cd /root/handoff/main
+bash tests/e2e/run_e2e.sh           # run all tests
+bash tests/e2e/run_e2e.sh "t01 t03" # run specific tests
+```
+
+The runner handles setup/teardown automatically: starts pup with an
+isolated `PUP_SOCKET_DIR`, runs the requested tests, and cleans up.
 
 ---
 

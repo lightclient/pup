@@ -15,7 +15,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import * as crypto from "node:crypto";
 
-const SOCKET_DIR = path.join(os.homedir(), ".pi", "pup");
+const SOCKET_DIR = process.env.PUP_SOCKET_DIR || path.join(os.homedir(), ".pi", "pup");
 const DEFAULT_HISTORY_TURNS = 5;
 const NAME_POLL_INTERVAL = 1000;
 const SOCKET_CHECK_INTERVAL = 2000;

@@ -1,0 +1,588 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# ─── Constants ──────────────────────────────────────────────────────
+SOCKET_DIR=${TMPDIR:-/tmp}/claude-tmux-sockets
+SOCKET="$SOCKET_DIR/pup-e2e.sock"
+PUP_CONFIG="${PUP_CONFIG:-$HOME/.config/pup/config.toml}"
+SUPERGROUP=$(python3 -c "import tomllib; print(tomllib.load(open('$PUP_CONFIG','rb'))['backends']['telegram']['topics']['supergroup_id'])")
+BOT_TOKEN=$(python3 -c "import tomllib; print(tomllib.load(open('$PUP_CONFIG','rb'))['backends']['telegram']['bot_token'])")
+BOT_ID=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['id'])")
+PROJECT=/root/handoff/main
+TG="uv run $PROJECT/tests/e2e/tg.py"
+# Isolated socket dir so other pi sessions don't interfere
+PUP_SOCKET_DIR=/tmp/pup-e2e-sockets
+export PUP_SOCKET_DIR
+
+PASSED=0
+FAILED=0
+SKIPPED=0
+ERRORS=()
+
+# ─── Helpers ────────────────────────────────────────────────────────
+log()  { echo -e "\033[1;34m[INFO]\033[0m $*"; }
+pass() { echo -e "\033[1;32m[PASS]\033[0m $1"; PASSED=$((PASSED + 1)); }
+fail() { echo -e "\033[1;31m[FAIL]\033[0m $1: $2"; FAILED=$((FAILED + 1)); ERRORS+=("$1: $2"); }
+skip() { echo -e "\033[1;33m[SKIP]\033[0m $1: $2"; SKIPPED=$((SKIPPED + 1)); }
+
+# Wait for a topic matching a query to appear (returns JSON)
+wait_topic() {
+  local query="$1" timeout="${2:-20}"
+  for i in $(seq 1 "$timeout"); do
+    local result
+    result=$($TG topics "$SUPERGROUP" -q "$query" 2>/dev/null)
+    local count
+    count=$(echo "$result" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
+    if [ "$count" -gt 0 ]; then
+      echo "$result"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Get first non-General topic ID for a query
+get_topic_id() {
+  local query="$1"
+  $TG topics "$SUPERGROUP" -q "$query" 2>/dev/null | python3 -c "
+import sys, json
+topics = json.load(sys.stdin)
+for t in topics:
+    if t['id'] != 1:
+        print(t['id'])
+        break
+" 2>/dev/null
+}
+
+# Get first non-General topic ID (any topic)
+get_any_topic_id() {
+  $TG topics "$SUPERGROUP" 2>/dev/null | python3 -c "
+import sys, json
+topics = json.load(sys.stdin)
+for t in topics:
+    if t['id'] != 1:
+        print(t['id'])
+        break
+" 2>/dev/null
+}
+
+# Wait for all non-General topics to disappear
+wait_all_topics_gone() {
+  local timeout="${1:-20}"
+  for i in $(seq 1 "$timeout"); do
+    local cnt
+    cnt=$(count_topics)
+    if [ "$cnt" = "0" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Wait for topic to disappear
+wait_no_topic() {
+  local query="$1" timeout="${2:-20}"
+  for i in $(seq 1 "$timeout"); do
+    local result
+    result=$($TG topics "$SUPERGROUP" -q "$query" 2>/dev/null)
+    local count
+    count=$(echo "$result" | python3 -c "import sys,json; print(len([t for t in json.load(sys.stdin) if t['id'] != 1]))" 2>/dev/null || echo 1)
+    if [ "$count" = "0" ]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+# Start a pi session in tmux (Ctrl-D exits pi, not /exit)
+start_pi() {
+  local name="$1"
+  local work
+  work=$(mktemp -d)
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$name"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "/name $name" Enter
+  sleep 3
+}
+
+# Start a pi session without naming it
+start_pi_unnamed() {
+  local label="$1"
+  local work
+  work=$(mktemp -d)
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$label"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$label" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+}
+
+# Exit pi with Ctrl-D (the proper way)
+exit_pi() {
+  local name="$1"
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" C-c
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" C-d
+  sleep 2
+  # Close the shell too
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "exit" Enter 2>/dev/null || true
+  sleep 1
+}
+
+# Send a command to pi TUI
+pi_send() {
+  local name="$1" cmd="$2"
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "$cmd" Enter
+}
+
+# Wait for bot message in topic containing text
+wait_bot_msg() {
+  local topic_id="$1" contains="$2" timeout="${3:-30}"
+  $TG wait "$SUPERGROUP" --topic "$topic_id" --from "$BOT_ID" --contains "$contains" --timeout "$timeout" 2>/dev/null
+}
+
+# Get topic history
+topic_history() {
+  local topic_id="$1" limit="${2:-20}"
+  $TG history "$SUPERGROUP" "$topic_id" --limit "$limit" 2>/dev/null
+}
+
+# Count non-General topics
+count_topics() {
+  $TG topics "$SUPERGROUP" 2>/dev/null | python3 -c "
+import sys, json
+topics = json.load(sys.stdin)
+print(len([t for t in topics if t['id'] != 1]))
+"
+}
+
+# ─── Setup / Teardown ───────────────────────────────────────────────
+setup() {
+  log "Setting up test environment"
+
+  # Create isolated socket dir
+  mkdir -p "$PUP_SOCKET_DIR"
+  rm -f "$PUP_SOCKET_DIR"/*.sock "$PUP_SOCKET_DIR"/*.alias "$PUP_SOCKET_DIR"/topics_state.json
+
+  # Write test pup config (read allowed_user_ids from main config)
+  local allowed_users
+  allowed_users=$(python3 -c "import tomllib; print(tomllib.load(open('$PUP_CONFIG','rb'))['backends']['telegram']['allowed_user_ids'])")
+  cat > /tmp/pup-e2e-config.toml <<EOF
+[pup]
+socket_dir = "$PUP_SOCKET_DIR"
+
+[display]
+verbose = true
+history_turns = 5
+
+[streaming]
+edit_interval_ms = 1500
+
+[backends.telegram]
+enabled = true
+bot_token = "$BOT_TOKEN"
+allowed_user_ids = $allowed_users
+
+[backends.telegram.dm]
+enabled = true
+
+[backends.telegram.topics]
+enabled = true
+supergroup_id = $SUPERGROUP
+topic_icon = "📎"
+
+[backends.telegram.display]
+max_message_length = 3500
+EOF
+
+  # Clean up stale topics
+  $TG topics "$SUPERGROUP" 2>/dev/null | python3 -c "
+import sys, json
+for t in json.load(sys.stdin):
+    if t['id'] != 1:
+        print(t['id'])
+" | while read tid; do
+    curl -s "https://api.telegram.org/bot${BOT_TOKEN}/deleteForumTopic?chat_id=${SUPERGROUP}&message_thread_id=${tid}" >/dev/null 2>&1
+  done
+
+  # Kill any existing tmux session
+  tmux -S "$SOCKET" kill-server 2>/dev/null || true
+  mkdir -p "$SOCKET_DIR"
+
+  # Start tmux + pup
+  tmux -S "$SOCKET" new-session -d -s e2e -n pup
+  sleep 1
+  tmux -S "$SOCKET" send-keys -t e2e:pup \
+    "cd $PROJECT && RUST_LOG=info ./target/debug/pup --config /tmp/pup-e2e-config.toml" Enter
+
+  # Wait for pup to start
+  for i in $(seq 1 30); do
+    sleep 1
+    if tmux -S "$SOCKET" capture-pane -p -t e2e:pup 2>/dev/null | grep -q "telegram backend started"; then
+      log "pup started"
+      return 0
+    fi
+  done
+  log "ERROR: pup failed to start"
+  tmux -S "$SOCKET" capture-pane -p -t e2e:pup
+  exit 1
+}
+
+teardown() {
+  local exit_code=$?
+  log "Tearing down"
+  # Kill all pi windows
+  tmux -S "$SOCKET" list-windows -t e2e -F '#{window_name}' 2>/dev/null | grep '^pi-' | while read w; do
+    tmux -S "$SOCKET" send-keys -t "e2e:$w" C-c 2>/dev/null || true
+    sleep 0.3
+    tmux -S "$SOCKET" send-keys -t "e2e:$w" C-d 2>/dev/null || true
+  done
+  sleep 3
+  tmux -S "$SOCKET" kill-server 2>/dev/null || true
+  rm -rf "$PUP_SOCKET_DIR"
+  exit $exit_code
+}
+
+# ─── Tests ──────────────────────────────────────────────────────────
+
+test_t01() {
+  log "T01 — Topic created when pi session starts"
+  start_pi "e2e-t01"
+  if wait_topic "e2e-t01" 20 >/dev/null; then
+    pass "T01"
+  else
+    fail "T01" "topic not created"
+  fi
+  exit_pi "e2e-t01"
+  wait_no_topic "e2e-t01" 20 || true
+}
+
+test_t02() {
+  log "T02 — Topic deleted when pi session exits"
+  start_pi "e2e-t02"
+  if ! wait_topic "e2e-t02" 20 >/dev/null; then
+    fail "T02" "topic never appeared"
+    return
+  fi
+  exit_pi "e2e-t02"
+  if wait_no_topic "e2e-t02" 20; then
+    pass "T02"
+  else
+    fail "T02" "topic not deleted after exit"
+  fi
+}
+
+test_t03() {
+  log "T03 — User message forwarded to pi session"
+  start_pi "e2e-t03"
+  if ! wait_topic "e2e-t03" 20 >/dev/null; then
+    fail "T03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t03")
+  $TG send "$SUPERGROUP" "$tid" "say exactly PINEAPPLE" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "PINEAPPLE" 60 >/dev/null; then
+    pass "T03"
+  else
+    fail "T03" "no response containing PINEAPPLE"
+  fi
+  exit_pi "e2e-t03"
+  wait_no_topic "e2e-t03" 20 || true
+}
+
+test_t04() {
+  log "T04 — Multiple parallel sessions get separate topics"
+  start_pi "e2e-t04-alpha"
+  start_pi "e2e-t04-beta"
+
+  local ok=true
+  wait_topic "e2e-t04-alpha" 20 >/dev/null || { ok=false; }
+  wait_topic "e2e-t04-beta" 20 >/dev/null || { ok=false; }
+
+  if $ok; then
+    local cnt
+    cnt=$(count_topics)
+    if [ "$cnt" -ge 2 ]; then
+      pass "T04"
+    else
+      fail "T04" "expected >=2 topics, got $cnt"
+    fi
+  else
+    fail "T04" "one or both topics missing"
+  fi
+
+  exit_pi "e2e-t04-alpha"
+  exit_pi "e2e-t04-beta"
+  wait_all_topics_gone 20 || true
+}
+
+test_t05() {
+  log "T05 — Session rename updates topic title"
+  start_pi "e2e-t05-before"
+  if ! wait_topic "e2e-t05-before" 20 >/dev/null; then
+    fail "T05" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-t05-before" "/name e2e-t05-after"
+  sleep 10
+  if wait_topic "e2e-t05-after" 10 >/dev/null; then
+    pass "T05"
+  else
+    fail "T05" "topic not renamed to e2e-t05-after"
+  fi
+  exit_pi "e2e-t05-before"
+  wait_all_topics_gone 20 || true
+}
+
+test_t09() {
+  log "T09 — Tool calls visible in verbose mode"
+  start_pi "e2e-t09"
+  if ! wait_topic "e2e-t09" 20 >/dev/null; then
+    fail "T09" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t09")
+  $TG send "$SUPERGROUP" "$tid" 'run: echo E2E_TOOL_TEST' 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "E2E_TOOL_TEST" 60 >/dev/null; then
+    pass "T09"
+  else
+    fail "T09" "no response containing E2E_TOOL_TEST"
+  fi
+  exit_pi "e2e-t09"
+  wait_all_topics_gone 20 || true
+}
+
+test_t13() {
+  log "T13 — Response available immediately after message_end"
+  start_pi "e2e-t13"
+  if ! wait_topic "e2e-t13" 20 >/dev/null; then
+    fail "T13" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t13")
+  local start_time
+  start_time=$(date +%s)
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word BANANA" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "BANANA" 30 >/dev/null; then
+    local end_time elapsed
+    end_time=$(date +%s)
+    elapsed=$((end_time - start_time))
+    pass "T13 (${elapsed}s)"
+  else
+    fail "T13" "no response containing BANANA"
+  fi
+  exit_pi "e2e-t13"
+  wait_all_topics_gone 20 || true
+}
+
+test_t14() {
+  log "T14 — Concurrent prompts to different sessions"
+  start_pi "e2e-t14-a"
+  start_pi "e2e-t14-b"
+  wait_topic "e2e-t14-a" 20 >/dev/null
+  wait_topic "e2e-t14-b" 20 >/dev/null
+  local tid_a tid_b
+  tid_a=$(get_topic_id "e2e-t14-a")
+  tid_b=$(get_topic_id "e2e-t14-b")
+
+  if [ -z "$tid_a" ] || [ -z "$tid_b" ]; then
+    fail "T14" "could not get topic IDs"
+    exit_pi "e2e-t14-a" 2>/dev/null || true
+    exit_pi "e2e-t14-b" 2>/dev/null || true
+    return
+  fi
+
+  $TG send "$SUPERGROUP" "$tid_a" "reply with only APPLE" 2>/dev/null >/dev/null
+  $TG send "$SUPERGROUP" "$tid_b" "reply with only ORANGE" 2>/dev/null >/dev/null
+
+  local ok=true
+  wait_bot_msg "$tid_a" "APPLE" 60 >/dev/null || { ok=false; fail "T14" "no APPLE in session A"; }
+  if $ok; then
+    wait_bot_msg "$tid_b" "ORANGE" 60 >/dev/null || { ok=false; fail "T14" "no ORANGE in session B"; }
+  fi
+  $ok && pass "T14"
+
+  exit_pi "e2e-t14-a"
+  exit_pi "e2e-t14-b"
+  wait_all_topics_gone 20 || true
+}
+
+test_t15() {
+  log "T15 — /new preserves the topic"
+  start_pi "e2e-t15"
+  if ! wait_topic "e2e-t15" 20 >/dev/null; then
+    fail "T15" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t15")
+  pi_send "e2e-t15" "/new"
+  sleep 10
+  # After /new, the topic should still exist (same or renamed)
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    # Check for session reset message
+    local active_tid
+    active_tid=$(get_any_topic_id)
+    if [ -n "$active_tid" ]; then
+      local history
+      history=$(topic_history "$active_tid")
+      if echo "$history" | grep -q "Session reset"; then
+        pass "T15"
+      else
+        pass "T15 (topic preserved, reset message may not be visible)"
+      fi
+    else
+      pass "T15 (topic count=$cnt)"
+    fi
+  else
+    fail "T15" "topic disappeared after /new"
+  fi
+  exit_pi "e2e-t15"
+  wait_all_topics_gone 20 || true
+}
+
+test_t16() {
+  log "T16 — Messages work after /new"
+  start_pi "e2e-t16"
+  if ! wait_topic "e2e-t16" 20 >/dev/null; then
+    fail "T16" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-t16" "/new"
+  sleep 10
+  local active_tid
+  active_tid=$(get_any_topic_id)
+  if [ -z "$active_tid" ]; then
+    fail "T16" "no topic found after /new"
+    exit_pi "e2e-t16"
+    return
+  fi
+  $TG send "$SUPERGROUP" "$active_tid" "say exactly AFTER_RESET" 2>/dev/null >/dev/null
+  if wait_bot_msg "$active_tid" "AFTER_RESET" 60 >/dev/null; then
+    pass "T16"
+  else
+    fail "T16" "no response containing AFTER_RESET"
+  fi
+  exit_pi "e2e-t16"
+  wait_all_topics_gone 20 || true
+}
+
+test_t17() {
+  log "T17 — Multiple /new in sequence preserve the same topic"
+  start_pi "e2e-t17"
+  if ! wait_topic "e2e-t17" 20 >/dev/null; then
+    fail "T17" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-t17" "/new"
+  sleep 5
+  pi_send "e2e-t17" "/new"
+  sleep 5
+  pi_send "e2e-t17" "/new"
+  sleep 5
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" = "1" ]; then
+    pass "T17"
+  else
+    fail "T17" "expected 1 topic, got $cnt"
+  fi
+  exit_pi "e2e-t17"
+  wait_all_topics_gone 20 || true
+}
+
+test_t19() {
+  log "T19 — /new then exit deletes the topic"
+  start_pi "e2e-t19"
+  if ! wait_topic "e2e-t19" 20 >/dev/null; then
+    fail "T19" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-t19" "/new"
+  sleep 5
+  exit_pi "e2e-t19"
+  if wait_all_topics_gone 20; then
+    pass "T19"
+  else
+    fail "T19" "topic not deleted after /new + exit"
+  fi
+}
+
+test_t21() {
+  log "T21 — Topic created for session with no name (fallback naming)"
+  start_pi_unnamed "e2e-t21"
+  sleep 15
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    pass "T21"
+  else
+    fail "T21" "no topic created for unnamed session"
+  fi
+  # Clean up
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t21" C-c
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t21" C-d
+  sleep 2
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t21" "exit" Enter 2>/dev/null || true
+  wait_all_topics_gone 20 || true
+}
+
+# ─── Run ────────────────────────────────────────────────────────────
+cd "$PROJECT"
+
+log "Starting E2E test suite"
+log "Supergroup: $SUPERGROUP"
+log "Bot ID: $BOT_ID"
+echo ""
+
+trap teardown EXIT
+
+setup
+
+TESTS="${1:-all}"
+if [ "$TESTS" = "all" ]; then
+  test_t01
+  test_t02
+  test_t03
+  test_t04
+  test_t05
+  test_t09
+  test_t13
+  test_t14
+  test_t15
+  test_t16
+  test_t17
+  test_t19
+  test_t21
+else
+  # Run specific tests: e.g. "t01 t03"
+  for t in $TESTS; do
+    "test_$t"
+  done
+fi
+
+echo ""
+echo "════════════════════════════════════════════════"
+echo "  RESULTS: $PASSED passed, $FAILED failed, $SKIPPED skipped"
+echo "════════════════════════════════════════════════"
+if [ "$FAILED" -gt 0 ]; then
+  echo ""
+  echo "Failures:"
+  for e in "${ERRORS[@]}"; do
+    echo "  ✗ $e"
+  done
+  FINAL_EXIT=1
+else
+  FINAL_EXIT=0
+fi
+exit $FINAL_EXIT
