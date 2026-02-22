@@ -1495,6 +1495,207 @@ Only the restarted session's topic should be reclaimed.
 
 ---
 
+## Name Continuity Tests
+
+These tests verify that session names survive across `/new`, pi restarts,
+and pup restarts. The name is treated as a property of the *workspace*
+(identified by working directory), not of an individual session.
+
+Three mechanisms work together:
+1. **Extension**: remembers `lastKnownName` and re-applies it after `/new`
+2. **Grace period**: `PendingDeletion` carries the name; `claim_pending_topic`
+   returns it so the daemon can push `/name` via IPC
+3. **Persistent cache**: `cwd_names` in `PersistedState` maps cwd→name,
+   surviving pup restarts
+
+### N01 — /new preserves the session name
+
+The session name should survive `/new` within the same pi process.
+
+**Steps:**
+1. Start a pi session, name it `e2e-n01-named`
+2. Wait for topic `e2e-n01-named` to appear; note the topic ID
+3. Send `/new` in the pi TUI:
+   `tmux -S "$SOCKET" send-keys -t e2e:pi-e2e-n01 "/new" Enter`
+4. Wait 10s for the reset to propagate
+5. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- The topic still exists (same topic ID — the socket is stable)
+- The topic title still contains `e2e-n01-named`
+- The extension re-applied the name via `pi.setSessionName(lastKnownName)`
+- A `🔄 Session reset` message appears in the topic
+
+---
+
+### N02 — Multiple /new preserve the name
+
+Name should persist through repeated `/new` commands.
+
+**Steps:**
+1. Start a pi session, name it `e2e-n02-sticky`
+2. Wait for topic `e2e-n02-sticky`
+3. Send `/new` three times (with short pauses):
+   ```bash
+   tmux send "/new" Enter; sleep 5
+   tmux send "/new" Enter; sleep 5
+   tmux send "/new" Enter; sleep 5
+   ```
+4. Wait 10s
+5. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- The topic still contains `e2e-n02-sticky` after three resets
+- Only one topic exists
+- The session name is shown correctly in the topic title
+
+---
+
+### N03 — Name restored after pi restart (same cwd, within grace period)
+
+When pi exits and restarts in the same directory within the 30s grace
+period, the new session should inherit the old session's name.
+
+**Steps:**
+1. Create a working directory: `WORK=$(mktemp -d)`
+2. Start a pi session in `$WORK`, name it `e2e-n03-persist`
+3. Wait for topic `e2e-n03-persist`; note the topic ID
+4. Exit the pi session (Ctrl-D)
+5. Immediately (within a few seconds) start a new pi session in `$WORK`
+   — do NOT name it
+6. Wait up to 15s
+
+**Expected:**
+- The new session claims the old topic (grace period + cwd match)
+- The daemon sends `/name e2e-n03-persist` via IPC to restore the name
+- The topic title still contains `e2e-n03-persist`
+- The topic ID is the same as step 3
+- `tg.py topics SUPERGROUP` shows exactly one topic with the old name
+
+---
+
+### N04 — Name restored after pup restart
+
+When pup restarts while a session is running, the name should be
+restored from the persistent `cwd_names` cache if the session has no
+name (e.g., after a `/new`).
+
+**Steps:**
+1. Start a pi session, name it `e2e-n04-cached`
+2. Wait for topic `e2e-n04-cached`
+3. Send `/new` in the pi TUI (name is re-applied by the extension, but
+   let's verify the daemon's cache too)
+4. Wait 5s
+5. Stop pup (Ctrl-C)
+6. Wait 2s
+7. Start pup again
+8. Wait for startup
+9. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- The session is rediscovered on pup restart
+- The topic title contains `e2e-n04-cached` — either because the
+  extension already re-applied the name (and pup got it in `hello`),
+  or because the daemon's `cwd_names` cache restored it
+- The session is functional: send a message, get a response
+
+---
+
+### N05 — /name via Telegram updates the persistent cache
+
+When the user renames a session via Telegram, the new name should be
+persisted in `cwd_names` so it survives future restarts.
+
+**Steps:**
+1. Start a pi session, name it `e2e-n05-orig`
+2. Wait for topic; note the topic ID
+3. Rename via Telegram: `tg.py send SUPERGROUP TOPIC_ID "/name e2e-n05-renamed"`
+4. Wait 10s for the rename to propagate
+5. Verify topic title: `tg.py topics SUPERGROUP` shows `e2e-n05-renamed`
+6. Stop pup (Ctrl-C); wait 2s
+7. Start pup again; wait for startup
+8. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- After step 5: topic renamed to `e2e-n05-renamed`
+- After step 8: topic still shows `e2e-n05-renamed` (the `InfoChanged`
+  event persisted the name in `cwd_names`)
+
+---
+
+### N06 — Name inherited across both pi and pup restart
+
+Full restart scenario: both pi and pup are restarted. The name should
+survive via the persistent `cwd_names` cache.
+
+**Steps:**
+1. Create a working directory: `WORK=$(mktemp -d)`
+2. Start a pi session in `$WORK`, name it `e2e-n06-survive`
+3. Wait for topic `e2e-n06-survive`
+4. Stop pup (Ctrl-C)
+5. Exit the pi session
+6. Wait 3s
+7. Start a new pi session in `$WORK` — do NOT name it
+8. Start pup
+9. Wait for startup
+10. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- Pup loads `cwd_names` from the persisted state file
+- The new session (in the same `$WORK`) connects with no name
+- Pup finds a `cwd_names` entry for `$WORK` → `e2e-n06-survive`
+- Pup sends `/name e2e-n06-survive` to the session via IPC
+- The topic title contains `e2e-n06-survive`
+
+---
+
+### N07 — New /name overrides inherited name
+
+If the user explicitly sets a new name, it should override the cached
+name for that cwd.
+
+**Steps:**
+1. Create a working directory: `WORK=$(mktemp -d)`
+2. Start a pi session in `$WORK`, name it `e2e-n07-old`
+3. Wait for topic; exit the session
+4. Start a new pi session in `$WORK` (name should be inherited as
+   `e2e-n07-old`)
+5. Wait for topic with `e2e-n07-old`; note the topic ID
+6. Rename in the pi TUI: `/name e2e-n07-new`
+7. Wait 10s
+8. Verify topic: `tg.py topics SUPERGROUP` shows `e2e-n07-new`
+9. Exit the session; start another new session in `$WORK`
+10. Wait for topic
+
+**Expected:**
+- Step 5: the inherited name `e2e-n07-old` is applied
+- Step 8: the topic is renamed to `e2e-n07-new`
+- Step 10: the newest name `e2e-n07-new` is inherited (the cache was
+  updated when the user renamed in step 6)
+
+---
+
+### N08 — /compact preserves the session name
+
+`/compact` triggers a session reset similar to `/new`. The name should
+survive.
+
+**Steps:**
+1. Start a pi session, name it `e2e-n08-compact`
+2. Wait for topic `e2e-n08-compact`; note the topic ID
+3. Send a prompt to build context: `"say hello"`
+4. Wait for response
+5. Send `/compact` in the pi TUI
+6. Wait 15s
+7. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- The topic still exists (same topic ID)
+- The topic title still contains `e2e-n08-compact`
+- The extension re-applied the name after the session reset
+
+---
+
 ## Pedantic Tests
 
 Stress tests, crash scenarios, race conditions, and adversarial edge cases.

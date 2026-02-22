@@ -878,7 +878,7 @@ test_s04() {
 # ─── Additional topic tests ─────────────────────────────────────
 
 test_t20() {
-  log "T20 — Session name persists (or updates) across /new"
+  log "T20 — Session name persists across /new"
   start_pi "e2e-t20-orig"
   if ! wait_topic "e2e-t20-orig" 20 >/dev/null; then
     fail "T20" "topic never appeared"
@@ -886,13 +886,18 @@ test_t20() {
   fi
   pi_send "e2e-t20-orig" "/new"
   sleep 10
-  # Topic should still exist — either with original name or fallback
-  local cnt
-  cnt=$(count_topics)
-  if [ "$cnt" -ge 1 ]; then
+  # Topic should still exist WITH the original name
+  if wait_topic "e2e-t20-orig" 10 >/dev/null; then
     pass "T20"
   else
-    fail "T20" "topic disappeared after /new"
+    # Fall back: at least check a topic exists
+    local cnt
+    cnt=$(count_topics)
+    if [ "$cnt" -ge 1 ]; then
+      fail "T20" "topic exists but name was lost"
+    else
+      fail "T20" "topic disappeared after /new"
+    fi
   fi
   exit_pi "e2e-t20-orig"
   wait_all_topics_gone 45 || true
@@ -1563,6 +1568,286 @@ test_g05() {
   wait_all_topics_gone 45 || true
 }
 
+# ─── Name continuity tests ───────────────────────────────────────
+
+test_n01() {
+  log "N01 — /new preserves the session name"
+  start_pi "e2e-n01-named"
+  if ! wait_topic "e2e-n01-named" 20 >/dev/null; then
+    fail "N01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-n01-named")
+  pi_send "e2e-n01-named" "/new"
+  sleep 10
+  # Topic should still exist with the same name
+  if wait_topic "e2e-n01-named" 10 >/dev/null; then
+    # Verify it's the same topic ID (not recreated)
+    local new_tid
+    new_tid=$(get_topic_id "e2e-n01-named")
+    if [ "$new_tid" = "$tid" ]; then
+      pass "N01"
+    else
+      fail "N01" "topic recreated (old=$tid new=$new_tid)"
+    fi
+  else
+    fail "N01" "topic name lost after /new"
+  fi
+  exit_pi "e2e-n01-named"
+  wait_all_topics_gone 45 || true
+}
+
+test_n02() {
+  log "N02 — Multiple /new preserve the name"
+  start_pi "e2e-n02-sticky"
+  if ! wait_topic "e2e-n02-sticky" 20 >/dev/null; then
+    fail "N02" "topic never appeared"
+    return
+  fi
+  pi_send "e2e-n02-sticky" "/new"
+  sleep 5
+  pi_send "e2e-n02-sticky" "/new"
+  sleep 5
+  pi_send "e2e-n02-sticky" "/new"
+  sleep 10
+  if wait_topic "e2e-n02-sticky" 10 >/dev/null; then
+    local cnt
+    cnt=$(count_topics)
+    if [ "$cnt" = "1" ]; then
+      pass "N02"
+    else
+      fail "N02" "expected 1 topic, got $cnt"
+    fi
+  else
+    fail "N02" "topic name lost after multiple /new"
+  fi
+  exit_pi "e2e-n02-sticky"
+  wait_all_topics_gone 45 || true
+}
+
+test_n03() {
+  log "N03 — Name restored after pi restart (same cwd, within grace period)"
+  clean_stale_topics
+  local work
+  work=$(mktemp -d)
+  start_pi_in_dir "e2e-n03-persist" "$work"
+  if ! wait_topic "e2e-n03-persist" 20 >/dev/null; then
+    fail "N03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-n03-persist")
+  # Exit pi — topic enters grace period with remembered name
+  exit_pi "e2e-n03-persist"
+  sleep 3
+  # Start a new pi session in the SAME directory WITHOUT naming it
+  local label="e2e-n03-new"
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$label"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$label" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 8
+  # The daemon should restore the name — check topic title
+  if wait_topic "e2e-n03-persist" 15 >/dev/null; then
+    local new_tid
+    new_tid=$(get_topic_id "e2e-n03-persist")
+    if [ "$new_tid" = "$tid" ]; then
+      pass "N03"
+    else
+      pass "N03 (name restored, topic ID changed: old=$tid new=$new_tid)"
+    fi
+  else
+    fail "N03" "name not restored on new session in same cwd"
+  fi
+  exit_pi "$label"
+  wait_all_topics_gone 45 || true
+}
+
+test_n04() {
+  log "N04 — Name restored after pup restart"
+  start_pi "e2e-n04-cached"
+  if ! wait_topic "e2e-n04-cached" 20 >/dev/null; then
+    fail "N04" "topic never appeared"
+    return
+  fi
+  # The name should now be in the persistent cwd_names cache.
+  # Do /new so the pi-side name is re-applied by the extension.
+  pi_send "e2e-n04-cached" "/new"
+  sleep 5
+  # Restart pup to test persistent cache
+  restart_pup graceful
+  sleep 10
+  # Session should be rediscovered with the cached name
+  if wait_topic "e2e-n04-cached" 15 >/dev/null; then
+    # Verify session is functional
+    local tid
+    tid=$(get_topic_id "e2e-n04-cached")
+    $TG send "$SUPERGROUP" "$tid" "reply with only the word CACHED_N04" 2>/dev/null >/dev/null
+    if wait_bot_msg "$tid" "CACHED_N04" 60 >/dev/null; then
+      pass "N04"
+    else
+      fail "N04" "session not responsive after pup restart"
+    fi
+  else
+    fail "N04" "name not restored after pup restart"
+  fi
+  exit_pi "e2e-n04-cached"
+  wait_all_topics_gone 45 || true
+}
+
+test_n05() {
+  log "N05 — /name via Telegram updates the persistent cache"
+  start_pi "e2e-n05-orig"
+  if ! wait_topic "e2e-n05-orig" 20 >/dev/null; then
+    fail "N05" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-n05-orig")
+  # Rename via Telegram
+  $TG send "$SUPERGROUP" "$tid" "/name e2e-n05-renamed" 2>/dev/null >/dev/null
+  sleep 10
+  # Verify rename worked
+  if ! wait_topic "e2e-n05-renamed" 10 >/dev/null; then
+    fail "N05" "topic not renamed"
+    exit_pi "e2e-n05-orig"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # Restart pup to verify the new name is cached
+  restart_pup graceful
+  sleep 10
+  if wait_topic "e2e-n05-renamed" 15 >/dev/null; then
+    pass "N05"
+  else
+    fail "N05" "renamed name not persisted across pup restart"
+  fi
+  exit_pi "e2e-n05-orig"
+  wait_all_topics_gone 45 || true
+}
+
+test_n06() {
+  log "N06 — Name inherited across both pi and pup restart"
+  clean_stale_topics
+  local work
+  work=$(mktemp -d)
+  start_pi_in_dir "e2e-n06-survive" "$work"
+  if ! wait_topic "e2e-n06-survive" 20 >/dev/null; then
+    fail "N06" "topic never appeared"
+    return
+  fi
+  # Stop pup first (so the persistent cache is written)
+  stop_pup graceful
+  # Exit pi
+  exit_pi "e2e-n06-survive"
+  sleep 3
+  # Start a new pi session in the same dir WITHOUT naming it
+  local label="e2e-n06-new"
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$label"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$label" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+  # Start pup (it loads cwd_names from disk)
+  if ! start_pup; then
+    fail "N06" "pup failed to restart"
+    exit_pi "$label"
+    return
+  fi
+  sleep 10
+  # The daemon should find the cwd in cwd_names and restore the name
+  if wait_topic "e2e-n06-survive" 15 >/dev/null; then
+    pass "N06"
+  else
+    fail "N06" "name not inherited across both pi and pup restart"
+  fi
+  exit_pi "$label"
+  wait_all_topics_gone 45 || true
+}
+
+test_n07() {
+  log "N07 — New /name overrides inherited name"
+  clean_stale_topics
+  local work
+  work=$(mktemp -d)
+  start_pi_in_dir "e2e-n07-old" "$work"
+  if ! wait_topic "e2e-n07-old" 20 >/dev/null; then
+    fail "N07" "first topic never appeared"
+    return
+  fi
+  # Exit the session
+  exit_pi "e2e-n07-old"
+  sleep 3
+  # Start a new session in the same dir (should inherit e2e-n07-old)
+  local label="e2e-n07-mid"
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$label"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$label" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 8
+  if ! wait_topic "e2e-n07-old" 15 >/dev/null; then
+    fail "N07" "name not inherited on second session"
+    exit_pi "$label"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # Now rename to something new
+  local tid
+  tid=$(get_topic_id "e2e-n07-old")
+  pi_send "$label" "/name e2e-n07-new"
+  sleep 10
+  if ! wait_topic "e2e-n07-new" 10 >/dev/null; then
+    fail "N07" "rename to e2e-n07-new failed"
+    exit_pi "$label"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # Exit and start a third session — should inherit e2e-n07-new (not old)
+  exit_pi "$label"
+  sleep 3
+  local label2="e2e-n07-third"
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$label2"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$label2" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 8
+  if wait_topic "e2e-n07-new" 15 >/dev/null; then
+    pass "N07"
+  else
+    fail "N07" "third session did not inherit the updated name"
+  fi
+  exit_pi "$label2"
+  wait_all_topics_gone 45 || true
+}
+
+test_n08() {
+  log "N08 — /compact preserves the session name"
+  start_pi "e2e-n08-compact"
+  if ! wait_topic "e2e-n08-compact" 20 >/dev/null; then
+    fail "N08" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-n08-compact")
+  # Build some context so compact has something to work with
+  $TG send "$SUPERGROUP" "$tid" "say BEFORE_N08" 2>/dev/null >/dev/null
+  wait_bot_msg "$tid" "BEFORE_N08" 60 >/dev/null || true
+  # Compact via TUI
+  pi_send "e2e-n08-compact" "/compact"
+  sleep 15
+  # Name should still be in the topic title
+  if wait_topic "e2e-n08-compact" 10 >/dev/null; then
+    local new_tid
+    new_tid=$(get_topic_id "e2e-n08-compact")
+    if [ "$new_tid" = "$tid" ]; then
+      pass "N08"
+    else
+      pass "N08 (name preserved, topic ID changed)"
+    fi
+  else
+    fail "N08" "topic name lost after /compact"
+  fi
+  exit_pi "e2e-n08-compact"
+  wait_all_topics_gone 45 || true
+}
+
 if [ "$TESTS" = "all" ]; then
   # Core lifecycle
   test_t01   # topic created
@@ -1625,6 +1910,16 @@ if [ "$TESTS" = "all" ]; then
   test_g03   # different cwd gets new topic (no reclaim)
   test_g04   # graceful pup shutdown preserves mapping
   test_g05   # multiple sessions: only matching cwd reclaims
+
+  # Name continuity
+  test_n01   # /new preserves session name
+  test_n02   # multiple /new preserve name
+  test_n03   # name restored after pi restart (same cwd)
+  test_n04   # name restored after pup restart
+  test_n05   # /name via Telegram updates persistent cache
+  test_n06   # name inherited across both pi and pup restart
+  test_n07   # new /name overrides inherited name
+  test_n08   # /compact preserves session name
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do

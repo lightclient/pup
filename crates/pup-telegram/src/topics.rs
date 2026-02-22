@@ -24,6 +24,8 @@ struct PendingDeletion {
     thread_id: i64,
     /// When to give up waiting and delete.
     deadline: Instant,
+    /// Session name at disconnect time, for restoring on the new session.
+    name: Option<String>,
 }
 
 /// Resolve git repo name and branch from a working directory.
@@ -79,6 +81,10 @@ struct PersistedState {
     /// On the next startup we resume from here.
     #[serde(default)]
     scan_checkpoint: i64,
+    /// Last known session name per working directory.
+    /// Used to restore names across pi/pup restarts.
+    #[serde(default)]
+    cwd_names: HashMap<String, String>,
 }
 
 // ── Topics manager ─────────────────────────────────────────────
@@ -115,6 +121,9 @@ pub struct TopicsManager {
     state_path: PathBuf,
     /// Topics pending deletion after session disconnect (grace period).
     pending_deletions: HashMap<String, PendingDeletion>,
+    /// Last known session name per working directory.
+    /// Persisted so names survive pi and pup restarts.
+    cwd_names: HashMap<String, String>,
 }
 
 impl TopicsManager {
@@ -147,6 +156,7 @@ impl TopicsManager {
             scan_checkpoint: state.scan_checkpoint,
             state_path,
             pending_deletions: HashMap::new(),
+            cwd_names: state.cwd_names,
         }
     }
 
@@ -175,6 +185,7 @@ impl TopicsManager {
                 topics: old,
                 known_threads,
                 scan_checkpoint: 0,
+                cwd_names: HashMap::new(),
             };
         }
 
@@ -187,6 +198,7 @@ impl TopicsManager {
             topics: self.session_topics.clone(),
             known_threads: self.known_threads.clone(),
             scan_checkpoint: self.scan_checkpoint,
+            cwd_names: self.cwd_names.clone(),
         };
         if let Some(parent) = self.state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -454,12 +466,25 @@ impl TopicsManager {
     /// immediately.  If a new session with the same working directory
     /// connects within [`DELETION_GRACE_PERIOD`], the topic is reused.
     ///
+    /// `name` is the session name at disconnect time, stored so it can be
+    /// restored on the replacement session and persisted in `cwd_names`.
+    ///
     /// Returns the thread ID if the topic was scheduled, `None` if the
     /// session had no topic.
-    pub fn schedule_deletion(&mut self, session_id: &str, cwd: &str) -> Option<i64> {
+    pub fn schedule_deletion(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        name: Option<&str>,
+    ) -> Option<i64> {
         let thread_id = self.session_topics.remove(session_id)?;
         self.thread_sessions.remove(&thread_id);
         // Keep in known_threads so startup cleanup can find it if pup crashes.
+
+        // Remember the name for this cwd so it survives pup restarts too.
+        if let Some(n) = name {
+            self.cwd_names.insert(cwd.to_owned(), n.to_owned());
+        }
 
         info!(
             session_id,
@@ -474,6 +499,7 @@ impl TopicsManager {
                 cwd: cwd.to_owned(),
                 thread_id,
                 deadline: Instant::now() + DELETION_GRACE_PERIOD,
+                name: name.map(ToOwned::to_owned),
             },
         );
 
@@ -485,12 +511,12 @@ impl TopicsManager {
     /// one by working directory.  If found, transfers the topic to the new
     /// session and cancels the pending deletion.
     ///
-    /// Returns the thread ID if a match was found.
+    /// Returns `(thread_id, remembered_name)` if a match was found.
     pub fn claim_pending_topic(
         &mut self,
         new_session_id: &str,
         cwd: &str,
-    ) -> Option<i64> {
+    ) -> Option<(i64, Option<String>)> {
         let matching_key = self
             .pending_deletions
             .iter()
@@ -513,7 +539,21 @@ impl TopicsManager {
             .insert(pd.thread_id, new_session_id.to_owned());
         self.save_state();
 
-        Some(pd.thread_id)
+        Some((pd.thread_id, pd.name))
+    }
+
+    // ── Name persistence per cwd ─────────────────────────────────
+
+    /// Record a session name for a working directory.
+    /// Persisted to disk so it survives pup restarts.
+    pub fn remember_name(&mut self, cwd: &str, name: &str) {
+        self.cwd_names.insert(cwd.to_owned(), name.to_owned());
+        self.save_state();
+    }
+
+    /// Look up the last known session name for a working directory.
+    pub fn last_name_for_cwd(&self, cwd: &str) -> Option<&str> {
+        self.cwd_names.get(cwd).map(String::as_str)
     }
 
     /// Drain pending deletions whose grace period has expired.

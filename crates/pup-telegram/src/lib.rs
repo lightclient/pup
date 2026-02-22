@@ -978,14 +978,54 @@ impl ChatBackend for TelegramBackend {
                 if let Some(ref mut topics) = self.topics {
                     // Check if a recently-disconnected session in the same cwd
                     // has a topic we can reuse (handles pi restarts).
-                    if let Some(_thread_id) =
+                    if let Some((thread_id, remembered_name)) =
                         topics.claim_pending_topic(&info.session_id, &info.cwd)
                     {
+                        // Restore the session name if the new session doesn't
+                        // have one. Try the grace-period name first, then the
+                        // persistent cwd→name cache.
+                        if info.session_name.is_none() {
+                            let name_to_restore = remembered_name
+                                .or_else(|| topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned));
+                            if let Some(name) = name_to_restore {
+                                info!(
+                                    session_id = %info.session_id,
+                                    name = %name,
+                                    thread_id,
+                                    "restoring session name from previous session"
+                                );
+                                let _ = self.incoming_tx.send(IncomingMessage {
+                                    session_id: info.session_id.clone(),
+                                    text: format!("/name {name}"),
+                                    mode: SendMode::Steer,
+                                    is_cancel: false,
+                                }).await;
+                            }
+                        }
+
                         // Rename the topic to reflect the new session's info.
                         if let Err(e) = topics.rename_topic(&self.bot, info).await {
                             warn!(error = %e, "failed to rename reclaimed topic");
                         }
                     } else {
+                        // No pending topic to reclaim — check persistent name
+                        // cache and restore the name before creating the topic.
+                        if info.session_name.is_none()
+                            && let Some(name) = topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned)
+                        {
+                            info!(
+                                session_id = %info.session_id,
+                                name = %name,
+                                "restoring session name from cwd cache"
+                            );
+                            let _ = self.incoming_tx.send(IncomingMessage {
+                                session_id: info.session_id.clone(),
+                                text: format!("/name {name}"),
+                                mode: SendMode::Steer,
+                                is_cancel: false,
+                            }).await;
+                        }
+
                         match topics.create_topic(&self.bot, info).await {
                             Ok((thread_id, reused)) => {
                                 // Only post history for newly created topics.
@@ -1018,12 +1058,13 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::Disconnected { ref session_id } => {
                 self.pre_turn_typing.remove(session_id);
 
-                // Grab the cwd before removing from our session list.
-                let cwd = self
+                // Grab cwd and name before removing from our session list.
+                let (cwd, name) = self
                     .sessions
                     .iter()
                     .find(|s| s.session_id == *session_id)
-                    .map(|s| s.cwd.clone());
+                    .map(|s| (s.cwd.clone(), s.session_name.clone()))
+                    .unwrap_or_default();
 
                 self.sessions.retain(|s| s.session_id != *session_id);
                 self.pending_prompts.remove(session_id.as_str());
@@ -1031,8 +1072,8 @@ impl ChatBackend for TelegramBackend {
                 // Topics mode: schedule deletion with grace period so a
                 // restarted pi session in the same cwd can reclaim the topic.
                 if let Some(ref mut topics) = self.topics {
-                    if let Some(cwd) = cwd {
-                        topics.schedule_deletion(session_id, &cwd);
+                    if !cwd.is_empty() {
+                        topics.schedule_deletion(session_id, &cwd, name.as_deref());
                     } else if let Err(e) = topics.delete_topic(&self.bot, session_id).await {
                         warn!(error = %e, "failed to delete topic");
                     }
@@ -1056,11 +1097,15 @@ impl ChatBackend for TelegramBackend {
                     *existing = info.clone();
                 }
 
-                // Topics mode: rename the topic.
-                if let Some(ref mut topics) = self.topics
-                    && let Err(e) = topics.rename_topic(&self.bot, info).await {
+                // Topics mode: rename the topic and persist the name.
+                if let Some(ref mut topics) = self.topics {
+                    if let Some(ref name) = info.session_name {
+                        topics.remember_name(&info.cwd, name);
+                    }
+                    if let Err(e) = topics.rename_topic(&self.bot, info).await {
                         warn!(error = %e, "failed to rename topic");
                     }
+                }
             }
             SessionEvent::SessionReset { ref session_id } => {
                 info!(session_id, "session reset");

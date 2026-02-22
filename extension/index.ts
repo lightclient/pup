@@ -31,6 +31,9 @@ export default function (pi: ExtensionAPI) {
 	let aliasPath: string | null = null;
 	let sessionId: string | null = null;
 	let currentName: string | undefined;
+	// Last known truthy session name — survives /new and /compact so it can
+	// be restored on the new session automatically.
+	let lastKnownName: string | undefined;
 	let namePollTimer: ReturnType<typeof setInterval> | null = null;
 	let socketCheckTimer: ReturnType<typeof setInterval> | null = null;
 	let savedCtx: ExtensionContext | null = null;
@@ -281,6 +284,7 @@ export default function (pi: ExtensionAPI) {
 			if (newName !== currentName) {
 				currentName = newName;
 				if (newName) {
+					lastKnownName = newName;
 					broadcastEvent("session_name_changed", { name: newName });
 				}
 				if (savedCtx) updateAlias(savedCtx);
@@ -429,6 +433,7 @@ export default function (pi: ExtensionAPI) {
 					return true;
 				}
 				pi.setSessionName(args);
+				lastKnownName = args;
 				sendResponse(client, "send", id, true);
 				return true;
 			}
@@ -631,6 +636,15 @@ export default function (pi: ExtensionAPI) {
 			currentMessageId = null;
 			accumulatedText = "";
 			accumulatedThinking = "";
+
+			// Restore the previous session name if the new session doesn't
+			// have one. This keeps the name stable across /new and /compact
+			// so the Telegram topic title doesn't reset.
+			const newName = pi.getSessionName();
+			if (!newName && lastKnownName) {
+				pi.setSessionName(lastKnownName);
+			}
+
 			broadcastEvent("session_reset");
 			updateAlias(ctx);
 			return;
