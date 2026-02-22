@@ -232,7 +232,7 @@ pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str
     let mut out = String::new();
 
     // Tool header
-    out.push_str(&format!("🔧 <b>{}</b>", escape_html(tool_name)));
+    out.push_str(&format!("<b>{}</b>", escape_html(tool_name)));
 
     // Show args for common tools
     if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
@@ -250,7 +250,7 @@ pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str
             content.to_owned()
         };
         if is_error {
-            out.push_str(&format!("❌ <pre>{}</pre>", escape_html(&truncated)));
+            out.push_str(&format!("<pre>{}</pre>", escape_html(&truncated)));
         } else {
             out.push_str(&format!("<pre>{}</pre>", escape_html(&truncated)));
         }

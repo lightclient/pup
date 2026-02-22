@@ -9,6 +9,21 @@ use crate::render::{
     cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html, MAX_BODY_CHARS,
 };
 
+/// How many recent tool calls to keep in the rendered message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallLimit {
+    /// Keep only the last N tool calls.
+    Last(usize),
+    /// Keep all tool calls.
+    All,
+}
+
+impl Default for ToolCallLimit {
+    fn default() -> Self {
+        Self::Last(3)
+    }
+}
+
 /// A tracked tool call for verbose rendering.
 #[derive(Debug)]
 struct TrackedTool {
@@ -49,6 +64,8 @@ struct TurnState {
     typing_stop: Option<tokio::sync::watch::Sender<bool>>,
     /// Whether to show tool call details.
     verbose: bool,
+    /// How many tool calls to keep in the rendered message.
+    tool_call_limit: ToolCallLimit,
     /// Tracked tool calls in order.
     tools: Vec<TrackedTool>,
 }
@@ -79,26 +96,30 @@ impl TurnState {
     }
 
     /// Render the current turn state as Telegram HTML.
-    fn render(&self) -> String {
+    ///
+    /// If `include_text` is true, the streaming assistant text is appended
+    /// (used during the turn). If false, only tools/thinking are rendered
+    /// (used at turn end when the text goes to a separate message).
+    fn render_parts(&self, include_text: bool) -> String {
         let mut parts = Vec::new();
 
-        // Verbose tool call summaries.
+        // Verbose tool call summaries (limited to the configured window).
         if self.verbose {
-            for tool in &self.tools {
-                let mut line = format!("🔧 <b>{}</b>", escape_html(&tool.tool_name));
+            let tools: &[TrackedTool] = match self.tool_call_limit {
+                ToolCallLimit::All => &self.tools,
+                ToolCallLimit::Last(n) => {
+                    let start = self.tools.len().saturating_sub(n);
+                    &self.tools[start..]
+                }
+            };
+            for tool in tools {
+                let mut line = format!("<b>{}</b>", escape_html(&tool.tool_name));
                 // Show command or path arg if present.
                 if let Some(cmd) = tool.args.get("command").and_then(|v| v.as_str()) {
                     let truncated = if cmd.len() > 200 { &cmd[..200] } else { cmd };
                     line.push_str(&format!("\n<pre>{}</pre>", escape_html(truncated)));
                 } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
                     line.push_str(&format!(" <code>{}</code>", escape_html(path)));
-                }
-                if tool.is_error {
-                    line.push_str(" ❌");
-                } else if tool.done {
-                    line.push_str(" ✓");
-                } else {
-                    line.push_str(" ⏳");
                 }
                 parts.push(line);
             }
@@ -107,7 +128,7 @@ impl TurnState {
         // Thinking content (shown while model is reasoning, before response text).
         if self.thinking && self.streaming_text.is_empty() {
             if self.thinking_text.is_empty() {
-                parts.push("💭 <i>Thinking…</i>".to_owned());
+                parts.push("<i>Thinking…</i>".to_owned());
             } else {
                 // Show the tail of the thinking text (most recent reasoning).
                 // Cap at 2000 chars to leave room for tools/formatting within
@@ -125,12 +146,12 @@ impl TurnState {
                 } else {
                     self.thinking_text.clone()
                 };
-                parts.push(format!("💭 <i>{}</i>", escape_html(&display)));
+                parts.push(format!("<i>{}</i>", escape_html(&display)));
             }
         }
 
-        // Streaming text.
-        if !self.streaming_text.is_empty() {
+        // Streaming text (only during the turn, not at finalization).
+        if include_text && !self.streaming_text.is_empty() {
             let html = to_telegram_html(&self.streaming_text);
             if !html.is_empty() {
                 parts.push(html);
@@ -142,6 +163,11 @@ impl TurnState {
         } else {
             parts.join("\n\n")
         }
+    }
+
+    /// Render the full turn state (tools + thinking + text) for mid-turn edits.
+    fn render(&self) -> String {
+        self.render_parts(true)
     }
 
     /// Enqueue an edit (or initial send) for the current state.
@@ -188,6 +214,8 @@ pub struct TurnTracker {
     edit_interval_ms: u64,
     /// Whether to show tool call details.
     verbose: bool,
+    /// How many tool calls to keep in the rendered message.
+    tool_call_limit: ToolCallLimit,
 }
 
 impl TurnTracker {
@@ -196,6 +224,15 @@ impl TurnTracker {
             turns: HashMap::new(),
             edit_interval_ms,
             verbose: false,
+            tool_call_limit: ToolCallLimit::default(),
+        }
+    }
+
+    /// Set the tool call display limit.
+    pub fn set_tool_call_limit(&mut self, limit: ToolCallLimit) {
+        self.tool_call_limit = limit;
+        for state in self.turns.values_mut() {
+            state.tool_call_limit = limit;
         }
     }
 
@@ -266,6 +303,7 @@ impl TurnTracker {
                 dirty: false,
                 typing_stop: Some(stop_tx),
                 verbose: self.verbose,
+                tool_call_limit: self.tool_call_limit,
                 tools: Vec::new(),
             },
         );
@@ -358,7 +396,7 @@ impl TurnTracker {
             state.thinking_text.push_str(text);
         }
         if verbose {
-            self.ensure_message(session_id, "💭 <i>Thinking…</i>", outbox);
+            self.ensure_message(session_id, "<i>Thinking…</i>", outbox);
             if let Some(state) = self.turns.get_mut(session_id) {
                 state.dirty = true;
                 state.flush(outbox, self.edit_interval_ms);
@@ -451,8 +489,12 @@ impl TurnTracker {
         }
     }
 
-    /// Finalize the turn: send the last edit with the complete content
-    /// and remove the cancel keyboard.
+    /// Finalize the turn.
+    ///
+    /// The existing Telegram message is updated to show only the
+    /// tools/thinking summary (with the cancel keyboard removed).
+    /// The final assistant text is sent as a **separate** message so
+    /// the user can scroll back to the tool trace independently.
     pub fn end_turn(&mut self, session_id: &str, outbox: &mut Outbox) {
         let Some(mut state) = self.turns.remove(session_id) else {
             return;
@@ -464,43 +506,90 @@ impl TurnTracker {
         // Resolve message ID if still pending.
         state.try_resolve_message_id();
 
-        // Final render.
-        let rendered = state.render();
-        let chunks = split_message(&rendered, MAX_BODY_CHARS);
+        let has_verbose_content = state.verbose && (!state.tools.is_empty() || !state.thinking_text.is_empty());
+        let has_text = !state.streaming_text.is_empty();
 
         if let Some(tg_msg_id) = state.telegram_message_id {
-            // Edit the existing message with final content and remove cancel keyboard.
-            if let Some(first) = chunks.first() {
-                outbox.enqueue(OutboxOp::Edit {
-                    chat_id: state.chat_id,
-                    message_id: tg_msg_id,
-                    text: first.clone(),
-                    parse_mode: Some("HTML".to_owned()),
-                    reply_markup: Some(empty_keyboard()),
-                });
-            }
+            if has_verbose_content && has_text {
+                // Edit the existing message to show only tools/thinking
+                // (strip the streaming text that was shown during the turn).
+                let summary = state.render_parts(false);
+                let summary_chunks = split_message(&summary, MAX_BODY_CHARS);
+                if let Some(first) = summary_chunks.first() {
+                    outbox.enqueue(OutboxOp::Edit {
+                        chat_id: state.chat_id,
+                        message_id: tg_msg_id,
+                        text: first.clone(),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: Some(empty_keyboard()),
+                    });
+                }
 
-            // Overflow chunks as separate messages.
-            for chunk in chunks.iter().skip(1) {
+                // Send final assistant text as a separate message.
+                let text_html = to_telegram_html(&state.streaming_text);
+                if !text_html.is_empty() {
+                    let text_chunks = split_message(&text_html, MAX_BODY_CHARS);
+                    for chunk in &text_chunks {
+                        outbox.enqueue(OutboxOp::Send {
+                            chat_id: state.chat_id,
+                            text: chunk.clone(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: None,
+                            message_thread_id: state.thread_id,
+                            result_tx: None,
+                        });
+                    }
+                }
+            } else if has_text {
+                // Non-verbose or no tool/thinking content: the existing
+                // message already has the text — just remove the keyboard.
+                let rendered = state.render();
+                let chunks = split_message(&rendered, MAX_BODY_CHARS);
+                if let Some(first) = chunks.first() {
+                    outbox.enqueue(OutboxOp::Edit {
+                        chat_id: state.chat_id,
+                        message_id: tg_msg_id,
+                        text: first.clone(),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: Some(empty_keyboard()),
+                    });
+                }
+                for chunk in chunks.iter().skip(1) {
+                    outbox.enqueue(OutboxOp::Send {
+                        chat_id: state.chat_id,
+                        text: chunk.clone(),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: None,
+                        message_thread_id: state.thread_id,
+                        result_tx: None,
+                    });
+                }
+            } else {
+                // No text at all (tools-only turn) — just remove the keyboard.
+                let rendered = state.render_parts(false);
+                let chunks = split_message(&rendered, MAX_BODY_CHARS);
+                if let Some(first) = chunks.first() {
+                    outbox.enqueue(OutboxOp::Edit {
+                        chat_id: state.chat_id,
+                        message_id: tg_msg_id,
+                        text: first.clone(),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: Some(empty_keyboard()),
+                    });
+                }
+            }
+        } else if has_text {
+            // No Telegram message was ever created (e.g. no deltas arrived,
+            // or the send is still in flight). Send the final content as a
+            // new message.
+            let text_html = to_telegram_html(&state.streaming_text);
+            let chunks = split_message(&text_html, MAX_BODY_CHARS);
+            for chunk in &chunks {
                 outbox.enqueue(OutboxOp::Send {
                     chat_id: state.chat_id,
                     text: chunk.clone(),
                     parse_mode: Some("HTML".to_owned()),
                     reply_markup: None,
-                    message_thread_id: state.thread_id,
-                    result_tx: None,
-                });
-            }
-        } else if !state.streaming_text.is_empty() {
-            // No Telegram message was ever created (e.g. no deltas arrived,
-            // or the send is still in flight). Send the final content as a
-            // new message without a cancel keyboard.
-            for (i, chunk) in chunks.iter().enumerate() {
-                outbox.enqueue(OutboxOp::Send {
-                    chat_id: state.chat_id,
-                    text: chunk.clone(),
-                    parse_mode: Some("HTML".to_owned()),
-                    reply_markup: if i == 0 { Some(empty_keyboard()) } else { None },
                     message_thread_id: state.thread_id,
                     result_tx: None,
                 });

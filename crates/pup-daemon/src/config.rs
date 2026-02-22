@@ -37,6 +37,11 @@ pub(crate) struct DisplayConfig {
     pub verbose: bool,
     #[serde(default = "default_history_turns")]
     pub history_turns: usize,
+    /// How many tool calls to keep in the rendered message.
+    /// A number (e.g. 3) keeps only the last N. The string "all" keeps all.
+    /// Default: 3.
+    #[serde(default = "default_tool_calls")]
+    pub tool_calls: ToolCallsValue,
 }
 
 impl Default for DisplayConfig {
@@ -44,8 +49,62 @@ impl Default for DisplayConfig {
         Self {
             verbose: false,
             history_turns: 5,
+            tool_calls: default_tool_calls(),
         }
     }
+}
+
+/// Represents the `tool_calls` config value: either a number or "all".
+#[derive(Debug, Clone)]
+pub(crate) enum ToolCallsValue {
+    Last(usize),
+    All,
+}
+
+impl<'de> Deserialize<'de> for ToolCallsValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct ToolCallsVisitor;
+
+        impl de::Visitor<'_> for ToolCallsVisitor {
+            type Value = ToolCallsValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a positive integer or the string \"all\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(ToolCallsValue::Last(v as usize))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(de::Error::custom("tool_calls must be non-negative"));
+                }
+                Ok(ToolCallsValue::Last(v as usize))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("all") {
+                    Ok(ToolCallsValue::All)
+                } else {
+                    Err(de::Error::custom(
+                        "expected a number or \"all\" for tool_calls",
+                    ))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(ToolCallsVisitor)
+    }
+}
+
+fn default_tool_calls() -> ToolCallsValue {
+    ToolCallsValue::Last(3)
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +243,11 @@ impl Config {
 
         let socket_dir = self.socket_dir();
 
+        let tool_call_limit = match &self.display.tool_calls {
+            ToolCallsValue::All => pup_telegram::turn_tracker::ToolCallLimit::All,
+            ToolCallsValue::Last(n) => pup_telegram::turn_tracker::ToolCallLimit::Last(*n),
+        };
+
         Some(pup_telegram::TelegramConfig {
             bot_token: tg.bot_token.clone(),
             allowed_user_ids: tg.allowed_user_ids.clone(),
@@ -198,6 +262,7 @@ impl Config {
             topics_state_path: socket_dir.join("topics_state.json"),
             socket_dir,
             voice: tg.voice,
+            tool_call_limit,
         })
     }
 }
@@ -281,5 +346,51 @@ max_message_length = 3500
         let path = expand_tilde("~/.pi/pup");
         // Should start with the home dir, not ~.
         assert!(!path.to_str().unwrap_or("").starts_with('~'));
+    }
+
+    #[test]
+    fn test_tool_calls_default() {
+        let toml = r#"
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(config.display.tool_calls, ToolCallsValue::Last(3)));
+    }
+
+    #[test]
+    fn test_tool_calls_number() {
+        let toml = r#"
+[display]
+tool_calls = 5
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(config.display.tool_calls, ToolCallsValue::Last(5)));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(tg.tool_call_limit, pup_telegram::turn_tracker::ToolCallLimit::Last(5));
+    }
+
+    #[test]
+    fn test_tool_calls_all() {
+        let toml = r#"
+[display]
+tool_calls = "all"
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(config.display.tool_calls, ToolCallsValue::All));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(tg.tool_call_limit, pup_telegram::turn_tracker::ToolCallLimit::All);
     }
 }

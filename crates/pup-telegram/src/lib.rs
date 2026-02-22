@@ -117,6 +117,8 @@ pub struct TelegramConfig {
     pub topics_state_path: PathBuf,
     /// Enable local voice-to-text transcription via whisper.cpp.
     pub voice: bool,
+    /// How many tool calls to keep in the rendered message.
+    pub tool_call_limit: turn_tracker::ToolCallLimit,
 }
 
 /// The Telegram chat backend.
@@ -160,6 +162,7 @@ impl TelegramBackend {
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_verbose(config.verbose);
+        turn_tracker.set_tool_call_limit(config.tool_call_limit);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
@@ -200,6 +203,7 @@ impl TelegramBackend {
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_verbose(config.verbose);
+        turn_tracker.set_tool_call_limit(config.tool_call_limit);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         Self {
@@ -1636,6 +1640,7 @@ mod tests {
             socket_dir: PathBuf::from("/tmp"),
             topics_state_path: PathBuf::from("/tmp/topics.json"),
             voice: false,
+            tool_call_limit: turn_tracker::ToolCallLimit::default(),
         }
     }
 
