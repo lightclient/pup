@@ -1119,8 +1119,11 @@ test_p17() {
   # Start a long prompt from Telegram
   $TG send "$SUPERGROUP" "$tid" "write a very long essay about the history of every programming language" 2>/dev/null >/dev/null
   sleep 5
-  # Send /new via Telegram while streaming
-  $TG send "$SUPERGROUP" "$tid" "/new" 2>/dev/null >/dev/null
+  # Send /new via the pi TUI (not Telegram!) — this actually resets the
+  # session and interrupts the agent mid-stream.  Sending /new via Telegram
+  # would be intercepted by the extension as "not available via remote access"
+  # and would NOT interrupt the running agent.
+  pi_send "e2e-p17" "/new"
   sleep 12
   # Topic should still exist
   local cnt
