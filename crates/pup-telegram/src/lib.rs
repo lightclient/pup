@@ -1246,6 +1246,11 @@ impl ChatBackend for TelegramBackend {
                 }
             }
             SessionEvent::InfoChanged { ref info } => {
+                // The session responded with a metadata change (e.g. /name,
+                // /model) without starting an agent turn.  Stop any pre-turn
+                // typing indicator that was spawned when the message arrived.
+                self.pre_turn_typing.remove(&info.session_id);
+
                 // Update local session info.
                 if let Some(existing) = self
                     .sessions
@@ -1393,6 +1398,11 @@ impl ChatBackend for TelegramBackend {
                 ref session_id,
                 ref text,
             } => {
+                // The session responded with a notification (e.g. /status,
+                // unsupported command) without starting an agent turn.  Stop
+                // any pre-turn typing indicator.
+                self.pre_turn_typing.remove(session_id);
+
                 let html = format!("<i>{}</i>", escape_html(text));
                 self.send_to_topic(session_id, &html);
 
