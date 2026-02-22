@@ -450,7 +450,11 @@ export default function (pi: ExtensionAPI) {
 					sendResponse(client, "send", id, false, undefined, "/${cmd} without arguments requires pi TUI");
 					return true;
 				}
-				pi.setModel(args as any).catch(() => {});
+				pi.setModel(args as any).catch(() => {
+					broadcastEvent("notification", {
+						text: `⚠️ Failed to set model to "${args}"`,
+					});
+				});
 				sendResponse(client, "send", id, true);
 				return true;
 			}
