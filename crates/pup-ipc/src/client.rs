@@ -122,7 +122,7 @@ mod tests {
         let msg = client.recv().await.expect("recv").expect("some");
         match msg {
             ServerMessage::Event { event, .. } => assert_eq!(event, "hello"),
-            _ => panic!("expected event"),
+            ServerMessage::Response { .. } => panic!("expected event"),
         }
 
         // Client sends a command

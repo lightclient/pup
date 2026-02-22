@@ -18,7 +18,9 @@ fn prompt(msg: &str) -> Result<String> {
 }
 
 /// Run the interactive setup wizard.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run_setup() -> Result<()> {
+    use std::fmt::Write;
     println!("pup — setup");
     println!("============\n");
 
@@ -82,11 +84,10 @@ pub(crate) async fn run_setup() -> Result<()> {
                 if update.update_id >= offset {
                     offset = update.update_id + 1;
                 }
-                if let Some(ref msg) = update.message {
-                    if msg.chat.chat_type == "supergroup" {
+                if let Some(ref msg) = update.message
+                    && msg.chat.chat_type == "supergroup" {
                         break; // not the outer loop — handled below
                     }
-                }
             }
             // Check if any update contained a supergroup message.
             if let Some(sg) = updates.iter().find_map(|u| {
@@ -135,15 +136,15 @@ pub(crate) async fn run_setup() -> Result<()> {
     config.push_str("[streaming]\nedit_interval_ms = 1500\n\n");
     config.push_str("[backends.telegram]\n");
     config.push_str("enabled = true\n");
-    config.push_str(&format!("bot_token = \"{bot_token}\"\n"));
-    config.push_str(&format!("allowed_user_ids = [{user_id}]\n\n"));
+    let _ = writeln!(config, "bot_token = \"{bot_token}\"");
+    let _ = writeln!(config, "allowed_user_ids = [{user_id}]\n");
     config.push_str("[backends.telegram.dm]\nenabled = true\n\n");
 
     if topics_enabled {
         config.push_str("[backends.telegram.topics]\n");
         config.push_str("enabled = true\n");
         if let Some(sg) = supergroup_id {
-            config.push_str(&format!("supergroup_id = {sg}\n"));
+            let _ = writeln!(config, "supergroup_id = {sg}");
         }
         config.push_str("topic_icon = \"📎\"\n\n");
     }

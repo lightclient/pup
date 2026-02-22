@@ -84,6 +84,7 @@ impl<'de> Deserialize<'de> for ToolCallsValue {
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                #[allow(clippy::cast_possible_truncation)]
                 Ok(ToolCallsValue::Last(v as usize))
             }
 
@@ -91,6 +92,7 @@ impl<'de> Deserialize<'de> for ToolCallsValue {
                 if v < 0 {
                     return Err(de::Error::custom("tool_calls must be non-negative"));
                 }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Ok(ToolCallsValue::Last(v as usize))
             }
 
@@ -137,6 +139,7 @@ impl<'de> Deserialize<'de> for ToolOutputLinesValue {
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                #[allow(clippy::cast_possible_truncation)]
                 Ok(ToolOutputLinesValue::First(v as usize))
             }
 
@@ -144,6 +147,7 @@ impl<'de> Deserialize<'de> for ToolOutputLinesValue {
                 if v < 0 {
                     return Err(de::Error::custom("tool_output_lines must be non-negative"));
                 }
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 Ok(ToolOutputLinesValue::First(v as usize))
             }
 
@@ -298,7 +302,7 @@ impl Config {
         let max_message_length = tg
             .display
             .as_ref()
-            .map_or(default_max_message_length(), |d| d.max_message_length);
+            .map_or_else(default_max_message_length, |d| d.max_message_length);
 
         let socket_dir = self.socket_dir();
 
@@ -350,6 +354,7 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 #[cfg(test)]
+#[allow(clippy::unreadable_literal)]
 mod tests {
     use super::*;
 

@@ -332,7 +332,7 @@ impl Outbox {
         if let Some(last) = self.last_send {
             let elapsed = last.elapsed();
             if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval.checked_sub(elapsed).unwrap()).await;
+                tokio::time::sleep(self.min_interval.checked_sub(elapsed).expect("elapsed < min_interval")).await;
             }
         }
 
@@ -471,6 +471,7 @@ impl Outbox {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

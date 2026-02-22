@@ -159,10 +159,11 @@ where
         }
 
         fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
-            Ok(v as u64)
+            Ok(v.cast_unsigned())
         }
 
         fn visit_f64<E: de::Error>(self, v: f64) -> Result<u64, E> {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             Ok(v as u64)
         }
 
@@ -170,7 +171,7 @@ where
             // Try parsing as ISO 8601 (e.g. "2026-02-21T15:11:53.270Z").
             // Fall back to treating it as a numeric string.
             if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(v) {
-                Ok(dt.timestamp_millis() as u64)
+                Ok(dt.timestamp_millis().cast_unsigned())
             } else if let Ok(n) = v.parse::<u64>() {
                 Ok(n)
             } else {
@@ -197,6 +198,7 @@ pub struct ToolCall {
 
 impl IpcEvent {
     /// Parse a raw `ServerMessage::Event` into a typed `IpcEvent`.
+    #[allow(clippy::too_many_lines)]
     pub fn parse(event: &str, data: &serde_json::Value) -> Self {
         match event {
             "hello" => match serde_json::from_value(data.clone()) {

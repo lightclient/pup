@@ -100,6 +100,7 @@ fn spawn_typing_loop(
 
 /// Configuration for the Telegram backend.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TelegramConfig {
     pub bot_token: String,
     pub allowed_user_ids: Vec<i64>,
@@ -258,7 +259,7 @@ impl TelegramBackend {
             Some(ref mut topics) => topics.drain_expired(),
             None => return,
         };
-        let chat_id = self.topics.as_ref().unwrap().chat_id();
+        let chat_id = self.topics.as_ref().expect("topics checked above").chat_id();
         for (session_id, thread_id) in expired {
             info!(session_id = %session_id, thread_id, "deleting expired topic");
             if let Err(e) = self.bot.delete_forum_topic(chat_id, thread_id).await {
@@ -273,6 +274,7 @@ impl TelegramBackend {
     }
 
     /// Handle a Telegram update (message or callback query).
+    #[allow(clippy::too_many_lines)]
     async fn handle_update(&mut self, update: Update) {
         // Handle callback queries (cancel button).
         if let Some(cb) = update.callback_query {
@@ -377,7 +379,7 @@ impl TelegramBackend {
                     // Handle /verbose locally (pup-level command).
                     if trimmed == "/verbose" || trimmed.starts_with("/verbose ") {
                         self.pending_prompts.remove(&session_id);
-                        let args = trimmed.strip_prefix("/verbose").unwrap().trim();
+                        let args = trimmed.strip_prefix("/verbose").expect("checked above").trim();
                         if args.is_empty() {
                             self.pending_prompts.insert(
                                 session_id.clone(),
@@ -419,53 +421,47 @@ impl TelegramBackend {
 
                     // If the user sent a non-command and there's a pending
                     // prompt, treat their reply as the argument.
-                    if !trimmed.starts_with('/') {
-                        if let Some(prompt) = self.pending_prompts.remove(&session_id) {
-                            if prompt.local {
-                                // Handle pup-level command locally.
-                                self.pre_turn_typing.remove(&session_id);
-                                match prompt.command.as_str() {
-                                    "verbose" => {
-                                        let on = matches!(trimmed, "on" | "true" | "1" | "yes");
-                                        self.turn_tracker.set_verbose(on);
-                                        let label = if on { "on" } else { "off" };
-                                        self.outbox.enqueue(OutboxOp::Send {
-                                            chat_id: topics.chat_id(),
-                                            text: format!("Verbose mode: <b>{label}</b>"),
-                                            parse_mode: Some("HTML".to_owned()),
-                                            reply_markup: None,
-                                            message_thread_id: Some(thread_id),
-                                            result_tx: None,
-                                        });
-                                    }
-                                    _ => {}
-                                }
-                            } else {
-                                let full_cmd = format!("/{} {}", prompt.command, trimmed);
-                                let _ = self.incoming_tx.send(IncomingMessage {
-                                    session_id,
-                                    text: full_cmd,
-                                    mode: SendMode::Steer,
-                                    is_cancel: false,
-                                }).await;
-                            }
-                            return;
-                        }
-                    } else {
+                    if trimmed.starts_with('/') {
                         // A new slash command cancels any pending prompt.
                         self.pending_prompts.remove(&session_id);
+                    } else if let Some(prompt) = self.pending_prompts.remove(&session_id) {
+                        if prompt.local {
+                            // Handle pup-level command locally.
+                            self.pre_turn_typing.remove(&session_id);
+                            if prompt.command.as_str() == "verbose" {
+                                let on = matches!(trimmed, "on" | "true" | "1" | "yes");
+                                self.turn_tracker.set_verbose(on);
+                                let label = if on { "on" } else { "off" };
+                                self.outbox.enqueue(OutboxOp::Send {
+                                    chat_id: topics.chat_id(),
+                                    text: format!("Verbose mode: <b>{label}</b>"),
+                                    parse_mode: Some("HTML".to_owned()),
+                                    reply_markup: None,
+                                    message_thread_id: Some(thread_id),
+                                    result_tx: None,
+                                });
+                            }
+                        } else {
+                            let full_cmd = format!("/{} {}", prompt.command, trimmed);
+                            let _ = self.incoming_tx.send(IncomingMessage {
+                                session_id,
+                                text: full_cmd,
+                                mode: SendMode::Steer,
+                                is_cancel: false,
+                            }).await;
+                        }
+                        return;
                     }
 
                     // If this is a slash command that needs an argument but
                     // was invoked without one, start an interactive prompt.
-                    if trimmed.starts_with('/') {
-                        let after_slash = &trimmed[1..];
+                    if let Some(after_slash) = trimmed.strip_prefix('/') {
                         let (cmd_name, args) = match after_slash.split_once(' ') {
                             Some((c, a)) => (c, a.trim()),
                             None => (after_slash, ""),
                         };
-                        if args.is_empty() {
-                            if let Some(question) = prompt_for_command(cmd_name) {
+                        if args.is_empty()
+                            && let Some(question) = prompt_for_command(cmd_name) {
                                 self.pre_turn_typing.remove(&session_id);
                                 self.pending_prompts.insert(
                                     session_id.clone(),
@@ -481,7 +477,6 @@ impl TelegramBackend {
                                 });
                                 return;
                             }
-                        }
                     }
 
                     // Determine send mode.
@@ -508,6 +503,7 @@ impl TelegramBackend {
     }
 
     /// Handle a DM message (commands or forwarding).
+    #[allow(clippy::too_many_lines)]
     async fn handle_dm_message(&mut self, chat_id: i64, text: &str) {
         // Any slash command cancels pending interactive prompts.
         if text.trim().starts_with('/') {
@@ -521,7 +517,7 @@ impl TelegramBackend {
 
         match cmd {
             DmCommand::List => {
-                self.dm.last_list = self.sessions.clone();
+                self.dm.last_list.clone_from(&self.sessions);
                 let msg = DmState::format_session_list(&self.sessions);
                 self.outbox.enqueue(OutboxOp::Send {
                     chat_id,
@@ -543,7 +539,7 @@ impl TelegramBackend {
                         let name = session
                             .session_name
                             .as_deref()
-                            .unwrap_or(&sid[..8.min(sid.len())]);
+                            .unwrap_or_else(|| &sid[..8.min(sid.len())]);
                         self.dm.attached = Some(sid.clone());
                         self.send_dm(
                             chat_id,
@@ -622,20 +618,16 @@ impl TelegramBackend {
             }
             DmCommand::Message { text, mode } => {
                 // Check DM-level pending prompt first (e.g. /verbose).
-                if !text.starts_with('/') {
-                    if let Some(prompt) = self.pending_dm_prompt.take() {
-                        match prompt.command.as_str() {
-                            "verbose" => {
-                                let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                                self.turn_tracker.set_verbose(on);
-                                let label = if on { "on" } else { "off" };
-                                self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
-                            }
-                            _ => {}
+                if !text.starts_with('/')
+                    && let Some(prompt) = self.pending_dm_prompt.take() {
+                        if prompt.command.as_str() == "verbose" {
+                            let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                            self.turn_tracker.set_verbose(on);
+                            let label = if on { "on" } else { "off" };
+                            self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
                         }
                         return;
                     }
-                }
 
                 if let Some(sid) = self.dm.attached.clone() {
                     // Start typing immediately.
@@ -648,18 +640,15 @@ impl TelegramBackend {
                     );
 
                     // Check for pending prompt completion.
-                    if !text.starts_with('/') {
-                        if let Some(prompt) = self.pending_prompts.remove(&sid) {
+                    if !text.starts_with('/')
+                        && let Some(prompt) = self.pending_prompts.remove(&sid) {
                             if prompt.local {
                                 self.pre_turn_typing.remove(&sid);
-                                match prompt.command.as_str() {
-                                    "verbose" => {
-                                        let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                                        self.turn_tracker.set_verbose(on);
-                                        let label = if on { "on" } else { "off" };
-                                        self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
-                                    }
-                                    _ => {}
+                                if prompt.command.as_str() == "verbose" {
+                                    let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                                    self.turn_tracker.set_verbose(on);
+                                    let label = if on { "on" } else { "off" };
+                                    self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
                                 }
                             } else {
                                 let full_cmd = format!("/{} {}", prompt.command, text);
@@ -672,18 +661,16 @@ impl TelegramBackend {
                             }
                             return;
                         }
-                    }
 
                     // Check if this is a pi slash command that needs an argument.
                     let msg_trimmed = text.trim();
-                    if msg_trimmed.starts_with('/') {
-                        let after_slash = &msg_trimmed[1..];
+                    if let Some(after_slash) = msg_trimmed.strip_prefix('/') {
                         let (cmd_name, args) = match after_slash.split_once(' ') {
                             Some((c, a)) => (c.split('@').next().unwrap_or(c), a.trim()),
                             None => (after_slash.split('@').next().unwrap_or(after_slash), ""),
                         };
-                        if args.is_empty() {
-                            if let Some(question) = prompt_for_command(cmd_name) {
+                        if args.is_empty()
+                            && let Some(question) = prompt_for_command(cmd_name) {
                                 self.pre_turn_typing.remove(&sid);
                                 self.pending_prompts.insert(
                                     sid,
@@ -692,7 +679,6 @@ impl TelegramBackend {
                                 self.send_dm(chat_id, &format!("<i>{question}</i>"));
                                 return;
                             }
-                        }
                     }
 
                     let _ = self.incoming_tx.send(IncomingMessage {
@@ -998,6 +984,7 @@ async fn scan_live_sessions(socket_dir: &Path) -> HashSet<String> {
     live
 }
 
+#[allow(clippy::too_many_lines)]
 #[async_trait]
 impl ChatBackend for TelegramBackend {
     fn name(&self) -> &'static str {
@@ -1480,7 +1467,6 @@ impl ChatBackend for TelegramBackend {
                         // No messages — loop back for another short poll.
                         // The select! in the main loop can preempt us at
                         // the next .await (the getUpdates call).
-                        continue;
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
                 }
@@ -1510,6 +1496,12 @@ impl ChatBackend for TelegramBackend {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::clone_on_ref_ptr,
+    clippy::too_many_lines,
+    clippy::significant_drop_tightening
+)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex as StdMutex};

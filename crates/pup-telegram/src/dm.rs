@@ -61,10 +61,10 @@ pub fn parse_command(text: &str) -> DmCommand {
                 mode: SendMode::Steer,
             },
         }
-    } else if trimmed.starts_with(">>") {
+    } else if let Some(rest) = trimmed.strip_prefix(">>") {
         // Follow-up prefix
         DmCommand::Message {
-            text: trimmed[2..].trim().to_owned(),
+            text: rest.trim().to_owned(),
             mode: SendMode::FollowUp,
         }
     } else {
@@ -128,6 +128,8 @@ impl DmState {
 
     /// Format the session list for display.
     pub fn format_session_list(sessions: &[SessionInfo]) -> String {
+        use std::fmt::Write;
+
         if sessions.is_empty() {
             return "No active sessions.".to_owned();
         }
@@ -137,19 +139,21 @@ impl DmState {
             let name = session
                 .session_name
                 .as_deref()
-                .unwrap_or(&session.session_id[..8.min(session.session_id.len())]);
+                .unwrap_or_else(|| &session.session_id[..8.min(session.session_id.len())]);
             let cwd_short = session
                 .cwd
                 .rsplit('/')
                 .next()
                 .unwrap_or(&session.cwd);
 
-            out.push_str(&format!(
-                "<b>{}</b>. {} <i>({})</i>\n",
+            let _ = write!(
+                out,
+                "<b>{}</b>. {} <i>({})</i>",
                 i + 1,
                 pup_telegram_escape_html(name),
                 pup_telegram_escape_html(cwd_short),
-            ));
+            );
+            out.push('\n');
         }
         out.push_str("\nUse /attach &lt;number&gt; to connect.");
         out

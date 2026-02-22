@@ -162,7 +162,7 @@ impl BotClient {
                 .with_context(|| format!("{method} response parse failed"))?;
 
             if !body.ok {
-                let code = body.error_code.unwrap_or(status.as_u16().into());
+                let code = body.error_code.unwrap_or_else(|| status.as_u16().into());
                 let desc = body.description.unwrap_or_default();
 
                 if code == 429 {

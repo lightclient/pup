@@ -97,6 +97,7 @@ struct TrackedTool {
 
 /// State for one agent turn in one session.
 #[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
 struct TurnState {
     /// Chat ID where this message lives.
     chat_id: i64,
@@ -144,14 +145,11 @@ impl TurnState {
                     self.telegram_message_id = Some(sent.message_id);
                     self.send_pending = false;
                 }
-                Ok(Err(_)) => {
+                Ok(Err(_)) | Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                     self.send_pending = false;
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     self.send_rx = Some(rx);
-                }
-                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    self.send_pending = false;
                 }
             }
         }
@@ -175,22 +173,20 @@ impl TurnState {
                 }
             };
             for tool in tools {
+                use std::fmt::Write;
                 let mut line = format!("<b>{}</b>", escape_html(&tool.tool_name));
                 // Show command or path arg if present.
                 if let Some(cmd) = tool.args.get("command").and_then(|v| v.as_str()) {
                     let truncated = if cmd.len() > 200 { &cmd[..200] } else { cmd };
-                    line.push_str(&format!("\n<pre>{}</pre>", escape_html(truncated)));
+                    let _ = write!(line, "\n<pre>{}</pre>", escape_html(truncated));
                 } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
-                    line.push_str(&format!(" <code>{}</code>", escape_html(path)));
+                    let _ = write!(line, " <code>{}</code>", escape_html(path));
                 }
                 // Show tool output (truncated by line limit).
                 if !tool.content.is_empty() {
                     let truncated = truncate_tool_output(&tool.content, self.tool_output_lines);
                     if !truncated.is_empty() {
-                        line.push_str(&format!(
-                            "\n<pre>{}</pre>",
-                            escape_html(&truncated)
-                        ));
+                        let _ = write!(line, "\n<pre>{}</pre>", escape_html(&truncated));
                     }
                 }
                 parts.push(line);
@@ -212,8 +208,7 @@ impl TurnState {
                     let safe_start = self.thinking_text[start..]
                         .char_indices()
                         .next()
-                        .map(|(i, _)| start + i)
-                        .unwrap_or(start);
+                        .map_or(start, |(i, _)| start + i);
                     format!("…{}", &self.thinking_text[safe_start..])
                 } else {
                     self.thinking_text.clone()
@@ -249,6 +244,7 @@ impl TurnState {
         }
 
         // Throttle edits.
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed = self.last_edit.elapsed().as_millis() as u64;
         if elapsed < edit_interval_ms {
             return;
@@ -363,7 +359,7 @@ impl TurnTracker {
                     }
                     tokio::select! {
                         _ = stop_rx.changed() => break,
-                        _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                        () = tokio::time::sleep(Duration::from_secs(4)) => {}
                     }
                 }
             });
@@ -428,7 +424,7 @@ impl TurnTracker {
         args: &serde_json::Value,
         outbox: &mut Outbox,
     ) {
-        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
         if !verbose {
             return;
         }
@@ -503,7 +499,7 @@ impl TurnTracker {
 
     /// Note that thinking/reasoning content is streaming.
     pub fn thinking_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
-        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
         if let Some(state) = self.turns.get_mut(session_id) {
             state.thinking = true;
             state.thinking_text.push_str(text);
@@ -519,17 +515,18 @@ impl TurnTracker {
 
     /// Accumulate a streaming text delta.
     pub fn message_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
-        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
 
         if verbose {
             // If no message sent yet, send with the first chunk of text.
+            #[allow(clippy::if_then_some_else_none)]
             let initial = {
                 let needs_send = self
                     .turns
                     .get(session_id)
-                    .map_or(false, |s| s.telegram_message_id.is_none() && !s.send_pending);
+                    .is_some_and(|s| s.telegram_message_id.is_none() && !s.send_pending);
                 if needs_send {
-                    let state = self.turns.get(session_id).unwrap();
+                    let state = self.turns.get(session_id).expect("session must exist");
                     let mut preview = state.render();
                     let delta_html = to_telegram_html(text);
                     if !delta_html.is_empty() {
@@ -539,7 +536,7 @@ impl TurnTracker {
                         preview.push_str(&delta_html);
                     }
                     if preview.is_empty() {
-                        preview = "…".to_owned();
+                        "…".clone_into(&mut preview);
                     }
                     Some(preview)
                 } else {
@@ -574,7 +571,7 @@ impl TurnTracker {
         content: &str,
         outbox: &mut Outbox,
     ) {
-        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
 
         if verbose {
             // If no deltas were received (e.g. very short response with extended
@@ -591,7 +588,7 @@ impl TurnTracker {
         };
 
         if !content.is_empty() {
-            state.streaming_text = content.to_owned();
+            content.clone_into(&mut state.streaming_text);
         }
 
         if state.verbose {

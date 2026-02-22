@@ -2,12 +2,13 @@
 ///
 /// Converts markdown-ish content to Telegram's supported HTML subset:
 /// `<b>`, `<i>`, `<code>`, `<pre>`, `<a href="">`.
-
 /// Maximum characters per Telegram message (with safety margin).
 pub const MAX_BODY_CHARS: usize = 3500;
 
 /// Convert markdown to Telegram HTML.
+#[allow(clippy::too_many_lines)]
 pub fn to_telegram_html(input: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(input.len() + input.len() / 4);
     let mut chars = input.chars().peekable();
     let mut in_code_block = false;
@@ -115,8 +116,7 @@ pub fn to_telegram_html(input: &str) -> String {
                 chars.next(); // consume second *
                 out.push_str("<b>");
                 let mut found = false;
-                loop {
-                    let Some(c) = chars.next() else { break };
+                while let Some(c) = chars.next() {
                     if c == '*' {
                         if chars.peek() == Some(&'*') {
                             chars.next();
@@ -179,11 +179,7 @@ pub fn to_telegram_html(input: &str) -> String {
                         }
                         url.push(c);
                     }
-                    out.push_str(&format!(
-                        "<a href=\"{}\">{}</a>",
-                        escape_html(&url),
-                        escape_html(&text)
-                    ));
+                    let _ = write!(out, "<a href=\"{}\">{}</a>", escape_html(&url), escape_html(&text));
                 } else {
                     out.push('[');
                     out.push_str(&escape_html(&text));
@@ -228,17 +224,18 @@ pub fn format_user_message(content: &str) -> String {
 }
 
 /// Format a tool call for verbose mode.
-pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str, is_error: bool) -> String {
+pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str, _is_error: bool) -> String {
+    use std::fmt::Write;
     let mut out = String::new();
 
     // Tool header
-    out.push_str(&format!("<b>{}</b>", escape_html(tool_name)));
+    let _ = write!(out, "<b>{}</b>", escape_html(tool_name));
 
     // Show args for common tools
     if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
-        out.push_str(&format!("\n<pre>{}</pre>", escape_html(cmd)));
+        let _ = write!(out, "\n<pre>{}</pre>", escape_html(cmd));
     } else if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-        out.push_str(&format!("\n<code>{}</code>", escape_html(path)));
+        let _ = write!(out, "\n<code>{}</code>", escape_html(path));
     }
 
     // Result
@@ -249,11 +246,7 @@ pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str
         } else {
             content.to_owned()
         };
-        if is_error {
-            out.push_str(&format!("<pre>{}</pre>", escape_html(&truncated)));
-        } else {
-            out.push_str(&format!("<pre>{}</pre>", escape_html(&truncated)));
-        }
+        let _ = write!(out, "<pre>{}</pre>", escape_html(&truncated));
     }
 
     out

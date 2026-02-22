@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
 
     let socket_dir = config.socket_dir();
     info!(
-        config_path = %cli.config.as_deref().map_or("default".to_owned(), |p| p.display().to_string()),
+        config_path = %cli.config.as_deref().map_or_else(|| "default".to_owned(), |p| p.display().to_string()),
         socket_dir = %socket_dir.display(),
         "starting pup"
     );

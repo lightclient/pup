@@ -2,8 +2,8 @@
 ///
 /// Each backend has its own format constraints (Telegram HTML, Discord markdown,
 /// etc.), but some transforms are useful everywhere.
-
 /// Strip markdown formatting to produce plain text.
+#[allow(clippy::too_many_lines)]
 pub fn strip_markdown(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();

@@ -86,12 +86,14 @@ pub enum MessageSource {
     Extension,
 }
 
-impl MessageSource {
-    pub fn from_str(s: &str) -> Self {
-        match s {
+impl std::str::FromStr for MessageSource {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "extension" => Self::Extension,
             _ => Self::Interactive,
-        }
+        })
     }
 }
 

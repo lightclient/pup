@@ -68,11 +68,10 @@ impl Transcriber {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
 
         // Language: None means auto-detect.
-        if let Some(ref lang) = self.language {
-            if lang != "auto" {
+        if let Some(ref lang) = self.language
+            && lang != "auto" {
                 params.set_language(Some(lang));
             }
-        }
 
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -88,11 +87,10 @@ impl Transcriber {
         let n = state.full_n_segments();
         let mut text = String::new();
         for i in 0..n {
-            if let Some(seg) = state.get_segment(i) {
-                if let Ok(s) = seg.to_str_lossy() {
+            if let Some(seg) = state.get_segment(i)
+                && let Ok(s) = seg.to_str_lossy() {
                     text.push_str(&s);
                 }
-            }
         }
 
         Ok(text.trim().to_owned())
@@ -148,6 +146,7 @@ pub(crate) fn decode_ogg_opus(ogg_data: &[u8]) -> Result<Vec<f32>> {
                 let sum: f32 = (0..channels)
                     .map(|c| decode_buf[i * channels + c])
                     .sum();
+                #[allow(clippy::cast_precision_loss)]
                 pcm_48k.push(sum / channels as f32);
             }
         } else {
@@ -160,6 +159,7 @@ pub(crate) fn decode_ogg_opus(ogg_data: &[u8]) -> Result<Vec<f32>> {
     let pcm_48k = &pcm_48k[start..];
 
     // Resample 48 kHz → 16 kHz (3:1 ratio, simple averaging).
+    #[allow(clippy::cast_precision_loss)]
     let pcm_16k: Vec<f32> = pcm_48k
         .chunks(3)
         .map(|c| c.iter().sum::<f32>() / c.len() as f32)

@@ -282,6 +282,7 @@ impl SessionManager {
     }
 
     /// Handle a parsed IPC event from a session.
+    #[allow(clippy::too_many_lines)]
     async fn handle_ipc_event(&mut self, session_id: &str, event: IpcEvent) {
         let session_event = match event {
             IpcEvent::AgentStart => SessionEvent::AgentStart {
@@ -372,7 +373,7 @@ impl SessionManager {
                 session_id: session_id.to_owned(),
                 content,
                 echo,
-                source: MessageSource::from_str(&source),
+                source: source.parse().unwrap_or(MessageSource::Interactive),
             },
             IpcEvent::SessionReset => SessionEvent::SessionReset {
                 session_id: session_id.to_owned(),
@@ -396,9 +397,11 @@ impl SessionManager {
                 content,
             },
             // Hello/History are handled during connect, not in the event stream.
-            IpcEvent::Hello(_) | IpcEvent::History(_) => return,
-            IpcEvent::TurnStart { .. } | IpcEvent::TurnEnd { .. } => return,
-            IpcEvent::Unknown { .. } => return,
+            IpcEvent::Hello(_)
+            | IpcEvent::History(_)
+            | IpcEvent::TurnStart { .. }
+            | IpcEvent::TurnEnd { .. }
+            | IpcEvent::Unknown { .. } => return,
         };
 
         self.fanout(session_event).await;
