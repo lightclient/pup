@@ -1,3 +1,13 @@
+<p align="center">
+  <img src="docs/pup.png" alt="pup logo" width="200">
+</p>
+
+<p align="center">
+  <a href="https://github.com/lightclient/pup/actions/workflows/ci.yml"><img src="https://github.com/lightclient/pup/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/lightclient/pup/releases/latest"><img src="https://img.shields.io/github/v/release/lightclient/pup" alt="Release"></a>
+  <a href="LICENSE-MIT"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue" alt="License: MIT/Apache-2.0"></a>
+</p>
+
 # pup
 
 Pickup your [pi](https://github.com/badlogic/pi) sessions on the go.
