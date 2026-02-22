@@ -46,52 +46,21 @@ Two components:
 The pi TUI keeps working normally. The extension is zero-overhead when no
 clients are connected.
 
-## Install
-
-### Extension
-
-Install the pi extension so every pi session exposes its socket:
+## Quick start
 
 ```bash
-# via pi's package manager (recommended)
-pi install git:github.com/anthropics/pup
+# install the pi extension
+pi install git:github.com/lightclient/pup
 
-# or manually
-mkdir -p ~/.pi/agent/extensions/pup
-cp extension/index.ts ~/.pi/agent/extensions/pup/
-```
-
-### Daemon
-
-```bash
-# build
+# build the daemon
 cargo build --release
 
-# run setup (creates ~/.config/pup/config.toml)
+# interactive setup (creates ~/.config/pup/config.toml)
 ./target/release/pup setup
 
 # start
 ./target/release/pup
 ```
-
-## Telegram modes
-
-**DM mode** — interact with sessions through direct messages:
-
-- `/ls` — list active pi sessions
-- `/attach <name|index|id>` — attach to a session
-- `/detach` — detach
-- `/cancel` — abort current operation
-- `/verbose [on|off]` — show/hide tool calls
-
-Plain messages are forwarded to the attached session. Prefix with `>>` for
-follow-up (queued until the agent finishes instead of interrupting).
-
-**Topics mode** — one forum topic per session in a Telegram supergroup. No
-attach/detach needed. Topics are created/deleted automatically as sessions
-start and stop.
-
-Both modes can run simultaneously.
 
 ## Configuration
 
@@ -99,20 +68,29 @@ Both modes can run simultaneously.
 
 ```toml
 [pup]
+# Directory where pi session sockets are created
 socket_dir = "~/.pi/pup"
 
 [display]
+# Show tool calls in messages by default
 verbose = false
+# Number of conversation turns to show when attaching
 history_turns = 5
-tool_output_lines = 10  # or "all"
+# How many tool calls to keep in rendered messages (number or "all")
+tool_calls = 3
+# How many lines of tool output to show per tool call (number or "all")
+tool_output_lines = 10
 
 [streaming]
+# Minimum interval between Telegram message edits (ms)
 edit_interval_ms = 1500
 
 [backends.telegram]
 enabled = true
 bot_token = "123456:ABC-..."
 allowed_user_ids = [12345678]
+# Enable local voice-to-text via whisper.cpp
+voice = true
 
 [backends.telegram.dm]
 enabled = true
@@ -120,20 +98,12 @@ enabled = true
 [backends.telegram.topics]
 enabled = true
 supergroup_id = -1001234567890
-```
+# Emoji icon for auto-created forum topics
+topic_icon = "📎"
 
-## Project structure
-
-```
-├── package.json                Pi package manifest (for pi install)
-├── extension/index.ts          Pi extension (TypeScript)
-├── crates/
-│   ├── pup-ipc/                IPC protocol types + Unix socket client
-│   ├── pup-core/               Backend trait, session manager, discovery
-│   ├── pup-telegram/           Telegram backend
-│   └── pup-daemon/             Binary, config, setup wizard, tracing
-└── docs/
-    └── ARCHITECTURE.md         Full design document
+[backends.telegram.display]
+# Maximum message length before truncation
+max_message_length = 3500
 ```
 
 ## Development
