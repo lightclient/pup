@@ -56,6 +56,11 @@ pub enum SessionEvent {
         echo: bool,
         source: MessageSource,
     },
+    /// A notification from the extension (command errors, status messages, etc).
+    Notification {
+        session_id: String,
+        text: String,
+    },
 }
 
 /// Where a user message originated.

@@ -372,6 +372,10 @@ impl SessionManager {
             IpcEvent::SessionReset => SessionEvent::SessionReset {
                 session_id: session_id.to_owned(),
             },
+            IpcEvent::Notification { text } => SessionEvent::Notification {
+                session_id: session_id.to_owned(),
+                text,
+            },
             IpcEvent::SessionEnd => {
                 self.disconnect_session(session_id, "session ended").await;
                 return;

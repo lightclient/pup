@@ -81,6 +81,9 @@ pub(crate) struct TelegramBackendConfig {
     pub topics: Option<TelegramTopicsConfig>,
     #[serde(default)]
     pub display: Option<TelegramDisplayConfig>,
+    /// Enable local voice-to-text via whisper.cpp (default: true).
+    #[serde(default = "default_true")]
+    pub voice: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +197,7 @@ impl Config {
             history_turns: self.display.history_turns,
             topics_state_path: socket_dir.join("topics_state.json"),
             socket_dir,
+            voice: tg.voice,
         })
     }
 }

@@ -4,8 +4,10 @@ pub mod outbox;
 pub mod render;
 pub mod topics;
 pub mod turn_tracker;
+pub(crate) mod whisper;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -22,6 +24,25 @@ use outbox::{Outbox, OutboxOp};
 use render::{escape_html, format_history, format_user_message};
 use topics::TopicsManager;
 use turn_tracker::TurnTracker;
+
+/// A pending interactive prompt for a command that requires an argument.
+/// When the user selects such a command from the Telegram menu without
+/// providing an argument, the daemon asks them for input and stores this
+/// state until their next message.
+#[derive(Debug, Clone)]
+struct PendingPrompt {
+    /// The slash command name (without the leading `/`).
+    command: String,
+}
+
+/// If a slash command requires an argument and was invoked without one,
+/// return the question to ask the user.
+fn prompt_for_command(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        "name" => Some("What name would you like to set?"),
+        _ => None,
+    }
+}
 
 /// Configuration for the Telegram backend.
 #[derive(Debug, Clone)]
@@ -40,6 +61,8 @@ pub struct TelegramConfig {
     pub socket_dir: PathBuf,
     /// Path to the topics state file for persisting the topic mapping.
     pub topics_state_path: PathBuf,
+    /// Enable local voice-to-text transcription via whisper.cpp.
+    pub voice: bool,
 }
 
 /// The Telegram chat backend.
@@ -65,6 +88,10 @@ pub struct TelegramBackend {
     incoming_rx: Option<mpsc::Receiver<IncomingMessage>>,
     /// Chat ID for DM mode (set on first message from allowed user).
     dm_chat_id: Option<i64>,
+    /// Pending interactive prompts, keyed by session ID.
+    pending_prompts: HashMap<String, PendingPrompt>,
+    /// Whisper transcriber for voice messages (loaded on start).
+    transcriber: Option<Arc<Mutex<whisper::Transcriber>>>,
 }
 
 impl TelegramBackend {
@@ -100,6 +127,34 @@ impl TelegramBackend {
             incoming_tx,
             incoming_rx: Some(incoming_rx),
             dm_chat_id: None,
+            pending_prompts: HashMap::new(),
+            transcriber: None,
+        }
+    }
+
+    /// Create a backend with a custom [`BotClient`] (for testing).
+    #[cfg(test)]
+    fn with_bot(config: TelegramConfig, bot: BotClient) -> Self {
+        let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
+        let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
+        turn_tracker.set_verbose(config.verbose);
+        let (incoming_tx, incoming_rx) = mpsc::channel(64);
+
+        Self {
+            config,
+            bot,
+            bot_user_id: 0,
+            outbox,
+            turn_tracker,
+            dm: DmState::default(),
+            topics: None,
+            update_offset: 0,
+            sessions: Vec::new(),
+            incoming_tx,
+            incoming_rx: Some(incoming_rx),
+            dm_chat_id: None,
+            pending_prompts: HashMap::new(),
+            transcriber: None,
         }
     }
 
@@ -123,6 +178,26 @@ impl TelegramBackend {
         }
 
         None
+    }
+
+    /// Delete any topics whose grace period has expired.
+    async fn check_pending_deletions(&mut self) {
+        let expired = match self.topics {
+            Some(ref mut topics) => topics.drain_expired(),
+            None => return,
+        };
+        let chat_id = self.topics.as_ref().unwrap().chat_id();
+        for (session_id, thread_id) in expired {
+            info!(session_id = %session_id, thread_id, "deleting expired topic");
+            if let Err(e) = self.bot.delete_forum_topic(chat_id, thread_id).await {
+                warn!(
+                    session_id = %session_id,
+                    thread_id,
+                    error = %e,
+                    "failed to delete expired topic"
+                );
+            }
+        }
     }
 
     /// Handle a Telegram update (message or callback query).
@@ -155,11 +230,18 @@ impl TelegramBackend {
         if !self.is_allowed(from.id) {
             return;
         }
+
+        let chat_id = message.chat.id;
+
+        // Handle voice messages: transcribe and treat as text.
+        if let Some(ref voice) = message.voice {
+            self.handle_voice_message(chat_id, &message, voice).await;
+            return;
+        }
+
         let Some(ref text) = message.text else {
             return;
         };
-
-        let chat_id = message.chat.id;
 
         // Topics mode: message in a forum topic.
         if let Some(thread_id) = message.message_thread_id
@@ -182,9 +264,12 @@ impl TelegramBackend {
                         text.clone()
                     };
 
-                    // Check for /cancel command in topic.
-                    let cmd = cleaned_text.trim().split(' ').next().unwrap_or("");
-                    if cmd == "/cancel" {
+                    let trimmed = cleaned_text.trim();
+
+                    // /cancel always takes effect immediately and clears any
+                    // pending interactive prompt.
+                    if trimmed.split_whitespace().next() == Some("/cancel") {
+                        self.pending_prompts.remove(&session_id);
                         let _ = self.incoming_tx.send(IncomingMessage {
                             session_id,
                             text: String::new(),
@@ -192,6 +277,51 @@ impl TelegramBackend {
                             is_cancel: true,
                         }).await;
                         return;
+                    }
+
+                    // If the user sent a non-command and there's a pending
+                    // prompt, treat their reply as the argument.
+                    if !trimmed.starts_with('/') {
+                        if let Some(prompt) = self.pending_prompts.remove(&session_id) {
+                            let full_cmd = format!("/{} {}", prompt.command, trimmed);
+                            let _ = self.incoming_tx.send(IncomingMessage {
+                                session_id,
+                                text: full_cmd,
+                                mode: SendMode::Steer,
+                                is_cancel: false,
+                            }).await;
+                            return;
+                        }
+                    } else {
+                        // A new slash command cancels any pending prompt.
+                        self.pending_prompts.remove(&session_id);
+                    }
+
+                    // If this is a slash command that needs an argument but
+                    // was invoked without one, start an interactive prompt.
+                    if trimmed.starts_with('/') {
+                        let after_slash = &trimmed[1..];
+                        let (cmd_name, args) = match after_slash.split_once(' ') {
+                            Some((c, a)) => (c, a.trim()),
+                            None => (after_slash, ""),
+                        };
+                        if args.is_empty() {
+                            if let Some(question) = prompt_for_command(cmd_name) {
+                                self.pending_prompts.insert(
+                                    session_id.clone(),
+                                    PendingPrompt { command: cmd_name.to_owned() },
+                                );
+                                self.outbox.enqueue(OutboxOp::Send {
+                                    chat_id: topics.chat_id(),
+                                    text: format!("<i>{question}</i>"),
+                                    parse_mode: Some("HTML".to_owned()),
+                                    reply_markup: None,
+                                    message_thread_id: Some(thread_id),
+                                    result_tx: None,
+                                });
+                                return;
+                            }
+                        }
                     }
 
                     // Determine send mode.
@@ -219,6 +349,13 @@ impl TelegramBackend {
 
     /// Handle a DM message (commands or forwarding).
     async fn handle_dm_message(&mut self, chat_id: i64, text: &str) {
+        // Any slash command cancels a pending interactive prompt.
+        if text.trim().starts_with('/') {
+            if let Some(sid) = &self.dm.attached {
+                self.pending_prompts.remove(sid.as_str());
+            }
+        }
+
         let cmd = dm::parse_command(text);
 
         match cmd {
@@ -311,9 +448,43 @@ impl TelegramBackend {
                 self.send_dm(chat_id, &DmState::format_help());
             }
             DmCommand::Message { text, mode } => {
-                if let Some(ref sid) = self.dm.attached {
+                if let Some(sid) = self.dm.attached.clone() {
+                    // Check for pending prompt completion.
+                    if !text.starts_with('/') {
+                        if let Some(prompt) = self.pending_prompts.remove(&sid) {
+                            let full_cmd = format!("/{} {}", prompt.command, text);
+                            let _ = self.incoming_tx.send(IncomingMessage {
+                                session_id: sid,
+                                text: full_cmd,
+                                mode: SendMode::Steer,
+                                is_cancel: false,
+                            }).await;
+                            return;
+                        }
+                    }
+
+                    // Check if this is a pi slash command that needs an argument.
+                    let msg_trimmed = text.trim();
+                    if msg_trimmed.starts_with('/') {
+                        let after_slash = &msg_trimmed[1..];
+                        let (cmd_name, args) = match after_slash.split_once(' ') {
+                            Some((c, a)) => (c.split('@').next().unwrap_or(c), a.trim()),
+                            None => (after_slash.split('@').next().unwrap_or(after_slash), ""),
+                        };
+                        if args.is_empty() {
+                            if let Some(question) = prompt_for_command(cmd_name) {
+                                self.pending_prompts.insert(
+                                    sid,
+                                    PendingPrompt { command: cmd_name.to_owned() },
+                                );
+                                self.send_dm(chat_id, &format!("<i>{question}</i>"));
+                                return;
+                            }
+                        }
+                    }
+
                     let _ = self.incoming_tx.send(IncomingMessage {
-                        session_id: sid.clone(),
+                        session_id: sid,
                         text,
                         mode,
                         is_cancel: false,
@@ -329,6 +500,33 @@ impl TelegramBackend {
     }
 
     /// Quick helper to enqueue a DM text message.
+    /// Ensure the turn tracker has state for this session.
+    /// Auto-creates turn state when the daemon connected mid-turn
+    /// (missed AgentStart) or when a steer message continues an
+    /// existing turn without a new AgentStart.
+    fn ensure_turn(&mut self, session_id: &str) {
+        if self.turn_tracker.has_turn(session_id) {
+            return;
+        }
+        if let Some(ref topics) = self.topics {
+            if let Some(thread_id) = topics.thread_for_session(session_id) {
+                debug!(session_id, "auto-creating turn state (missed AgentStart)");
+                self.turn_tracker.start_turn(
+                    session_id,
+                    topics.chat_id(),
+                    Some(thread_id),
+                    &self.bot,
+                );
+            }
+        } else if self.dm.attached.as_deref() == Some(session_id)
+            && let Some(chat_id) = self.dm_chat_id
+        {
+            debug!(session_id, "auto-creating turn state for DM (missed AgentStart)");
+            self.turn_tracker
+                .start_turn(session_id, chat_id, None, &self.bot);
+        }
+    }
+
     fn send_dm(&mut self, chat_id: i64, text: &str) {
         self.outbox.enqueue(OutboxOp::Send {
             chat_id,
@@ -353,6 +551,134 @@ impl TelegramBackend {
                     result_tx: None,
                 });
             }
+    }
+
+    /// Handle a voice message: download, transcribe, and forward as text.
+    async fn handle_voice_message(
+        &mut self,
+        chat_id: i64,
+        message: &bot::Message,
+        voice: &bot::Voice,
+    ) {
+        // Figure out where this message should go, and a helper to
+        // reply in the right place (topic or DM).
+        let (session_id, thread_id) = if let Some(tid) = message.message_thread_id
+            && let Some(ref topics) = self.topics
+            && let Some(sid) = topics.session_for_thread(tid)
+        {
+            (sid.to_owned(), Some(tid))
+        } else if let Some(ref sid) = self.dm.attached {
+            (sid.clone(), None)
+        } else {
+            self.send_dm(chat_id, "Not attached. Use /ls and /attach first.");
+            return;
+        };
+
+        // Macro-like helper: reply to the right place.
+        macro_rules! reply {
+            ($text:expr) => {
+                if thread_id.is_some() {
+                    self.send_to_topic(&session_id, $text);
+                } else {
+                    self.send_dm(chat_id, $text);
+                }
+            };
+        }
+
+        if self.transcriber.is_none() {
+            reply!("⚠️ Voice messages are not supported. \
+                    Set <code>voice = true</code> under <code>[backends.telegram]</code> in your pup config to enable transcription.");
+            return;
+        }
+
+        debug!(
+            file_id = %voice.file_id,
+            duration = voice.duration,
+            "transcribing voice message"
+        );
+
+        // Download the voice file.
+        let ogg_data = match self.download_voice(&voice.file_id).await {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(error = %e, "failed to download voice message");
+                reply!(&format!(
+                    "⚠️ Failed to download voice message: <code>{}</code>",
+                    escape_html(&e.to_string()),
+                ));
+                return;
+            }
+        };
+
+        // Convert OGG/Opus → 16 kHz PCM and transcribe.
+        let text = match self.transcribe_audio(ogg_data).await {
+            Ok(t) if t.is_empty() => {
+                reply!("⚠️ Could not recognise any speech in this voice message.");
+                return;
+            }
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "voice transcription failed");
+                reply!(&format!(
+                    "⚠️ Voice transcription failed: <code>{}</code>",
+                    escape_html(&e.to_string()),
+                ));
+                return;
+            }
+        };
+
+        info!(
+            session_id,
+            chars = text.len(),
+            "voice message transcribed"
+        );
+
+        // Show the transcribed text to the user.
+        let preview = format!("🎙️ <i>{}</i>", escape_html(&text));
+        if thread_id.is_some() {
+            self.send_to_topic(&session_id, &preview);
+        } else {
+            self.send_dm(chat_id, &preview);
+        }
+
+        // Forward the transcribed text to the session.
+        let _ = self
+            .incoming_tx
+            .send(IncomingMessage {
+                session_id,
+                text,
+                mode: SendMode::Steer,
+                is_cancel: false,
+            })
+            .await;
+    }
+
+    /// Download a Telegram voice file by file_id.
+    async fn download_voice(&self, file_id: &str) -> Result<Vec<u8>> {
+        let file_info = self.bot.get_file(file_id).await?;
+        let file_path = file_info
+            .file_path
+            .context("Telegram returned no file_path")?;
+        self.bot.download_file(&file_path).await
+    }
+
+    /// Decode OGG/Opus audio and run whisper transcription.
+    async fn transcribe_audio(&self, ogg_data: Vec<u8>) -> Result<String> {
+        let transcriber = Arc::clone(
+            self.transcriber
+                .as_ref()
+                .context("no transcriber loaded")?,
+        );
+        // Both decoding and inference are CPU-bound.
+        tokio::task::spawn_blocking(move || {
+            let pcm = whisper::decode_ogg_opus(&ogg_data)?;
+            let t = transcriber
+                .lock()
+                .map_err(|e| anyhow::anyhow!("transcriber lock poisoned: {e}"))?;
+            t.transcribe(&pcm)
+        })
+        .await
+        .context("transcription task panicked")?
     }
 
     /// Drain `getUpdates` from `offset`, recording any `forum_topic_created`
@@ -540,9 +866,24 @@ impl ChatBackend for TelegramBackend {
                     .await;
             }
 
+            // Load whisper model for voice transcription if enabled.
+            if self.config.voice {
+                let cache_dir = self.config.socket_dir.join("whisper");
+                match whisper::Transcriber::new(None, None, &cache_dir).await {
+                    Ok(t) => {
+                        info!("whisper transcriber loaded");
+                        self.transcriber = Some(Arc::new(Mutex::new(t)));
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to load whisper — voice messages will be ignored");
+                    }
+                }
+            }
+
             info!(
                 dm_enabled = self.config.dm_enabled,
                 topics_enabled = self.config.topics_enabled,
+                voice = self.transcriber.is_some(),
                 "telegram backend initialized"
             );
             Ok(())
@@ -552,48 +893,74 @@ impl ChatBackend for TelegramBackend {
     }
 
     async fn handle_event(&mut self, event: SessionEvent) -> Result<()> {
+        // Check for expired pending topic deletions on every event.
+        self.check_pending_deletions().await;
+
         match event {
             SessionEvent::Connected { ref info } => {
                 self.sessions.push(info.clone());
 
                 // Topics mode: create (or reuse) a topic and post recent history.
                 if let Some(ref mut topics) = self.topics {
-                    match topics.create_topic(&self.bot, info).await {
-                        Ok((thread_id, reused)) => {
-                            // Only post history for newly created topics.
-                            // Reused topics already have their history from the
-                            // previous daemon run.
-                            if !reused && !info.history.is_empty() {
-                                let msgs = format_history(
-                                    &info.history,
-                                    self.config.history_turns,
-                                );
-                                for msg in msgs {
-                                    self.outbox.enqueue(OutboxOp::Send {
-                                        chat_id: topics.chat_id(),
-                                        text: msg,
-                                        parse_mode: Some("HTML".to_owned()),
-                                        reply_markup: None,
-                                        message_thread_id: Some(thread_id),
-                                        result_tx: None,
-                                    });
+                    // Check if a recently-disconnected session in the same cwd
+                    // has a topic we can reuse (handles pi restarts).
+                    if let Some(_thread_id) =
+                        topics.claim_pending_topic(&info.session_id, &info.cwd)
+                    {
+                        // Rename the topic to reflect the new session's info.
+                        if let Err(e) = topics.rename_topic(&self.bot, info).await {
+                            warn!(error = %e, "failed to rename reclaimed topic");
+                        }
+                    } else {
+                        match topics.create_topic(&self.bot, info).await {
+                            Ok((thread_id, reused)) => {
+                                // Only post history for newly created topics.
+                                // Reused topics already have their history from the
+                                // previous daemon run.
+                                if !reused && !info.history.is_empty() {
+                                    let msgs = format_history(
+                                        &info.history,
+                                        self.config.history_turns,
+                                    );
+                                    for msg in msgs {
+                                        self.outbox.enqueue(OutboxOp::Send {
+                                            chat_id: topics.chat_id(),
+                                            text: msg,
+                                            parse_mode: Some("HTML".to_owned()),
+                                            reply_markup: None,
+                                            message_thread_id: Some(thread_id),
+                                            result_tx: None,
+                                        });
+                                    }
                                 }
                             }
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "failed to create topic");
+                            Err(e) => {
+                                warn!(error = %e, "failed to create topic");
+                            }
                         }
                     }
                 }
             }
             SessionEvent::Disconnected { ref session_id } => {
-                self.sessions.retain(|s| s.session_id != *session_id);
+                // Grab the cwd before removing from our session list.
+                let cwd = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.session_id == *session_id)
+                    .map(|s| s.cwd.clone());
 
-                // Topics mode: delete the topic.
-                if let Some(ref mut topics) = self.topics
-                    && let Err(e) = topics.delete_topic(&self.bot, session_id).await {
+                self.sessions.retain(|s| s.session_id != *session_id);
+                self.pending_prompts.remove(session_id.as_str());
+
+                // Topics mode: schedule deletion with grace period so a
+                // restarted pi session in the same cwd can reclaim the topic.
+                if let Some(ref mut topics) = self.topics {
+                    if let Some(cwd) = cwd {
+                        topics.schedule_deletion(session_id, &cwd);
+                    } else if let Err(e) = topics.delete_topic(&self.bot, session_id).await {
                         warn!(error = %e, "failed to delete topic");
                     }
+                }
 
                 // DM mode: auto-detach.
                 if self.dm.attached.as_deref() == Some(session_id.as_str()) {
@@ -621,6 +988,7 @@ impl ChatBackend for TelegramBackend {
             }
             SessionEvent::SessionReset { ref session_id } => {
                 info!(session_id, "session reset");
+                self.pending_prompts.remove(session_id.as_str());
                 // End any in-progress turn cleanly.
                 self.outbox.clear_edit_cooldown();
                 self.turn_tracker.end_turn(session_id, &mut self.outbox);
@@ -656,6 +1024,7 @@ impl ChatBackend for TelegramBackend {
             }
             SessionEvent::AgentEnd { ref session_id } => {
                 debug!(session_id, "agent ended");
+                self.ensure_turn(session_id);
                 // Clear edit cooldowns so the final edit (removing the cancel
                 // keyboard) goes through even if a recent content edit just ran.
                 self.outbox.clear_edit_cooldown();
@@ -671,6 +1040,8 @@ impl ChatBackend for TelegramBackend {
                 ref text,
                 ..
             } => {
+                debug!(session_id, len = text.len(), "message_delta");
+                self.ensure_turn(session_id);
                 self.turn_tracker
                     .message_delta(session_id, text, &mut self.outbox);
             }
@@ -681,6 +1052,7 @@ impl ChatBackend for TelegramBackend {
             } => {
                 // Update the turn with the final content and flush an
                 // edit. Does NOT finalize the turn — AgentEnd does that.
+                self.ensure_turn(session_id);
                 self.turn_tracker
                     .message_end_with_content(session_id, content, &mut self.outbox);
             }
@@ -690,6 +1062,7 @@ impl ChatBackend for TelegramBackend {
                 ref args,
                 ..
             } => {
+                self.ensure_turn(session_id);
                 self.turn_tracker
                     .tool_start(session_id, tool_name, args, &mut self.outbox);
             }
@@ -699,12 +1072,25 @@ impl ChatBackend for TelegramBackend {
                 is_error,
                 ..
             } => {
+                self.ensure_turn(session_id);
                 self.turn_tracker.tool_end(
                     session_id,
                     tool_name,
                     is_error,
                     &mut self.outbox,
                 );
+            }
+            SessionEvent::Notification {
+                ref session_id,
+                ref text,
+            } => {
+                let html = format!("<i>{}</i>", escape_html(text));
+                self.send_to_topic(session_id, &html);
+
+                if self.dm.attached.as_deref() == Some(session_id.as_str())
+                    && let Some(chat_id) = self.dm_chat_id {
+                        self.send_dm(chat_id, &html);
+                    }
             }
             SessionEvent::UserMessage {
                 ref session_id,
@@ -738,10 +1124,15 @@ impl ChatBackend for TelegramBackend {
 
     async fn recv_incoming(&mut self) -> Result<Option<IncomingMessage>> {
         loop {
-            // Poll for Telegram updates (long-polls for up to 30s).
+            // Check for expired pending topic deletions (~once per second).
+            self.check_pending_deletions().await;
+
+            // Short poll (1s) so the outer select! loop can preempt us
+            // between iterations to process session events (agent
+            // responses, typing indicators, etc.).
             match self
                 .bot
-                .get_updates(self.update_offset, 30)
+                .get_updates(self.update_offset, 1)
                 .await
             {
                 Ok(updates) => {
@@ -758,12 +1149,18 @@ impl ChatBackend for TelegramBackend {
                 }
             }
 
+            // Flush any outbox messages enqueued by handle_update
+            // (e.g. interactive prompts for commands like /name).
+            while self.outbox.flush_one().await {}
+
             // Drain any incoming messages generated by handle_update.
             if let Some(ref mut rx) = self.incoming_rx {
                 match rx.try_recv() {
                     Ok(msg) => return Ok(Some(msg)),
                     Err(mpsc::error::TryRecvError::Empty) => {
-                        // No messages this cycle, continue long-polling.
+                        // No messages — loop back for another short poll.
+                        // The select! in the main loop can preempt us at
+                        // the next .await (the getUpdates call).
                         continue;
                     }
                     Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
@@ -774,6 +1171,14 @@ impl ChatBackend for TelegramBackend {
 
     async fn shutdown(&mut self) -> Result<()> {
         info!("shutting down telegram backend");
+
+        // Cancel any pending topic deletions so their mappings are
+        // preserved across pup restarts.  If the sessions are still
+        // alive when pup comes back, their topics will be reused.
+        if let Some(ref mut topics) = self.topics {
+            topics.cancel_all_pending();
+        }
+
         // Best-effort flush of outbox.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !self.outbox.is_empty() && tokio::time::Instant::now() < deadline {
@@ -782,5 +1187,217 @@ impl ChatBackend for TelegramBackend {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex as StdMutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    /// A recorded API call from the mock server.
+    #[derive(Debug, Clone)]
+    struct ApiCall {
+        method: String,
+        body: String,
+    }
+
+    /// Start a mock Telegram Bot API server.
+    ///
+    /// Returns the base URL and a handle to the recorded API calls.
+    /// `updates` are returned on the first `getUpdates`; subsequent calls
+    /// block until the server is dropped (simulating long-poll).
+    async fn mock_telegram_api(
+        updates: Vec<serde_json::Value>,
+    ) -> (String, Arc<StdMutex<Vec<ApiCall>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}/bottest");
+        let calls: Arc<StdMutex<Vec<ApiCall>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let calls_bg = calls.clone();
+        let updates = Arc::new(StdMutex::new(Some(updates)));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let calls = calls_bg.clone();
+                let updates = updates.clone();
+
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+
+                    // Handle potentially multiple requests per connection.
+                    loop {
+                        // Read request line.
+                        let mut request_line = String::new();
+                        match reader.read_line(&mut request_line).await {
+                            Ok(0) | Err(_) => break,
+                            _ => {}
+                        }
+
+                        // Read headers.
+                        let mut content_length: usize = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).await.is_err() {
+                                return;
+                            }
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some(val) =
+                                line.strip_prefix("content-length:")
+                                    .or_else(|| line.strip_prefix("Content-Length:"))
+                            {
+                                content_length =
+                                    val.trim().parse().unwrap_or(0);
+                            }
+                        }
+
+                        // Read body.
+                        let mut body = vec![0u8; content_length];
+                        if reader.read_exact(&mut body).await.is_err() {
+                            break;
+                        }
+                        let body_str =
+                            String::from_utf8_lossy(&body).to_string();
+
+                        // Extract API method from path.
+                        let method = request_line
+                            .split(' ')
+                            .nth(1)
+                            .unwrap_or("")
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_owned();
+
+                        calls.lock().unwrap().push(ApiCall {
+                            method: method.clone(),
+                            body: body_str,
+                        });
+
+                        let response_json = match method.as_str() {
+                            "getUpdates" => {
+                                let batch = updates.lock().unwrap().take();
+                                if let Some(batch) = batch {
+                                    // First call: return the canned updates.
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "result": batch
+                                    })
+                                } else {
+                                    // Subsequent calls: hang (long-poll).
+                                    tokio::time::sleep(Duration::from_secs(120))
+                                        .await;
+                                    return;
+                                }
+                            }
+                            "sendMessage" => serde_json::json!({
+                                "ok": true,
+                                "result": {
+                                    "message_id": 999,
+                                    "chat": {"id": 1, "type": "private"}
+                                }
+                            }),
+                            _ => serde_json::json!({"ok": true, "result": true}),
+                        };
+
+                        let payload =
+                            serde_json::to_string(&response_json).unwrap();
+                        let http = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             \r\n\
+                             {}",
+                            payload.len(),
+                            payload,
+                        );
+                        if writer.write_all(http.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        (base_url, calls)
+    }
+
+    fn test_config() -> TelegramConfig {
+        TelegramConfig {
+            bot_token: "test".to_owned(),
+            allowed_user_ids: vec![12345],
+            dm_enabled: true,
+            topics_enabled: false,
+            supergroup_id: None,
+            topic_icon: String::new(),
+            max_message_length: 4096,
+            edit_interval_ms: 100,
+            verbose: false,
+            history_turns: 0,
+            socket_dir: PathBuf::from("/tmp"),
+            topics_state_path: PathBuf::from("/tmp/topics.json"),
+            voice: false,
+        }
+    }
+
+    /// An interactive command like `/name` (which requires an argument)
+    /// must send its prompt to the user immediately — not wait until the
+    /// next incoming message.  This is an end-to-end test: the mock
+    /// Telegram API returns a single `/name` update, and we assert that
+    /// `sendMessage` with the prompt text is called before the next
+    /// (blocking) `getUpdates`.
+    #[tokio::test]
+    async fn test_interactive_prompt_sent_immediately() {
+        let updates = vec![serde_json::json!({
+            "update_id": 1,
+            "message": {
+                "message_id": 100,
+                "from": {"id": 12345, "first_name": "Test"},
+                "chat": {"id": 99999, "type": "private"},
+                "text": "/name"
+            }
+        })];
+
+        let (base_url, api_calls) = mock_telegram_api(updates).await;
+
+        let bot = BotClient::with_base_url(&base_url);
+        let mut backend = TelegramBackend::with_bot(test_config(), bot);
+        backend.dm.attached = Some("test-session".to_owned());
+        backend.dm_chat_id = Some(99999);
+
+        // recv_incoming loops forever (second getUpdates hangs), so
+        // use a timeout.  The prompt must be sent within this window.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            backend.recv_incoming(),
+        )
+        .await;
+
+        let calls = api_calls.lock().unwrap();
+        let send_calls: Vec<&ApiCall> = calls
+            .iter()
+            .filter(|c| c.method == "sendMessage")
+            .collect();
+
+        assert!(
+            !send_calls.is_empty(),
+            "sendMessage must be called with the interactive prompt \
+             (got only: {calls:?})"
+        );
+        assert!(
+            send_calls[0].body.contains("What name"),
+            "prompt text missing from sendMessage body: {}",
+            send_calls[0].body,
+        );
     }
 }

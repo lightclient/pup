@@ -187,10 +187,11 @@ isolated `PUP_SOCKET_DIR`, runs the requested tests, and cleans up.
 **Expected:**
 - The `e2e-t02` topic no longer appears in `tg.py topics`
 
-**Note:** Topic deletion is triggered by the daemon detecting the broken
-IPC connection when the pi process exits. The extension does not explicitly
-send a `session_end` event on shutdown — the OS closes the socket when the
-process dies.
+**Note:** Topic deletion uses a 30-second grace period. When the pi process
+exits and the IPC connection breaks, the topic is scheduled for deletion
+but not immediately removed. After 30 seconds with no replacement session
+in the same working directory, the topic is deleted. The test must wait
+long enough for the grace period to expire.
 
 ---
 
@@ -910,105 +911,92 @@ Pi interprets its own slash commands from this text.
 
 ### S01 — /name via Telegram renames the topic
 
-**Steps:**
-1. Start a pi session, name it `e2e-s01-original`
-2. Wait for topic `e2e-s01-original`; note the topic ID
-3. Send `/name e2e-s01-renamed` via Telegram:
-   `tg.py send SUPERGROUP TOPIC_ID "/name e2e-s01-renamed"`
-4. Wait up to 15s
-
-**Expected:**
-- Pi receives `/name e2e-s01-renamed` and renames the session
-- The extension detects the name change (via polling or event)
-- The extension broadcasts `session_name_changed`
-- Pup receives the event and renames the topic via `editForumTopic`
-- `tg.py topics SUPERGROUP` shows the topic as `📎 e2e-s01-renamed`
-- The topic ID is unchanged (same topic, just renamed)
+See S09 for the current test — kept here as a cross-reference.
 
 ---
 
-### S02 — /exit via Telegram kills the session and deletes the topic
+### S02 — /exit via Telegram kills the session
 
-**Steps:**
-1. Start a pi session, name it `e2e-s02`
-2. Wait for topic; note the topic ID
-3. Send `/exit` via Telegram:
-   `tg.py send SUPERGROUP TOPIC_ID "/exit"`
-4. Wait up to 15s
-
-**Expected:**
-- Pi receives `/exit` and shuts down the session
-- The pi process exits
-- The IPC connection breaks
-- Pup detects the disconnect and deletes the topic
-- `tg.py topics SUPERGROUP` no longer shows `e2e-s02`
+See S10 for the current test — kept here as a cross-reference.
 
 ---
 
-### S03 — /new via Telegram resets session (topic persists)
+### S03 — /new via Telegram shows unsupported notification
+
+The `/new` command requires `ExtensionCommandContext.newSession()` which
+is not available to extension IPC handlers (only to `registerCommand`
+handlers). The extension intercepts the command and broadcasts an error
+notification instead of forwarding it to the LLM.
 
 **Steps:**
 1. Start a pi session, name it `e2e-s03`
 2. Wait for topic; note the topic ID
-3. Send a prompt via Telegram: `"say BEFORE_TELE_RESET"`
-4. Wait for the response
-5. Send `/new` via Telegram:
+3. Send `/new` via Telegram:
    `tg.py send SUPERGROUP TOPIC_ID "/new"`
-6. Wait 10s
-7. List topics
-8. Read topic history
+4. Wait 10s
+5. Read topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
 
 **Expected:**
-- Pi receives `/new` and resets the session
-- The extension broadcasts `session_reset`
-- Pup posts `🔄 Session reset` in the topic
+- The bot posts a notification containing `not available via remote access`
+- The `/new` text is NOT forwarded to the LLM (the agent does not see it)
 - The topic persists (same topic ID)
-- Sending a new message to the topic works
+- The session remains functional — send a follow-up message and verify
 
 ---
 
-### S04 — /compact via Telegram (topic persists)
+### S04 — /compact via Telegram compacts the session
+
+The extension handles `/compact` directly via `ctx.compact()`.
 
 **Steps:**
 1. Start a pi session, name it `e2e-s04`
 2. Wait for topic; note the topic ID
-3. Send a prompt via Telegram to build conversation
+3. Send a prompt via Telegram to build conversation:
+   `tg.py send SUPERGROUP TOPIC_ID "say BEFORE_COMPACT"`
 4. Wait for response
 5. Send `/compact` via Telegram:
    `tg.py send SUPERGROUP TOPIC_ID "/compact"`
-6. Wait 10s
-7. List topics
+6. Wait 15s for compaction to complete
+7. List topics: `tg.py topics SUPERGROUP`
+8. Send a follow-up message:
+   `tg.py send SUPERGROUP TOPIC_ID "say AFTER_COMPACT"`
+9. Wait for response
 
 **Expected:**
-- Pi receives `/compact` and compacts the context
+- The extension calls `ctx.compact()` — the text `/compact` is NOT
+  forwarded to the LLM
 - Topic persists (same topic ID)
-- If `/compact` triggers a session reset, `🔄 Session reset` appears
-- Session is functional afterward
+- If compaction triggers `session_shutdown` + `session_start`, the
+  extension broadcasts `session_reset` and `🔄 Session reset` appears
+- The session responds to the follow-up message after compaction
 
 ---
 
-### S05 — /model via Telegram changes the model
+### S05 — /model via Telegram
+
+The extension handles `/model <name>` (with args) by calling
+`pi.setModel()`. Without args, it shows an unsupported notification
+since the interactive model selector requires the TUI.
 
 **Steps:**
 1. Start a pi session, name it `e2e-s05`
 2. Wait for topic; note the topic ID
-3. Send `/model` via Telegram:
+3. Send `/model` (no args) via Telegram:
    `tg.py send SUPERGROUP TOPIC_ID "/model"`
-4. Wait for pi's response (model selection UI or current model info)
+4. Wait 5s
+5. Read topic history
 
 **Expected:**
-- Pi receives `/model` and responds (showing model info or a picker)
-- The response appears in the topic
-- If the model changes, the extension broadcasts `model_changed`
-- No crash
-
-**Note:** The exact behavior depends on pi's `/model` implementation.
-It may show a list, switch models, or just display the current one. The
-test verifies the command is forwarded and pi handles it.
+- The bot posts a notification containing `not available via remote access`
+- The `/model` text is NOT forwarded to the LLM
 
 ---
 
-### S06 — Unknown pi slash command via Telegram
+### S06 — Unknown slash command via Telegram is forwarded to the LLM
+
+Commands not recognized by the extension (not in the TUI's built-in list)
+are passed through to `sendUserMessage()` and reach the LLM.
 
 **Steps:**
 1. Start a pi session, name it `e2e-s06`
@@ -1018,14 +1006,104 @@ test verifies the command is forwarded and pi handles it.
 4. Wait for response
 
 **Expected:**
-- Pi receives `/nonexistent` and either ignores it or shows an error
-- The response (or lack thereof) appears in the topic
+- The extension does NOT intercept `/nonexistent` (it's not a known
+  TUI command)
+- The text is forwarded to the LLM via `sendUserMessage()`
+- The LLM responds (it sees `/nonexistent` as user text)
 - No crash on either side
 - The session remains functional
 
 ---
 
-### S07 — /cancel@botname works in group topics
+### S07 — TUI-only commands via Telegram show notification
+
+Commands that require the pi TUI (interactive selectors, clipboard, etc.)
+are intercepted by the extension and produce an error notification.
+
+**Steps:**
+1. Start a pi session, name it `e2e-s07`
+2. Wait for topic; note the topic ID
+3. Send TUI-only commands via Telegram:
+   - `tg.py send SUPERGROUP TOPIC_ID "/settings"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/copy"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/session"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/hotkeys"`
+4. Wait 10s
+5. Read topic history: `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- Each command produces a notification containing `not available via
+  remote access` and `requires pi TUI`
+- None of the commands are forwarded to the LLM
+- The session remains functional afterward
+
+---
+
+### S08 — ExtensionCommandContext commands via Telegram show notification
+
+Commands that require `ExtensionCommandContext` (not available to IPC
+handlers) are intercepted and produce a specific error notification.
+
+**Steps:**
+1. Start a pi session, name it `e2e-s08`
+2. Wait for topic; note the topic ID
+3. Send commands that need `ExtensionCommandContext`:
+   - `tg.py send SUPERGROUP TOPIC_ID "/new"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/fork"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/tree"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/resume"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/reload"`
+4. Wait 10s
+5. Read topic history: `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- Each command produces a notification containing `not available via
+  remote access` and `upstream pi API change`
+- None of the commands are forwarded to the LLM
+- The session remains functional afterward
+
+---
+
+### S09 — /name via Telegram renames the topic
+
+(Moved from old S01 — tests the supported `/name` command.)
+
+**Steps:**
+1. Start a pi session, name it `e2e-s09-original`
+2. Wait for topic `e2e-s09-original`; note the topic ID
+3. Send `/name e2e-s09-renamed` via Telegram:
+   `tg.py send SUPERGROUP TOPIC_ID "/name e2e-s09-renamed"`
+4. Wait up to 15s
+
+**Expected:**
+- The extension calls `pi.setSessionName("e2e-s09-renamed")`
+- The extension detects the name change (via polling)
+- The extension broadcasts `session_name_changed`
+- Pup renames the topic via `editForumTopic`
+- `tg.py topics SUPERGROUP` shows the topic as `📎 e2e-s09-renamed`
+- The topic ID is unchanged (same topic, just renamed)
+
+---
+
+### S10 — /exit via Telegram kills the session and deletes the topic
+
+**Steps:**
+1. Start a pi session, name it `e2e-s10`
+2. Wait for topic; note the topic ID
+3. Send `/exit` via Telegram:
+   `tg.py send SUPERGROUP TOPIC_ID "/exit"`
+4. Wait up to 15s
+
+**Expected:**
+- The extension calls `ctx.shutdown()`
+- The pi process exits
+- The IPC connection breaks
+- Pup detects the disconnect and deletes the topic
+- `tg.py topics SUPERGROUP` no longer shows `e2e-s10`
+
+---
+
+### S11 — /cancel@botname works in group topics
 
 In Telegram groups, commands are sent with `@botname` suffix when the user
 picks them from the autocomplete menu, e.g., `/cancel@my_pup_bot`. Pup
@@ -1048,7 +1126,7 @@ strips the `@botname` suffix before matching commands.
 
 ---
 
-### S08 — Command sent to General topic (not a pup topic)
+### S12 — Command sent to General topic (not a pup topic)
 
 Messages in the supergroup's "General" topic (or any non-pup topic)
 should not be processed by pup.
@@ -1296,6 +1374,124 @@ when pup restarts.
 
 **Note:** The daemon missed the `session_reset` event (it wasn't running),
 but the socket stayed alive, so the session is picked up normally.
+
+---
+
+## Grace Period Tests
+
+When a pi session disconnects, pup waits 30 seconds before deleting the
+topic. If a new pi session starts in the same working directory within
+that window, the topic is transferred to the new session instead of being
+deleted and recreated. This handles pi restarts gracefully.
+
+### G01 — Pi restart in same cwd reuses topic
+
+A pi session is restarted (killed and relaunched in the same directory).
+The new session should reclaim the old topic.
+
+**Steps:**
+1. Create a working directory: `WORK=$(mktemp -d)`
+2. Start a pi session in `$WORK`, name it `e2e-g01`
+3. Wait for topic to appear; note the topic ID
+4. Send a message to verify it works:
+   `tg.py send SUPERGROUP TOPIC_ID "say BEFORE_RESTART"`
+5. Wait for response
+6. Exit the pi session (Ctrl-D)
+7. Immediately (within a few seconds) start a new pi session in the
+   same `$WORK` directory
+8. Name it `e2e-g01-after`
+9. Wait up to 15s
+
+**Expected:**
+- The old topic is NOT deleted (grace period holds it)
+- The new session claims the old topic (matched by cwd)
+- The topic is renamed to reflect the new session name (`e2e-g01-after`)
+- `tg.py topics SUPERGROUP` shows exactly one topic
+- The topic ID is the same as in step 3
+- Sending a message to the topic works:
+  `tg.py send SUPERGROUP TOPIC_ID "say AFTER_RESTART"`
+- The response appears in the same topic
+
+---
+
+### G02 — Topic deleted after grace period expires (no reconnect)
+
+A pi session exits and no replacement appears within 30 seconds.
+
+**Steps:**
+1. Start a pi session, name it `e2e-g02`
+2. Wait for topic to appear
+3. Exit the pi session
+4. Wait 35 seconds (past the 30s grace period)
+
+**Expected:**
+- The topic is deleted after the grace period expires
+- `tg.py topics SUPERGROUP` shows no topics (besides General)
+
+---
+
+### G03 — Grace period: new session in different cwd gets new topic
+
+A pi session exits in dir A, and a new session starts in dir B within
+the grace period. The new session should NOT reclaim the old topic.
+
+**Steps:**
+1. Create two directories: `WORK_A=$(mktemp -d)` and `WORK_B=$(mktemp -d)`
+2. Start a pi session in `$WORK_A`, name it `e2e-g03-a`
+3. Wait for topic; note its topic ID
+4. Exit the pi session
+5. Immediately start a new pi session in `$WORK_B`, name it `e2e-g03-b`
+6. Wait for topic
+
+**Expected:**
+- The new session (in `$WORK_B`) does NOT reclaim the old topic (different cwd)
+- A new topic is created for `e2e-g03-b`
+- After 30s, the old topic for `e2e-g03-a` is deleted
+- Eventually only one topic remains
+
+---
+
+### G04 — Graceful pup shutdown preserves topic mapping
+
+When pup shuts down gracefully while topics are in the grace period,
+the mappings are restored so they survive across pup restarts.
+
+**Steps:**
+1. Start a pi session, name it `e2e-g04`
+2. Wait for topic; note the topic ID
+3. Exit the pi session (topic enters grace period)
+4. Immediately stop pup gracefully (Ctrl-C) — within the grace period
+5. Start a new pi session in the same cwd
+6. Restart pup
+
+**Expected:**
+- Pup's graceful shutdown calls `cancel_all_pending`, restoring the
+  topic mapping to `topics_state.json`
+- On restart, pup reuses the persisted topic for the new session
+- The topic ID is preserved (same topic, not deleted and recreated)
+- Sending a message works
+
+---
+
+### G05 — Multiple sessions: only the matching cwd reclaims
+
+Two sessions running in different directories. One exits and restarts.
+Only the restarted session's topic should be reclaimed.
+
+**Steps:**
+1. Create two dirs: `WORK_A=$(mktemp -d)` and `WORK_B=$(mktemp -d)`
+2. Start pi session A in `$WORK_A`, name it `e2e-g05-a`
+3. Start pi session B in `$WORK_B`, name it `e2e-g05-b`
+4. Wait for both topics; note their topic IDs
+5. Exit session A
+6. Immediately restart a new session in `$WORK_A`, name it `e2e-g05-a2`
+7. Wait up to 15s
+
+**Expected:**
+- Session B's topic is unaffected (still active, same topic ID)
+- The new session in `$WORK_A` reclaims session A's topic
+- Two topics exist total (one for B, one for the reclaimed A)
+- Both topics are functional (send messages, get responses)
 
 ---
 
@@ -1691,11 +1887,10 @@ Another process creates a socket at the same path the extension uses.
 
 ---
 
-### P18 — /new sent from Telegram (forwarded to pi as a message)
+### P18 — /new sent from Telegram shows unsupported notification
 
-When a user types `/new` in a Telegram topic, it's sent as a plain
-message to the pi session (it's not intercepted by the bot — only
-`/cancel` is intercepted). Pi should process it as a slash command.
+The extension intercepts `/new` and returns an error notification because
+`newSession()` is only available on `ExtensionCommandContext`.
 
 **Steps:**
 1. Start a pi session, name it `e2e-p18`
@@ -1707,39 +1902,34 @@ message to the pi session (it's not intercepted by the bot — only
 6. Read topic history
 
 **Expected:**
-- The message `/new` is forwarded to pi via IPC as a `send` command
-- Pi processes `/new` as a slash command and resets the session
+- The extension intercepts `/new` and broadcasts a notification event
+- The bot posts a message containing `not available via remote access`
 - The topic persists (no deletion/recreation)
-- `🔄 Session reset` message appears in the topic
+- The `/new` text is NOT forwarded to the LLM
 - The session is functional afterward
-
-**Important Telegram note:** In a supergroup topic, when a user types
-`/new`, Telegram shows it as a regular message (not a bot command) because
-`/new` is not in the bot's registered command list. The bot receives the
-full text `/new` and forwards it to pi, where pi interprets it as a slash
-command.
 
 ---
 
-### P19 — /compact sent from Telegram
+### P19 — /compact sent from Telegram works via extension API
 
-Same as P18 but for `/compact`.
+The extension handles `/compact` directly via `ctx.compact()`.
 
 **Steps:**
 1. Start a pi session, name it `e2e-p19`
 2. Wait for topic; note the topic ID
 3. Send a prompt to build some conversation:
-   `tg.py send SUPERGROUP TOPIC_ID "explain what /compact does in pi"`
+   `tg.py send SUPERGROUP TOPIC_ID "say BEFORE_COMPACT_P19"`
 4. Wait for response
 5. Send `/compact` via Telegram:
    `tg.py send SUPERGROUP TOPIC_ID "/compact"`
-6. Wait 10s
+6. Wait 15s
 7. List topics
 
 **Expected:**
-- `/compact` is forwarded to pi and processed
-- Topic persists
-- Session is functional afterward
+- The extension calls `ctx.compact()` — `/compact` is NOT forwarded
+  to the LLM
+- Topic persists (same topic ID)
+- Session is functional afterward — send a message and verify response
 
 ---
 
@@ -2127,31 +2317,40 @@ A long-running agent turn that exceeds typical timeout expectations.
 
 ---
 
-### P38 — Message that looks like a bot command but isn't registered
+### P38 — Slash commands in topics handled by extension
+
+The pup extension intercepts all known pi TUI slash commands via IPC
+before they reach `sendUserMessage()`. Commands are either executed
+(supported), rejected with a notification (unsupported), or forwarded
+to the LLM (unknown).
 
 **Steps:**
 1. Start a pi session, name it `e2e-p38`
 2. Wait for topic; note the topic ID
-3. Send various slash-like messages in the topic:
+3. Send supported commands:
+   - `tg.py send SUPERGROUP TOPIC_ID "/name test-name-p38"`
+     → should rename session and topic
+4. Wait 10s; verify topic renamed: `tg.py topics SUPERGROUP`
+5. Send unsupported commands:
+   - `tg.py send SUPERGROUP TOPIC_ID "/tree"`
+   - `tg.py send SUPERGROUP TOPIC_ID "/settings"`
+6. Wait 5s; read history: `tg.py history SUPERGROUP TOPIC_ID`
+7. Send unknown command:
    - `tg.py send SUPERGROUP TOPIC_ID "/unknowncommand"`
-   - `tg.py send SUPERGROUP TOPIC_ID "/name test-name"`
-   - `tg.py send SUPERGROUP TOPIC_ID "/model"`
-   - `tg.py send SUPERGROUP TOPIC_ID "/exit"`
-   - `tg.py send SUPERGROUP TOPIC_ID "/cancel@my_pup_bot"` (with @bot suffix)
-4. Wait for responses
+8. Wait for LLM response
+9. Send `/cancel@my_pup_bot` (with @bot suffix)
 
 **Expected:**
-- In topics mode, only `/cancel` (with or without `@botname` suffix) is
-  intercepted by pup
-- All other `/foo` messages (including `/name`, `/exit`, `/model`, etc.)
-  are forwarded to pi as literal text
-- Pi interprets them as slash commands in its own context:
-  - `/name test-name` renames the pi session → topic gets renamed
-  - `/exit` exits the pi session → topic gets deleted
-  - `/model` may change the model
-  - `/unknowncommand` → pi probably ignores it or shows an error
-- `/cancel@my_pup_bot` is recognized as `/cancel` (the `@bot` suffix
-  is stripped before matching)
+- `/name test-name-p38` → extension calls `pi.setSessionName()`, topic
+  renamed to contain `test-name-p38`
+- `/tree` → notification with `not available via remote access` appears
+  in the topic; NOT forwarded to LLM
+- `/settings` → notification with `not available via remote access`;
+  NOT forwarded to LLM
+- `/unknowncommand` → NOT intercepted by extension, forwarded to LLM
+  via `sendUserMessage()`, LLM responds
+- `/cancel@my_pup_bot` → `@bot` suffix stripped, recognized as `/cancel`,
+  handled by the Telegram backend directly (abort sent via IPC)
 - No crash, correct routing
 
 ---

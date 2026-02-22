@@ -43,6 +43,22 @@ pub struct Message {
     pub message_thread_id: Option<i64>,
     /// Present on service messages when a forum topic is created.
     pub forum_topic_created: Option<ForumTopicCreatedMsg>,
+    /// Present when the message is a voice note.
+    pub voice: Option<Voice>,
+}
+
+/// A Telegram voice message.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Voice {
+    pub file_id: String,
+    pub duration: u32,
+}
+
+/// Result of `getFile`.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct FileInfo {
+    pub file_id: String,
+    pub file_path: Option<String>,
 }
 
 /// Service message: a forum topic was created.
@@ -110,6 +126,15 @@ impl BotClient {
         Self {
             http: reqwest::Client::new(),
             base_url: format!("https://api.telegram.org/bot{token}"),
+        }
+    }
+
+    /// Create a client pointing at a custom base URL (for testing).
+    #[cfg(test)]
+    pub(crate) fn with_base_url(base_url: &str) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            base_url: base_url.to_owned(),
         }
     }
 
@@ -364,6 +389,35 @@ impl BotClient {
     /// Get bot info (getMe).
     pub async fn get_me(&self) -> Result<User> {
         self.call("getMe", &serde_json::json!({})).await
+    }
+
+    /// Get file info (for downloading).
+    pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
+        self.call(
+            "getFile",
+            &serde_json::json!({ "file_id": file_id }),
+        )
+        .await
+    }
+
+    /// Download a file by its `file_path` from `getFile`.
+    pub async fn download_file(&self, file_path: &str) -> Result<Vec<u8>> {
+        // The download URL uses /file/bot<token>/<file_path>
+        let url = format!(
+            "{}/{}",
+            self.base_url.replace("/bot", "/file/bot"),
+            file_path,
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .context("download file request failed")?;
+        if !resp.status().is_success() {
+            bail!("download failed: HTTP {}", resp.status());
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 
     /// Send a chat action (e.g. "typing").

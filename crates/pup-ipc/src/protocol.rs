@@ -88,6 +88,8 @@ pub enum IpcEvent {
     SessionEnd,
     /// The pi session was reset (/new or /compact). Same process, new conversation.
     SessionReset,
+    /// A notification from the extension (command errors, status messages, etc).
+    Notification { text: String },
     /// An event type we don't specifically handle.
     Unknown { event: String, data: serde_json::Value },
 }
@@ -348,6 +350,13 @@ impl IpcEvent {
             },
             "session_end" => Self::SessionEnd,
             "session_reset" => Self::SessionReset,
+            "notification" => Self::Notification {
+                text: data
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            },
             _ => Self::Unknown {
                 event: event.to_owned(),
                 data: data.clone(),

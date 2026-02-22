@@ -175,6 +175,11 @@ impl TurnTracker {
         self.verbose = verbose;
     }
 
+    /// Check if a turn is being tracked for the given session.
+    pub fn has_turn(&self, session_id: &str) -> bool {
+        self.turns.contains_key(session_id)
+    }
+
     /// Start tracking a new agent turn.
     ///
     /// Spawns a background typing indicator loop that keeps the "typing…"
@@ -424,11 +429,6 @@ impl TurnTracker {
                 });
             }
         }
-    }
-
-    /// Check if a session has an active turn.
-    pub fn has_turn(&self, session_id: &str) -> bool {
-        self.turns.contains_key(session_id)
     }
 
     /// Get all session IDs with active turns.

@@ -375,6 +375,23 @@ export default function (pi: ExtensionAPI) {
 	// pi.sendUserMessage() goes directly to the agent — it does NOT
 	// pass through the TUI's slash command parser. So "/new" would be
 	// interpreted as a conversation message by the LLM.
+	//
+	// Commands fall into three categories:
+	//   1. Supported — have equivalent ExtensionContext APIs, work fully
+	//   2. Unsupported (need ExtensionCommandContext) — newSession(), fork(),
+	//      navigateTree(), switchSession(), reload() are only available in
+	//      registerCommand handlers, not in event/IPC handlers
+	//   3. Unsupported (TUI-only) — require interactive UI (selectors, etc)
+	//
+	// For unsupported commands we broadcast a notification event so the
+	// user sees a clear error in Telegram instead of the LLM getting a
+	// slash command as conversation text.
+
+	function notifyUnsupported(cmd: string, reason: string) {
+		broadcastEvent("notification", {
+			text: `⚠️ /${cmd} is not available via remote access — ${reason}`,
+		});
+	}
 
 	function handleSlashCommand(
 		client: net.Socket,
@@ -386,22 +403,17 @@ export default function (pi: ExtensionAPI) {
 		if (!trimmed.startsWith("/")) return false;
 
 		// Parse: "/name foo bar" → cmd="name", args="foo bar"
+		// Also strip @botname suffix that Telegram appends in groups
+		// (e.g. "/new@mybot" → cmd="new"). The daemon already strips
+		// this but we handle it defensively here too.
 		const spaceIdx = trimmed.indexOf(" ");
-		const cmd = spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx);
+		const rawCmd = spaceIdx === -1 ? trimmed.slice(1) : trimmed.slice(1, spaceIdx);
+		const atIdx = rawCmd.indexOf("@");
+		const cmd = atIdx === -1 ? rawCmd : rawCmd.slice(0, atIdx);
 		const args = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
 
 		switch (cmd) {
-			case "new":
-				if (savedNewSession) {
-					savedNewSession().catch(() => {});
-				} else {
-					// Fallback: compact() triggers session_shutdown + session_start
-					// which the daemon sees as session_reset. Not identical to /new
-					// (retains a context summary) but achieves the same topic behavior.
-					ctx.compact();
-				}
-				sendResponse(client, "send", id, true);
-				return true;
+			// ── Supported commands (ExtensionContext APIs) ───────
 
 			case "compact": {
 				ctx.compact(args ? { customInstructions: args } : undefined);
@@ -411,6 +423,7 @@ export default function (pi: ExtensionAPI) {
 
 			case "name": {
 				if (!args) {
+					broadcastEvent("notification", { text: "⚠️ Usage: /name <name>" });
 					sendResponse(client, "send", id, false, undefined, "Usage: /name <name>");
 					return true;
 				}
@@ -427,40 +440,52 @@ export default function (pi: ExtensionAPI) {
 
 			case "model": {
 				if (!args) {
-					// No arg — can't open the interactive model selector via IPC.
-					// Forward as a user message so the agent sees it.
-					return false;
+					notifyUnsupported(cmd, "interactive model selector requires pi TUI");
+					sendResponse(client, "send", id, false, undefined, "/${cmd} without arguments requires pi TUI");
+					return true;
 				}
-				// Try to set model by name. setModel is async but we fire-and-forget.
 				pi.setModel(args as any).catch(() => {});
 				sendResponse(client, "send", id, true);
 				return true;
 			}
+
+			// ── Unsupported: need ExtensionCommandContext ────────
+			// These APIs (newSession, fork, navigateTree, switchSession,
+			// reload) are only on ExtensionCommandContext, which is only
+			// available inside registerCommand handlers. There is no
+			// pi.executeCommand() API to trigger them programmatically.
+
+			case "new":
+			case "fork":
+			case "tree":
+			case "resume":
+			case "reload":
+				notifyUnsupported(cmd, "requires upstream pi API change (ExtensionCommandContext)");
+				sendResponse(client, "send", id, false, undefined, `/${cmd} requires pi TUI (needs upstream API change)`);
+				return true;
+
+			// ── Unsupported: TUI-only (interactive UI) ──────────
+
+			case "settings":
+			case "scoped-models":
+			case "export":
+			case "share":
+			case "copy":
+			case "session":
+			case "changelog":
+			case "hotkeys":
+			case "login":
+			case "logout":
+			case "debug":
+				notifyUnsupported(cmd, "requires pi TUI");
+				sendResponse(client, "send", id, false, undefined, `/${cmd} requires pi TUI`);
+				return true;
 
 			default:
 				// Not a known slash command — fall through to sendUserMessage.
 				return false;
 		}
 	}
-
-	// Pi slash commands (/new, /compact, /name, /quit) must be handled
-	// directly by the extension, NOT forwarded via sendUserMessage().
-	// sendUserMessage() sends text to the LLM agent, bypassing pi's
-	// command parser entirely.
-	//
-	// For /new we need ExtensionCommandContext.newSession(), which is only
-	// available in registerCommand handlers. We register a "pup-new"
-	// command and capture the newSession function on first invocation,
-	// then reuse it for subsequent IPC /new requests.
-	let savedNewSession: (() => Promise<{ cancelled: boolean }>) | null = null;
-
-	pi.registerCommand("pup-new", {
-		description: "Start a new session (used by pup)",
-		handler: async (_args, cmdCtx) => {
-			savedNewSession = () => cmdCtx.newSession();
-			await cmdCtx.newSession();
-		},
-	});
 
 	function handleCommand(
 		client: net.Socket,
@@ -626,23 +651,28 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("message_update", async (event) => {
-		if (event.assistantMessageEvent) {
-			const ame = event.assistantMessageEvent as any;
-			// Extract text delta from the assistant message event.
-			let textDelta = "";
-			if (ame.type === "content_block_delta" && ame.delta?.type === "text_delta") {
-				textDelta = ame.delta.text ?? "";
-			} else if (ame.type === "response.output_text.delta") {
-				textDelta = ame.delta ?? "";
-			}
+		if (!currentMessageId) return;
 
-			if (textDelta && currentMessageId) {
-				accumulatedText += textDelta;
-				broadcastEvent("message_delta", {
-					message_id: currentMessageId,
-					text: textDelta,
-				});
-			}
+		// Extract the current full text from event.message.content.
+		// This works regardless of provider streaming format.
+		const msg = event.message;
+		const currentText = Array.isArray(msg.content)
+			? msg.content
+					.filter((c: any) => c.type === "text")
+					.map((c: any) => c.text)
+					.join("")
+			: typeof msg.content === "string"
+				? msg.content
+				: "";
+
+		// Diff against accumulated text to get the delta.
+		if (currentText.length > accumulatedText.length) {
+			const textDelta = currentText.slice(accumulatedText.length);
+			accumulatedText = currentText;
+			broadcastEvent("message_delta", {
+				message_id: currentMessageId,
+				text: textDelta,
+			});
 		}
 	});
 

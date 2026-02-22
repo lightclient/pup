@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use pup_core::SessionInfo;
@@ -7,6 +8,23 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::bot::BotClient;
+
+/// How long to wait after a session disconnects before deleting its topic.
+/// If a new session with the same working directory connects within this
+/// window, the topic is transferred instead of deleted.
+const DELETION_GRACE_PERIOD: Duration = Duration::from_secs(30);
+
+/// A topic whose session disconnected recently, awaiting either a
+/// replacement session (matched by cwd) or final deletion.
+#[derive(Debug)]
+struct PendingDeletion {
+    /// Working directory of the disconnected session.
+    cwd: String,
+    /// Telegram thread ID of the topic.
+    thread_id: i64,
+    /// When to give up waiting and delete.
+    deadline: Instant,
+}
 
 /// Resolve git repo name and branch from a working directory.
 async fn resolve_git_info(cwd: &str) -> Option<(String, String)> {
@@ -95,6 +113,8 @@ pub struct TopicsManager {
     scan_checkpoint: i64,
     /// Path to the JSON state file.
     state_path: PathBuf,
+    /// Topics pending deletion after session disconnect (grace period).
+    pending_deletions: HashMap<String, PendingDeletion>,
 }
 
 impl TopicsManager {
@@ -126,6 +146,7 @@ impl TopicsManager {
             topic_names: HashMap::new(),
             scan_checkpoint: state.scan_checkpoint,
             state_path,
+            pending_deletions: HashMap::new(),
         }
     }
 
@@ -358,6 +379,17 @@ impl TopicsManager {
                     );
                     return Ok((thread_id, true));
                 }
+                Err(e) if e.to_string().contains("TOPIC_NOT_MODIFIED") => {
+                    // Name unchanged — topic still exists, reuse it.
+                    self.thread_sessions
+                        .insert(thread_id, info.session_id.clone());
+                    debug!(
+                        session_id = %info.session_id,
+                        thread_id,
+                        "reusing existing topic (name unchanged)"
+                    );
+                    return Ok((thread_id, true));
+                }
                 Err(e) => {
                     // Topic gone — clean up stale mapping.
                     warn!(
@@ -416,6 +448,126 @@ impl TopicsManager {
         Ok(())
     }
 
+    // ── Grace period for session restarts ──────────────────────
+
+    /// Schedule a topic for delayed deletion instead of removing it
+    /// immediately.  If a new session with the same working directory
+    /// connects within [`DELETION_GRACE_PERIOD`], the topic is reused.
+    ///
+    /// Returns the thread ID if the topic was scheduled, `None` if the
+    /// session had no topic.
+    pub fn schedule_deletion(&mut self, session_id: &str, cwd: &str) -> Option<i64> {
+        let thread_id = self.session_topics.remove(session_id)?;
+        self.thread_sessions.remove(&thread_id);
+        // Keep in known_threads so startup cleanup can find it if pup crashes.
+
+        info!(
+            session_id,
+            thread_id,
+            grace_secs = DELETION_GRACE_PERIOD.as_secs(),
+            "topic scheduled for deletion"
+        );
+
+        self.pending_deletions.insert(
+            session_id.to_owned(),
+            PendingDeletion {
+                cwd: cwd.to_owned(),
+                thread_id,
+                deadline: Instant::now() + DELETION_GRACE_PERIOD,
+            },
+        );
+
+        self.save_state();
+        Some(thread_id)
+    }
+
+    /// Try to match a newly connected session to a recently-disconnected
+    /// one by working directory.  If found, transfers the topic to the new
+    /// session and cancels the pending deletion.
+    ///
+    /// Returns the thread ID if a match was found.
+    pub fn claim_pending_topic(
+        &mut self,
+        new_session_id: &str,
+        cwd: &str,
+    ) -> Option<i64> {
+        let matching_key = self
+            .pending_deletions
+            .iter()
+            .find(|(_, pd)| pd.cwd == cwd)
+            .map(|(k, _)| k.clone());
+
+        let old_session_id = matching_key?;
+        let pd = self.pending_deletions.remove(&old_session_id)?;
+
+        info!(
+            new_session_id,
+            old_session_id = %old_session_id,
+            thread_id = pd.thread_id,
+            "new session claimed pending topic"
+        );
+
+        self.session_topics
+            .insert(new_session_id.to_owned(), pd.thread_id);
+        self.thread_sessions
+            .insert(pd.thread_id, new_session_id.to_owned());
+        self.save_state();
+
+        Some(pd.thread_id)
+    }
+
+    /// Drain pending deletions whose grace period has expired.
+    /// Returns `(session_id, thread_id)` pairs that should be deleted.
+    pub fn drain_expired(&mut self) -> Vec<(String, i64)> {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .pending_deletions
+            .iter()
+            .filter(|(_, pd)| now >= pd.deadline)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        if expired.is_empty() {
+            return Vec::new();
+        }
+
+        let mut result = Vec::new();
+        for sid in expired {
+            if let Some(pd) = self.pending_deletions.remove(&sid) {
+                self.known_threads.remove(&pd.thread_id);
+                info!(
+                    session_id = %sid,
+                    thread_id = pd.thread_id,
+                    "grace period expired"
+                );
+                result.push((sid, pd.thread_id));
+            }
+        }
+
+        self.save_state();
+        result
+    }
+
+    /// Cancel all pending deletions, restoring their topic mappings.
+    ///
+    /// Called during graceful shutdown so that topic state is preserved
+    /// across pup restarts.  If pup reconnects to the same sessions on
+    /// startup, the topics will be reused instead of deleted and recreated.
+    pub fn cancel_all_pending(&mut self) {
+        if self.pending_deletions.is_empty() {
+            return;
+        }
+        info!(
+            count = self.pending_deletions.len(),
+            "restoring pending topic deletions for shutdown"
+        );
+        for (session_id, pd) in self.pending_deletions.drain() {
+            self.session_topics.insert(session_id.clone(), pd.thread_id);
+            self.thread_sessions.insert(pd.thread_id, session_id);
+        }
+        self.save_state();
+    }
+
     /// Rename a topic when session info changes.
     pub async fn rename_topic(
         &mut self,
@@ -429,8 +581,12 @@ impl TopicsManager {
         let name = self.topic_name(info).await;
         info!(session_id = %info.session_id, thread_id, new_name = %name, "renaming topic");
 
-        bot.edit_forum_topic(self.chat_id, thread_id, &name).await?;
-        Ok(())
+        match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
+            Ok(_) => Ok(()),
+            // Name unchanged — not an error.
+            Err(e) if e.to_string().contains("TOPIC_NOT_MODIFIED") => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// Validate that the bot has the required permissions in the supergroup.

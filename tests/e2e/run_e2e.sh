@@ -110,6 +110,19 @@ start_pi() {
   sleep 3
 }
 
+# Start a pi session in a specific directory
+start_pi_in_dir() {
+  local name="$1"
+  local work="$2"
+  mkdir -p "$work"
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-$name"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-$name" "/name $name" Enter
+  sleep 3
+}
+
 # Start a pi session without naming it
 start_pi_unnamed() {
   local label="$1"
@@ -306,21 +319,22 @@ test_t01() {
     fail "T01" "topic not created"
   fi
   exit_pi "e2e-t01"
-  wait_no_topic "e2e-t01" 20 || true
+  wait_no_topic "e2e-t01" 45 || true
 }
 
 test_t02() {
-  log "T02 — Topic deleted when pi session exits"
+  log "T02 — Topic deleted when pi session exits (after grace period)"
   start_pi "e2e-t02"
   if ! wait_topic "e2e-t02" 20 >/dev/null; then
     fail "T02" "topic never appeared"
     return
   fi
   exit_pi "e2e-t02"
-  if wait_no_topic "e2e-t02" 20; then
+  # Topic deletion now has a 30s grace period — wait long enough
+  if wait_no_topic "e2e-t02" 45; then
     pass "T02"
   else
-    fail "T02" "topic not deleted after exit"
+    fail "T02" "topic not deleted after exit + grace period"
   fi
 }
 
@@ -340,7 +354,7 @@ test_t03() {
     fail "T03" "no response containing PINEAPPLE"
   fi
   exit_pi "e2e-t03"
-  wait_no_topic "e2e-t03" 20 || true
+  wait_no_topic "e2e-t03" 45 || true
 }
 
 test_t04() {
@@ -366,7 +380,7 @@ test_t04() {
 
   exit_pi "e2e-t04-alpha"
   exit_pi "e2e-t04-beta"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t05() {
@@ -384,7 +398,7 @@ test_t05() {
     fail "T05" "topic not renamed to e2e-t05-after"
   fi
   exit_pi "e2e-t05-before"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t09() {
@@ -403,7 +417,7 @@ test_t09() {
     fail "T09" "no response containing E2E_TOOL_TEST"
   fi
   exit_pi "e2e-t09"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t13() {
@@ -427,7 +441,7 @@ test_t13() {
     fail "T13" "no response containing BANANA"
   fi
   exit_pi "e2e-t13"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t14() {
@@ -459,7 +473,7 @@ test_t14() {
 
   exit_pi "e2e-t14-a"
   exit_pi "e2e-t14-b"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t15() {
@@ -495,7 +509,7 @@ test_t15() {
     fail "T15" "topic disappeared after /new"
   fi
   exit_pi "e2e-t15"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t16() {
@@ -521,7 +535,7 @@ test_t16() {
     fail "T16" "no response containing AFTER_RESET"
   fi
   exit_pi "e2e-t16"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t17() {
@@ -545,7 +559,7 @@ test_t17() {
     fail "T17" "expected 1 topic, got $cnt"
   fi
   exit_pi "e2e-t17"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t19() {
@@ -558,7 +572,7 @@ test_t19() {
   pi_send "e2e-t19" "/new"
   sleep 5
   exit_pi "e2e-t19"
-  if wait_all_topics_gone 20; then
+  if wait_all_topics_gone 45; then
     pass "T19"
   else
     fail "T19" "topic not deleted after /new + exit"
@@ -582,7 +596,7 @@ test_t21() {
   tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t21" C-d
   sleep 2
   tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t21" "exit" Enter 2>/dev/null || true
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Run ────────────────────────────────────────────────────────────
@@ -630,7 +644,7 @@ test_t18() {
     fail "T18" "topic disappeared after /compact via TUI"
   fi
   exit_pi "e2e-t18"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t22() {
@@ -645,7 +659,7 @@ test_t22() {
   sleep 3
   # /quit should close pi; close the shell too
   tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-t22" "exit" Enter 2>/dev/null || true
-  if wait_all_topics_gone 20; then
+  if wait_all_topics_gone 45; then
     pass "T22"
   else
     fail "T22" "topic not deleted after /quit via TUI"
@@ -669,7 +683,7 @@ test_t23() {
     fail "T23" "TUI prompt response not visible in topic"
   fi
   exit_pi "e2e-t23"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Cancel tests ────────────────────────────────────────────────
@@ -699,7 +713,7 @@ test_c01() {
     fail "C01" "session not responsive after /cancel"
   fi
   exit_pi "e2e-c01"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_c02() {
@@ -726,7 +740,7 @@ test_c02() {
     fail "C02" "session not responsive after TUI cancel"
   fi
   exit_pi "e2e-c02"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Follow-up (>>) tests ───────────────────────────────────────
@@ -752,7 +766,7 @@ test_f01() {
     fail "F01" "follow-up response not found"
   fi
   exit_pi "e2e-f01"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Telegram slash command tests ────────────────────────────────
@@ -774,7 +788,7 @@ test_s01() {
     fail "S01" "topic not renamed to e2e-s01-renamed"
   fi
   exit_pi "e2e-s01"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_s02() {
@@ -787,7 +801,7 @@ test_s02() {
   local tid
   tid=$(get_topic_id "e2e-s02")
   $TG send "$SUPERGROUP" "$tid" "/quit" 2>/dev/null >/dev/null
-  if wait_all_topics_gone 20; then
+  if wait_all_topics_gone 45; then
     pass "S02"
   else
     fail "S02" "topic not deleted after /quit"
@@ -826,7 +840,7 @@ test_s03() {
     fail "S03" "topic disappeared after /new"
   fi
   exit_pi "e2e-s03"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_s04() {
@@ -858,7 +872,7 @@ test_s04() {
     fail "S04" "topic disappeared after /compact"
   fi
   exit_pi "e2e-s04"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Additional topic tests ─────────────────────────────────────
@@ -881,7 +895,7 @@ test_t20() {
     fail "T20" "topic disappeared after /new"
   fi
   exit_pi "e2e-t20-orig"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_t12() {
@@ -902,7 +916,7 @@ test_t12() {
     fail "T12" "no final response within timeout"
   fi
   exit_pi "e2e-t12"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Additional Telegram slash command tests ────────────────────
@@ -925,7 +939,7 @@ test_s05() {
     fail "S05" "topic not renamed (maybe @bot suffix not stripped)"
   fi
   exit_pi "e2e-s05"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_s06() {
@@ -948,7 +962,7 @@ test_s06() {
     fail "S06" "session not responsive after unknown slash command"
   fi
   exit_pi "e2e-s06"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_s07() {
@@ -974,7 +988,7 @@ test_s07() {
     fail "S07" "session not responsive after /cancel@bot"
   fi
   exit_pi "e2e-s07"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 # ─── Pedantic tests (crash, race, adversarial) ──────────────────
@@ -1021,7 +1035,7 @@ test_p01() {
     fail "P01" "session not responsive after SIGKILL + restart"
   fi
   exit_pi "e2e-p01"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_p02() {
@@ -1048,7 +1062,7 @@ test_p02() {
   sleep 1
   tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-p02" "exit" Enter 2>/dev/null || true
   # Wait for topic to be cleaned up
-  if wait_all_topics_gone 20; then
+  if wait_all_topics_gone 45; then
     pass "P02"
   else
     fail "P02" "topic not cleaned up after pi killed (count=$(count_topics))"
@@ -1085,7 +1099,7 @@ test_p09() {
   fi
   exit_pi "e2e-p09-a"
   exit_pi "e2e-p09-b"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_p17() {
@@ -1121,7 +1135,7 @@ test_p17() {
     fail "P17" "session not responsive after /new mid-stream"
   fi
   exit_pi "e2e-p17"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_p20() {
@@ -1144,7 +1158,7 @@ test_p20() {
   if [ "$cnt" != "1" ]; then
     fail "P20" "expected 1 topic after 10 /new, got $cnt"
     exit_pi "e2e-p20"
-    wait_all_topics_gone 20 || true
+    wait_all_topics_gone 45 || true
     return
   fi
   # Session should still work
@@ -1157,7 +1171,7 @@ test_p20() {
     fail "P20" "session not responsive after 10 /new spam"
   fi
   exit_pi "e2e-p20"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_p22() {
@@ -1194,7 +1208,7 @@ test_p22() {
     fail "P22" "no topic after state file deletion + restart"
   fi
   exit_pi "e2e-p22"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_p23() {
@@ -1231,7 +1245,7 @@ test_p23() {
     fail "P23" "no topic after corrupt state + restart"
   fi
   exit_pi "e2e-p23"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_r01() {
@@ -1262,7 +1276,7 @@ test_r01() {
     fail "R01" "session not responsive after pup restart"
   fi
   exit_pi "e2e-r01"
-  wait_all_topics_gone 20 || true
+  wait_all_topics_gone 45 || true
 }
 
 test_r06() {
@@ -1293,6 +1307,260 @@ test_r06() {
     # The key is pup didn't crash
     pass "R06 (stale topic count=$cnt, no crash)"
   fi
+}
+
+# ─── Grace period tests ──────────────────────────────────────────
+
+test_g01() {
+  log "G01 — Pi restart in same cwd reuses topic"
+  clean_stale_topics
+  local work
+  work=$(mktemp -d)
+  start_pi_in_dir "e2e-g01" "$work"
+  if ! wait_topic "e2e-g01" 20 >/dev/null; then
+    fail "G01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-g01")
+  # Exit pi — topic enters grace period
+  exit_pi "e2e-g01"
+  sleep 3
+  # Verify topic is still there (grace period holds it)
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" = "0" ]; then
+    fail "G01" "topic deleted immediately (grace period not working)"
+    return
+  fi
+  # Start a new pi session in the SAME directory
+  start_pi_in_dir "e2e-g01-after" "$work"
+  sleep 5
+  # The new session should have claimed the old topic
+  local new_cnt
+  new_cnt=$(count_topics)
+  if [ "$new_cnt" != "1" ]; then
+    fail "G01" "expected 1 topic after reclaim, got $new_cnt"
+    exit_pi "e2e-g01-after"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # The topic should be renamed to the new session name
+  if wait_topic "e2e-g01-after" 15 >/dev/null; then
+    # Verify the topic ID is the same (topic was reused, not recreated)
+    local new_tid
+    new_tid=$(get_topic_id "e2e-g01-after")
+    if [ "$new_tid" = "$tid" ]; then
+      # Verify session is functional in the reclaimed topic
+      $TG send "$SUPERGROUP" "$new_tid" "reply with only the word AFTER_G01" 2>/dev/null >/dev/null
+      if wait_bot_msg "$new_tid" "AFTER_G01" 60 >/dev/null; then
+        pass "G01"
+      else
+        fail "G01" "session not responsive in reclaimed topic"
+      fi
+    else
+      fail "G01" "topic ID changed: old=$tid new=$new_tid (not reused)"
+    fi
+  else
+    fail "G01" "topic not renamed to e2e-g01-after"
+  fi
+  exit_pi "e2e-g01-after"
+  wait_all_topics_gone 45 || true
+}
+
+test_g02() {
+  log "G02 — Topic deleted after grace period expires"
+  clean_stale_topics
+  start_pi "e2e-g02"
+  if ! wait_topic "e2e-g02" 20 >/dev/null; then
+    fail "G02" "topic never appeared"
+    return
+  fi
+  # Exit pi — topic enters 30s grace period
+  exit_pi "e2e-g02"
+  # Verify topic is still there after 5s (grace period holds)
+  sleep 5
+  local cnt_early
+  cnt_early=$(count_topics)
+  if [ "$cnt_early" = "0" ]; then
+    fail "G02" "topic deleted before grace period expired"
+    return
+  fi
+  # Wait for grace period to expire (total ~35s from exit)
+  sleep 30
+  # Now the topic should be gone
+  local cnt_late
+  cnt_late=$(count_topics)
+  if [ "$cnt_late" = "0" ]; then
+    pass "G02"
+  else
+    fail "G02" "topic still exists after grace period (count=$cnt_late)"
+    wait_all_topics_gone 45 || true
+  fi
+}
+
+test_g03() {
+  log "G03 — New session in different cwd gets new topic (no reclaim)"
+  clean_stale_topics
+  local work_a work_b
+  work_a=$(mktemp -d)
+  work_b=$(mktemp -d)
+  start_pi_in_dir "e2e-g03-a" "$work_a"
+  if ! wait_topic "e2e-g03-a" 20 >/dev/null; then
+    fail "G03" "first topic never appeared"
+    return
+  fi
+  local tid_a
+  tid_a=$(get_topic_id "e2e-g03-a")
+  # Exit session A — topic enters grace period
+  exit_pi "e2e-g03-a"
+  sleep 3
+  # Start session B in a DIFFERENT directory
+  start_pi_in_dir "e2e-g03-b" "$work_b"
+  if ! wait_topic "e2e-g03-b" 20 >/dev/null; then
+    fail "G03" "second topic never appeared"
+    exit_pi "e2e-g03-b"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  local tid_b
+  tid_b=$(get_topic_id "e2e-g03-b")
+  # Should have 2 topics (old one in grace period, new one created)
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" = "2" ]; then
+    # Verify the topic IDs are different (not reclaimed)
+    if [ "$tid_a" != "$tid_b" ]; then
+      pass "G03"
+    else
+      fail "G03" "same topic ID reused despite different cwd"
+    fi
+  elif [ "$cnt" = "1" ]; then
+    # Grace period may have expired already — still OK if it's the B topic
+    if [ "$tid_b" != "$tid_a" ]; then
+      pass "G03 (old topic already expired)"
+    else
+      fail "G03" "wrong topic survived"
+    fi
+  else
+    fail "G03" "unexpected topic count: $cnt"
+  fi
+  exit_pi "e2e-g03-b"
+  wait_all_topics_gone 45 || true
+}
+
+test_g04() {
+  log "G04 — Graceful pup shutdown preserves topic mapping"
+  clean_stale_topics
+  local work
+  work=$(mktemp -d)
+  start_pi_in_dir "e2e-g04" "$work"
+  if ! wait_topic "e2e-g04" 20 >/dev/null; then
+    fail "G04" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-g04")
+  # Exit pi — topic enters grace period
+  exit_pi "e2e-g04"
+  sleep 3
+  # Start a new pi session in the same cwd BEFORE stopping pup
+  start_pi_in_dir "e2e-g04-new" "$work"
+  sleep 5
+  # Gracefully stop pup (this calls cancel_all_pending)
+  stop_pup graceful
+  sleep 2
+  # Restart pup
+  if ! start_pup; then
+    fail "G04" "pup failed to restart"
+    exit_pi "e2e-g04-new"
+    return
+  fi
+  sleep 10
+  # The topic should still exist (mapping was preserved)
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" -ge 1 ]; then
+    local new_tid
+    new_tid=$(get_any_topic_id)
+    # Verify session is functional
+    $TG send "$SUPERGROUP" "$new_tid" "reply with only the word PRESERVED_G04" 2>/dev/null >/dev/null
+    if wait_bot_msg "$new_tid" "PRESERVED_G04" 60 >/dev/null; then
+      pass "G04"
+    else
+      fail "G04" "session not responsive after pup restart"
+    fi
+  else
+    fail "G04" "no topic after graceful pup restart"
+  fi
+  exit_pi "e2e-g04-new"
+  wait_all_topics_gone 45 || true
+}
+
+test_g05() {
+  log "G05 — Multiple sessions: only matching cwd reclaims"
+  clean_stale_topics
+  local work_a work_b
+  work_a=$(mktemp -d)
+  work_b=$(mktemp -d)
+  start_pi_in_dir "e2e-g05-a" "$work_a"
+  start_pi_in_dir "e2e-g05-b" "$work_b"
+  wait_topic "e2e-g05-a" 20 >/dev/null || true
+  wait_topic "e2e-g05-b" 20 >/dev/null || true
+  local tid_a tid_b
+  tid_a=$(get_topic_id "e2e-g05-a")
+  tid_b=$(get_topic_id "e2e-g05-b")
+  if [ -z "$tid_a" ] || [ -z "$tid_b" ]; then
+    fail "G05" "could not get both topic IDs (a=$tid_a b=$tid_b)"
+    exit_pi "e2e-g05-a" 2>/dev/null || true
+    exit_pi "e2e-g05-b" 2>/dev/null || true
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # Exit session A — its topic enters grace period
+  exit_pi "e2e-g05-a"
+  sleep 3
+  # Verify B's topic is still alive and functional
+  $TG send "$SUPERGROUP" "$tid_b" "reply with only the word STABLE_G05" 2>/dev/null >/dev/null
+  if ! wait_bot_msg "$tid_b" "STABLE_G05" 60 >/dev/null; then
+    fail "G05" "session B not responsive while A is in grace period"
+    exit_pi "e2e-g05-b"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  # Restart session A in the same dir
+  start_pi_in_dir "e2e-g05-a2" "$work_a"
+  sleep 10
+  # Should have 2 topics: B (unchanged) and reclaimed A
+  local cnt
+  cnt=$(count_topics)
+  if [ "$cnt" = "2" ]; then
+    # Verify B's topic ID is unchanged
+    local new_tid_b
+    new_tid_b=$(get_topic_id "e2e-g05-b")
+    if [ "$new_tid_b" = "$tid_b" ]; then
+      # Verify the reclaimed topic works
+      local reclaimed_tid
+      reclaimed_tid=$(get_topic_id "e2e-g05-a2")
+      if [ -n "$reclaimed_tid" ]; then
+        $TG send "$SUPERGROUP" "$reclaimed_tid" "reply with only the word RECLAIMED_G05" 2>/dev/null >/dev/null
+        if wait_bot_msg "$reclaimed_tid" "RECLAIMED_G05" 60 >/dev/null; then
+          pass "G05"
+        else
+          fail "G05" "reclaimed session not responsive"
+        fi
+      else
+        pass "G05 (2 topics, B unchanged)"
+      fi
+    else
+      fail "G05" "session B's topic ID changed (was=$tid_b now=$new_tid_b)"
+    fi
+  else
+    fail "G05" "expected 2 topics, got $cnt"
+  fi
+  exit_pi "e2e-g05-a2"
+  exit_pi "e2e-g05-b"
+  wait_all_topics_gone 45 || true
 }
 
 if [ "$TESTS" = "all" ]; then
@@ -1350,6 +1618,13 @@ if [ "$TESTS" = "all" ]; then
   # Robustness
   test_r01   # pup restart picks up sessions
   test_r06   # session exits during pup downtime
+
+  # Grace period (topic reuse on pi restart)
+  test_g01   # pi restart in same cwd reuses topic
+  test_g02   # topic deleted after grace period expires
+  test_g03   # different cwd gets new topic (no reclaim)
+  test_g04   # graceful pup shutdown preserves mapping
+  test_g05   # multiple sessions: only matching cwd reclaims
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do

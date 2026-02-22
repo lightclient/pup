@@ -293,6 +293,10 @@ class MockExtension:
             "is_error": is_error,
         })
 
+    async def send_notification(self, text: str) -> None:
+        """Broadcast a notification event (e.g., for unsupported command errors)."""
+        await self.broadcast_event("notification", {"text": text})
+
     async def change_name(self, new_name: str) -> None:
         """Simulate a session name change."""
         old_name = self.session_name
