@@ -150,6 +150,14 @@ PUP_TRACE_FILE=traces.jsonl cargo run
 RUST_LOG=debug cargo run
 ```
 
+For faster local builds, copy the example cargo config:
+
+```bash
+cp .cargo/config.toml.example .cargo/config.toml
+```
+
+This enables sccache and the mold linker (install both first).
+
 ## Architecture
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design: protocol

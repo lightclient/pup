@@ -2,6 +2,9 @@
 /target/
 **/*.rs.bk
 
+# Dev-local cargo config (sccache, mold, etc.)
+.cargo/config.toml
+
 # Traces
 traces.jsonl
 *.jsonl
