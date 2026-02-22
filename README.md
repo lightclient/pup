@@ -52,14 +52,14 @@ clients are connected.
 # install the pi extension
 pi install git:github.com/lightclient/pup
 
-# build the daemon
-cargo build --release
+# install the daemon
+cargo install --git https://github.com/lightclient/pup pup-daemon
 
 # interactive setup (creates ~/.config/pup/config.toml)
-./target/release/pup setup
+pup setup
 
 # start
-./target/release/pup
+pup
 ```
 
 ## Configuration
