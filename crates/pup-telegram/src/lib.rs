@@ -866,6 +866,7 @@ impl ChatBackend for TelegramBackend {
                 ("attach".to_owned(), "Attach to a session".to_owned()),
                 ("detach".to_owned(), "Detach from session".to_owned()),
                 ("cancel".to_owned(), "Cancel current operation".to_owned()),
+                ("status".to_owned(), "Show session status (model, context usage)".to_owned()),
                 ("verbose".to_owned(), "Toggle tool call visibility".to_owned()),
                 ("help".to_owned(), "Show help".to_owned()),
             ];
@@ -881,6 +882,7 @@ impl ChatBackend for TelegramBackend {
             // These are forwarded to pi via IPC and executed by the extension.
             let group_commands = vec![
                 ("cancel".to_owned(), "Cancel current operation".to_owned()),
+                ("status".to_owned(), "Show session status (model, context usage)".to_owned()),
                 ("new".to_owned(), "Start a new session".to_owned()),
                 ("compact".to_owned(), "Compact session context".to_owned()),
                 ("name".to_owned(), "Set session name".to_owned()),

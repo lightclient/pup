@@ -450,6 +450,35 @@ export default function (pi: ExtensionAPI) {
 				return true;
 			}
 
+			case "status": {
+				const usage = ctx.getContextUsage();
+				const model = ctx.model;
+				const thinkingLevel = pi.getThinkingLevel();
+
+				const lines: string[] = ["📊 Status"];
+
+				if (model) {
+					lines.push(`Model: ${model.provider}/${model.id}`);
+				} else {
+					lines.push("Model: unknown");
+				}
+
+				lines.push(`Thinking: ${thinkingLevel}`);
+
+				if (usage) {
+					const tokensStr = usage.tokens !== null ? usage.tokens.toLocaleString() : "unknown";
+					const windowStr = usage.contextWindow.toLocaleString();
+					const percentStr = usage.percent !== null ? `${usage.percent.toFixed(1)}%` : "unknown";
+					lines.push(`Context: ${tokensStr} / ${windowStr} tokens (${percentStr})`);
+				} else {
+					lines.push("Context: unavailable");
+				}
+
+				broadcastEvent("notification", { text: lines.join("\n") });
+				sendResponse(client, "send", id, true);
+				return true;
+			}
+
 			// ── Unsupported: need ExtensionCommandContext ────────
 			// These APIs (newSession, fork, navigateTree, switchSession,
 			// reload) are only on ExtensionCommandContext, which is only

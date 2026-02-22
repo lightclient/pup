@@ -165,6 +165,7 @@ impl DmState {
             "/attach &lt;ref&gt; — Attach to a session (name, index, or ID prefix)",
             "/detach — Detach from current session",
             "/cancel — Abort the current agent operation",
+            "/status — Show session status (model, context usage)",
             "/verbose [on|off] — Toggle tool call visibility",
             "/help — Show this help",
             "",
@@ -236,6 +237,19 @@ mod tests {
         match parse_command("/verbose on") {
             DmCommand::Verbose { toggle } => assert_eq!(toggle, Some(true)),
             _ => panic!("expected Verbose"),
+        }
+    }
+
+    #[test]
+    fn test_parse_status_forwarded_to_session() {
+        // /status is not a DM-level command — it's forwarded to the pi session
+        // where the extension handles it and broadcasts a notification.
+        match parse_command("/status") {
+            DmCommand::Message { text, mode } => {
+                assert_eq!(text, "/status");
+                assert_eq!(mode, SendMode::Steer);
+            }
+            _ => panic!("expected Message (forwarded to session)"),
         }
     }
 
