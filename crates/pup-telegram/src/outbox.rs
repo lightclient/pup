@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -60,9 +60,17 @@ impl OutboxOp {
             Self::Edit { .. } => OpPriority::Edit,
         }
     }
+
+    fn chat_id(&self) -> i64 {
+        match self {
+            Self::Send { chat_id, .. }
+            | Self::Edit { chat_id, .. }
+            | Self::Delete { chat_id, .. } => *chat_id,
+        }
+    }
 }
 
-/// Wrapper for heap ordering.
+/// Wrapper for heap ordering (sends and deletes only).
 #[derive(Debug)]
 struct HeapEntry {
     op: OutboxOp,
@@ -91,20 +99,166 @@ impl PartialOrd for HeapEntry {
     }
 }
 
+/// Per-chat token bucket for rate limiting.
+///
+/// Telegram Bot API limits
+/// (https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this):
+///   - Single chat: avoid more than ~1 message/second (bursts ok, then 429s)
+///   - Groups: no more than 20 messages per minute
+///   - Bulk broadcast: ~30 messages/second globally
+///
+/// The group limit (20/min) is the binding constraint for supergroups with
+/// topics. We target 18/min (one every 3.33s) to leave headroom.
+#[derive(Debug)]
+struct TokenBucket {
+    /// Available tokens (fractional, accumulates over time).
+    tokens: f64,
+    /// Maximum burst size.
+    capacity: f64,
+    /// Tokens added per second (= capacity / 60 for a per-minute rate).
+    rate: f64,
+    /// Last time tokens were refilled.
+    last_refill: Instant,
+}
+
+/// Default per-chat budget: 18 operations per minute.
+const DEFAULT_CHAT_BUDGET: f64 = 18.0;
+
+impl TokenBucket {
+    fn new(per_minute: f64) -> Self {
+        Self {
+            tokens: per_minute, // start full
+            capacity: per_minute,
+            rate: per_minute / 60.0,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Refill tokens based on elapsed time.
+    fn refill(&mut self) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.rate).min(self.capacity);
+        self.last_refill = now;
+    }
+
+    /// Try to consume one token. Returns `true` if successful.
+    fn try_consume(&mut self) -> bool {
+        self.refill();
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
 /// Rate-limited outbox for Telegram API calls.
 ///
 /// All Telegram API calls go through this queue. Priority: Send > Delete > Edit.
-/// Rate limiting: global min interval (~33ms) and per-message edit cooldown.
+///
+/// Rate limiting is layered:
+///   1. **Global min interval** (~33ms between any two API calls)
+///   2. **Per-message edit cooldown** (configurable, default 1500ms)
+///   3. **Per-chat token bucket** (18 ops/min, refills smoothly)
+///
+/// Edits are coalesced: only the latest edit per `(chat_id, message_id)` is
+/// kept. Superseded edits are silently dropped.
+///
+/// When the top-priority operation is blocked (budget or cooldown), lower
+/// entries and other chats are still tried — no head-of-line blocking.
 #[derive(Debug)]
 pub struct Outbox {
     bot: BotClient,
+    /// Priority queue for sends and deletes.
     queue: BinaryHeap<HeapEntry>,
+    /// Coalesced edits: only the latest per message.
+    pending_edits: EditMap,
     seq_counter: u64,
     min_interval: Duration,
     edit_cooldown: Duration,
     last_send: Option<Instant>,
     last_edit: HashMap<(i64, i64), Instant>,
     retry_until: Option<Instant>,
+    /// Per-chat token buckets.
+    chat_buckets: HashMap<i64, TokenBucket>,
+}
+
+/// Coalesced edit map — stores only the latest edit per message.
+///
+/// Edits are keyed by `(chat_id, message_id)`. An insertion-order queue
+/// tracks which messages have pending edits so they can be flushed FIFO.
+#[derive(Debug, Default)]
+struct EditMap {
+    /// Latest edit content per message.
+    entries: HashMap<(i64, i64), OutboxOp>,
+    /// FIFO order of distinct messages with pending edits.
+    order: VecDeque<(i64, i64)>,
+}
+
+impl EditMap {
+    /// Insert or replace an edit for a message.
+    fn upsert(&mut self, key: (i64, i64), op: OutboxOp) {
+        if self.entries.insert(key, op).is_none() {
+            // New message — add to FIFO order.
+            self.order.push_back(key);
+        }
+        // If the key already existed, only the content is replaced; FIFO
+        // position stays the same.
+    }
+
+    /// Pop the next eligible edit (respecting per-message cooldown and
+    /// per-chat budget).
+    ///
+    /// Returns `None` if there are no edits, or all are blocked.
+    fn pop_eligible(
+        &mut self,
+        last_edit: &HashMap<(i64, i64), Instant>,
+        cooldown: Duration,
+        chat_buckets: &mut HashMap<i64, TokenBucket>,
+    ) -> Option<OutboxOp> {
+        let len = self.order.len();
+        for _ in 0..len {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+
+            // Per-message cooldown.
+            let cooldown_blocked = last_edit
+                .get(&key)
+                .is_some_and(|t| t.elapsed() < cooldown);
+            if cooldown_blocked {
+                self.order.push_back(key);
+                continue;
+            }
+
+            // Per-chat budget.
+            let chat_id = key.0;
+            let bucket = chat_buckets
+                .entry(chat_id)
+                .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET));
+            if !bucket.try_consume() {
+                self.order.push_back(key);
+                continue;
+            }
+
+            // Found an eligible edit.
+            if let Some(op) = self.entries.remove(&key) {
+                return Some(op);
+            }
+            // Entry was removed externally (shouldn't happen), skip.
+        }
+        None
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 impl Outbox {
@@ -112,31 +266,38 @@ impl Outbox {
         Self {
             bot,
             queue: BinaryHeap::new(),
+            pending_edits: EditMap::default(),
             seq_counter: 0,
             min_interval: Duration::from_millis(33), // ~30 msg/sec
             edit_cooldown: Duration::from_millis(edit_cooldown_ms),
             last_send: None,
             last_edit: HashMap::new(),
             retry_until: None,
+            chat_buckets: HashMap::new(),
         }
     }
 
     /// Enqueue an operation.
     pub fn enqueue(&mut self, op: OutboxOp) {
-        let priority = op.priority();
-        let seq = self.seq_counter;
-        self.seq_counter += 1;
-        self.queue.push(HeapEntry { op, priority, seq });
+        if let OutboxOp::Edit { chat_id, message_id, .. } = &op {
+            // Coalesce: only keep the latest edit per message.
+            self.pending_edits.upsert((*chat_id, *message_id), op);
+        } else {
+            let priority = op.priority();
+            let seq = self.seq_counter;
+            self.seq_counter += 1;
+            self.queue.push(HeapEntry { op, priority, seq });
+        }
     }
 
     /// Number of pending operations.
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.queue.len() + self.pending_edits.len()
     }
 
     /// Whether the outbox is empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.queue.is_empty() && self.pending_edits.is_empty()
     }
 
     /// Clear the per-message edit cooldown so the next edit goes through
@@ -144,6 +305,14 @@ impl Outbox {
     /// the cancel keyboard) isn't blocked by a recent content edit.
     pub fn clear_edit_cooldown(&mut self) {
         self.last_edit.clear();
+    }
+
+    /// Try to consume a token for `chat_id`. Returns `true` if allowed.
+    fn chat_try_consume(&mut self, chat_id: i64) -> bool {
+        self.chat_buckets
+            .entry(chat_id)
+            .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET))
+            .try_consume()
     }
 
     /// Flush one operation from the queue, respecting rate limits.
@@ -167,35 +336,51 @@ impl Outbox {
             }
         }
 
-        // Find the next eligible operation.
-        let Some(entry) = self.queue.pop() else {
-            return false;
-        };
-
-        // For edits, check per-message cooldown.
-        if let OutboxOp::Edit {
-            chat_id,
-            message_id,
-            ..
-        } = &entry.op
-        {
-            let key = (*chat_id, *message_id);
-            if let Some(last) = self.last_edit.get(&key)
-                && last.elapsed() < self.edit_cooldown {
-                    // Re-enqueue; we'll try again later.
-                    self.queue.push(entry);
-                    return false;
+        // Try sends/deletes first (from the heap), skipping budget-blocked
+        // entries to avoid head-of-line blocking.
+        if !self.queue.is_empty() {
+            let mut deferred = Vec::new();
+            while let Some(entry) = self.queue.pop() {
+                let chat_id = entry.op.chat_id();
+                if self.chat_try_consume(chat_id) {
+                    // Put back the deferred entries.
+                    for d in deferred {
+                        self.queue.push(d);
+                    }
+                    let span = debug_span!("outbox_flush", queue_len = self.queue.len());
+                    return async {
+                        self.last_send = Some(Instant::now());
+                        self.execute(entry.op).await;
+                        true
+                    }
+                    .instrument(span)
+                    .await;
                 }
+                deferred.push(entry);
+            }
+            // All entries were budget-blocked — put them all back.
+            for d in deferred {
+                self.queue.push(d);
+            }
         }
 
-        let span = debug_span!("outbox_flush", queue_len = self.queue.len());
-        async {
-            self.last_send = Some(Instant::now());
-            self.execute(entry.op).await;
-            true
+        // Try pending edits (coalesced, cooldown + budget checked inside).
+        if let Some(op) = self.pending_edits.pop_eligible(
+            &self.last_edit,
+            self.edit_cooldown,
+            &mut self.chat_buckets,
+        ) {
+            let span = debug_span!("outbox_flush", pending_edits = self.pending_edits.len());
+            return async {
+                self.last_send = Some(Instant::now());
+                self.execute(op).await;
+                true
+            }
+            .instrument(span)
+            .await;
         }
-        .instrument(span)
-        .await
+
+        false
     }
 
     /// Execute a single outbox operation.
@@ -282,5 +467,209 @@ impl Outbox {
         } else {
             debug!(error = %error, "outbox operation failed");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── EditMap tests ───────────────────────────────────────────
+
+    /// Enqueuing multiple edits for the same message should coalesce —
+    /// only the latest text is retained.
+    #[test]
+    fn test_edit_coalescing() {
+        let mut map = EditMap::default();
+        let key = (100, 200);
+
+        map.upsert(key, OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 200,
+            text: "first".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        map.upsert(key, OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 200,
+            text: "second".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        map.upsert(key, OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 200,
+            text: "third".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+
+        // Should only have 1 entry.
+        assert_eq!(map.len(), 1);
+
+        // Pop should return the latest content.
+        let empty_cooldown = HashMap::new();
+        let mut empty_buckets = HashMap::new();
+        let op = map.pop_eligible(&empty_cooldown, Duration::ZERO, &mut empty_buckets).unwrap();
+        if let OutboxOp::Edit { text, .. } = op {
+            assert_eq!(text, "third");
+        } else {
+            panic!("expected Edit");
+        }
+
+        assert!(map.is_empty());
+    }
+
+    /// Edits for different messages are independent.
+    #[test]
+    fn test_edit_coalescing_different_messages() {
+        let mut map = EditMap::default();
+
+        map.upsert((100, 1), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 1,
+            text: "msg1-v2".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        map.upsert((100, 1), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 1,
+            text: "msg1-v3".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        map.upsert((100, 2), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 2,
+            text: "msg2-v1".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+
+        assert_eq!(map.len(), 2);
+
+        // FIFO order: msg 1 first, then msg 2.
+        let empty = HashMap::new();
+        let mut buckets = HashMap::new();
+        let op1 = map.pop_eligible(&empty, Duration::ZERO, &mut buckets).unwrap();
+        if let OutboxOp::Edit { message_id, text, .. } = op1 {
+            assert_eq!(message_id, 1);
+            assert_eq!(text, "msg1-v3");
+        } else {
+            panic!("expected Edit");
+        }
+
+        let op2 = map.pop_eligible(&empty, Duration::ZERO, &mut buckets).unwrap();
+        if let OutboxOp::Edit { message_id, text, .. } = op2 {
+            assert_eq!(message_id, 2);
+            assert_eq!(text, "msg2-v1");
+        } else {
+            panic!("expected Edit");
+        }
+
+        assert!(map.is_empty());
+    }
+
+    /// Edits blocked by cooldown are skipped; eligible edits still go through.
+    #[test]
+    fn test_edit_cooldown_skip() {
+        let mut map = EditMap::default();
+        map.upsert((100, 1), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 1,
+            text: "blocked".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        map.upsert((100, 2), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 2,
+            text: "ok".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+
+        // Message 1 was edited recently, message 2 was not.
+        let mut last_edit = HashMap::new();
+        last_edit.insert((100_i64, 1_i64), Instant::now());
+
+        let mut buckets = HashMap::new();
+        let op = map.pop_eligible(&last_edit, Duration::from_secs(10), &mut buckets).unwrap();
+        if let OutboxOp::Edit { message_id, text, .. } = op {
+            assert_eq!(message_id, 2);
+            assert_eq!(text, "ok");
+        } else {
+            panic!("expected Edit");
+        }
+
+        // Message 1 is still pending (blocked by cooldown).
+        assert_eq!(map.len(), 1);
+    }
+
+    // ── TokenBucket tests ───────────────────────────────────────
+
+    #[test]
+    fn test_token_bucket_basic() {
+        let mut bucket = TokenBucket::new(10.0);
+        // Starts full — 10 tokens available.
+        for _ in 0..10 {
+            assert!(bucket.try_consume());
+        }
+        // 11th should fail.
+        assert!(!bucket.try_consume());
+    }
+
+    #[test]
+    fn test_token_bucket_refill() {
+        let mut bucket = TokenBucket::new(60.0); // 1 token/sec
+        // Drain all tokens.
+        for _ in 0..60 {
+            assert!(bucket.try_consume());
+        }
+        assert!(!bucket.try_consume());
+
+        // Simulate time passing.
+        bucket.last_refill -= Duration::from_secs(5);
+        // Should have ~5 tokens now.
+        assert!(bucket.try_consume());
+    }
+
+    /// Edits for a budget-exhausted chat are skipped; edits for other
+    /// chats still go through (no head-of-line blocking).
+    #[test]
+    fn test_edit_budget_skip_across_chats() {
+        let mut map = EditMap::default();
+        // Chat 100: will be over budget.
+        map.upsert((100, 1), OutboxOp::Edit {
+            chat_id: 100,
+            message_id: 1,
+            text: "chat100".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+        // Chat 200: has budget.
+        map.upsert((200, 1), OutboxOp::Edit {
+            chat_id: 200,
+            message_id: 1,
+            text: "chat200".to_owned(),
+            parse_mode: None,
+            reply_markup: None,
+        });
+
+        let empty_cooldown = HashMap::new();
+        let mut buckets = HashMap::new();
+        // Exhaust chat 100's budget.
+        let mut b100 = TokenBucket::new(DEFAULT_CHAT_BUDGET);
+        while b100.try_consume() {}
+        buckets.insert(100_i64, b100);
+
+        // Should skip chat 100 and return chat 200's edit.
+        let op = map.pop_eligible(&empty_cooldown, Duration::ZERO, &mut buckets).unwrap();
+        assert_eq!(op.chat_id(), 200);
+
+        // Chat 100's edit is still pending.
+        assert_eq!(map.len(), 1);
     }
 }

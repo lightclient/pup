@@ -273,13 +273,22 @@ impl TelegramBackend {
             }
             if let Some(data) = &cb.data
                 && let Some(session_id) = data.strip_prefix("cancel:") {
-                    let _ = self.bot.answer_callback_query(&cb.id, Some("Cancelling…")).await;
+                    // Send the abort to the session FIRST — the Telegram API
+                    // call below can take 250ms–2s and the agent may finish
+                    // before the abort arrives if we wait.
                     let _ = self.incoming_tx.send(IncomingMessage {
                         session_id: session_id.to_owned(),
                         text: String::new(),
                         mode: SendMode::Steer,
                         is_cancel: true,
                     }).await;
+                    // Answer the callback query in the background so we don't
+                    // block the poll loop.
+                    let bot = self.bot.clone();
+                    let cb_id = cb.id.clone();
+                    tokio::spawn(async move {
+                        let _ = bot.answer_callback_query(&cb_id, Some("Cancelling…")).await;
+                    });
                 }
             return;
         }
@@ -1628,6 +1637,198 @@ mod tests {
             topics_state_path: PathBuf::from("/tmp/topics.json"),
             voice: false,
         }
+    }
+
+    /// Start a mock Telegram Bot API server where `answerCallbackQuery`
+    /// takes a configurable delay before responding.
+    ///
+    /// All other methods behave identically to [`mock_telegram_api`].
+    async fn mock_telegram_api_slow_callback(
+        updates: Vec<serde_json::Value>,
+        callback_delay: Duration,
+    ) -> (String, Arc<StdMutex<Vec<ApiCall>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}/bottest");
+        let calls: Arc<StdMutex<Vec<ApiCall>>> = Arc::new(StdMutex::new(Vec::new()));
+
+        let calls_bg = calls.clone();
+        let updates = Arc::new(StdMutex::new(Some(updates)));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let calls = calls_bg.clone();
+                let updates = updates.clone();
+                let callback_delay = callback_delay;
+
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut reader = BufReader::new(reader);
+
+                    loop {
+                        let mut request_line = String::new();
+                        match reader.read_line(&mut request_line).await {
+                            Ok(0) | Err(_) => break,
+                            _ => {}
+                        }
+
+                        let mut content_length: usize = 0;
+                        loop {
+                            let mut line = String::new();
+                            if reader.read_line(&mut line).await.is_err() {
+                                return;
+                            }
+                            if line == "\r\n" || line.is_empty() {
+                                break;
+                            }
+                            if let Some(val) = line
+                                .strip_prefix("content-length:")
+                                .or_else(|| line.strip_prefix("Content-Length:"))
+                            {
+                                content_length = val.trim().parse().unwrap_or(0);
+                            }
+                        }
+
+                        let mut body = vec![0u8; content_length];
+                        if reader.read_exact(&mut body).await.is_err() {
+                            break;
+                        }
+                        let body_str = String::from_utf8_lossy(&body).to_string();
+
+                        let method = request_line
+                            .split(' ')
+                            .nth(1)
+                            .unwrap_or("")
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or("")
+                            .to_owned();
+
+                        calls.lock().unwrap().push(ApiCall {
+                            method: method.clone(),
+                            body: body_str,
+                        });
+
+                        let response_json = match method.as_str() {
+                            "getUpdates" => {
+                                let batch = updates.lock().unwrap().take();
+                                if let Some(batch) = batch {
+                                    serde_json::json!({
+                                        "ok": true,
+                                        "result": batch
+                                    })
+                                } else {
+                                    tokio::time::sleep(Duration::from_secs(120)).await;
+                                    return;
+                                }
+                            }
+                            "answerCallbackQuery" => {
+                                // Simulate real-world Telegram API latency.
+                                tokio::time::sleep(callback_delay).await;
+                                serde_json::json!({"ok": true, "result": true})
+                            }
+                            "sendMessage" => serde_json::json!({
+                                "ok": true,
+                                "result": {
+                                    "message_id": 999,
+                                    "chat": {"id": 1, "type": "private"}
+                                }
+                            }),
+                            _ => serde_json::json!({"ok": true, "result": true}),
+                        };
+
+                        let payload = serde_json::to_string(&response_json).unwrap();
+                        let http = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             \r\n\
+                             {}",
+                            payload.len(),
+                            payload,
+                        );
+                        if writer.write_all(http.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        (base_url, calls)
+    }
+
+    /// The cancel button (callback query) must dispatch the abort
+    /// `IncomingMessage` immediately — without waiting for the
+    /// `answerCallbackQuery` API call to complete.
+    ///
+    /// This test uses a mock server that adds a 2-second delay to
+    /// `answerCallbackQuery`. The abort must arrive on the incoming
+    /// channel well before that delay elapses.
+    #[tokio::test]
+    async fn test_cancel_button_dispatches_abort_before_answering_callback() {
+        let session_id = "test-session-cancel";
+
+        let updates = vec![serde_json::json!({
+            "update_id": 1,
+            "callback_query": {
+                "id": "cb-1",
+                "from": {"id": 12345, "first_name": "Test"},
+                "data": format!("cancel:{session_id}")
+            }
+        })];
+
+        let (base_url, api_calls) = mock_telegram_api_slow_callback(
+            updates,
+            Duration::from_secs(2),
+        )
+        .await;
+
+        let bot = BotClient::with_base_url(&base_url);
+        let mut backend = TelegramBackend::with_bot(test_config(), bot);
+
+        // recv_incoming internally calls handle_update which sends the
+        // abort to incoming_tx.  It then tries to drain incoming_rx.
+        // With the fix, the abort should be ready instantly even though
+        // answerCallbackQuery takes 2 seconds.
+        let start = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            backend.recv_incoming(),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // The 500ms timeout must NOT fire — the abort should arrive
+        // almost immediately (well under the 2s callback delay).
+        let msg = result
+            .expect("abort must arrive within 500ms (answerCallbackQuery is 2s)")
+            .expect("recv_incoming should not error")
+            .expect("should return an IncomingMessage, not None");
+
+        assert!(msg.is_cancel, "expected is_cancel=true");
+        assert_eq!(msg.session_id, session_id);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "abort took {elapsed:?} — should be near-instant, not blocked by answerCallbackQuery"
+        );
+
+        // Give the spawned answerCallbackQuery task a moment to complete
+        // in the background.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let calls = api_calls.lock().unwrap();
+        let cb_calls: Vec<&ApiCall> = calls
+            .iter()
+            .filter(|c| c.method == "answerCallbackQuery")
+            .collect();
+        assert!(
+            !cb_calls.is_empty(),
+            "answerCallbackQuery should still be called (in the background)"
+        );
     }
 
     /// An interactive command like `/name` (which requires an argument)

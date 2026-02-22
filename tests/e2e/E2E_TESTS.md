@@ -318,6 +318,51 @@ Pup is configured with `verbose = true`.
 
 ---
 
+### T09b — /verbose on mid-turn takes effect immediately
+
+Toggling verbose mode while the agent is actively streaming must take
+effect for the current turn — not just the next one.
+
+**Background:** `set_verbose` updates both the `TurnTracker` default and
+all active `TurnState` entries. Before the fix, it only set the tracker
+default, so each turn's `verbose` flag was frozen at `start_turn()` time
+and never updated.
+
+**Steps:**
+1. Start a pi session, name it `e2e-t09b`
+2. Wait for topic; note the topic ID
+3. Ensure verbose is off: send `/verbose off` in the topic
+4. Send a prompt that triggers tool use and takes a few seconds:
+   `tg.py send SUPERGROUP TOPIC_ID "run these commands one by one: echo TOOL_A, echo TOOL_B, echo TOOL_C, then summarize"`
+5. Wait 2–3s for the agent to start working (check that an agent turn
+   message appears in the topic)
+6. While the agent is mid-turn, toggle verbose on:
+   `tg.py send SUPERGROUP TOPIC_ID "/verbose on"`
+7. Wait for the agent to finish (up to 60s)
+8. Read the topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- The bot confirms "Verbose mode: **on**" in the topic
+- Tool calls that happen **after** the toggle are visible in the bot's
+  streaming message (e.g., 🔧 **Bash** with the echo commands)
+- Tool calls that happened **before** the toggle may not be shown
+  (they were processed in non-verbose mode and not tracked) — this is
+  acceptable
+- The final message includes the agent's text response
+- Verbose mode persists for subsequent turns — send another prompt
+  that triggers a tool call and verify tools are shown from the start
+
+**To verify the fix worked (not the old broken behavior):**
+- In the old code, toggling verbose mid-turn had zero effect: the turn
+  kept its snapshot from `start_turn()`, and all tool/thinking handlers
+  checked the per-turn flag. The streaming message would show only the
+  final text with no tool indicators.
+- With the fix, `set_verbose` propagates to active turns immediately,
+  so subsequent `tool_start`/`thinking_delta` events are rendered.
+
+---
+
 ### T10 — Typing indicator shown during agent turn
 
 **Steps:**
@@ -2575,3 +2620,372 @@ to the LLM (unknown).
 - `> single`: NOT a follow-up — single `>` doesn't trigger follow-up mode,
   sent as a normal steer message with the full text `> single`
 - No crash on any of these
+
+---
+
+## Rate Limiting & Outbox Tests
+
+These tests verify that the outbox rate limiter prevents Telegram 429
+errors when multiple sessions stream simultaneously in the same
+supergroup. The outbox uses a per-chat token bucket (18 ops/min, smooth
+refill at 0.3 tokens/sec) with edit coalescing so stale edits never
+waste tokens.
+
+**Key dynamics:**
+
+- All topics in a supergroup share one `chat_id`, so they share one
+  token bucket. Telegram's group limit is 20 messages/min; the budget
+  of 18/min leaves headroom.
+- The token bucket starts full (18 tokens). With 3 sessions, the first
+  ~10 seconds have fluid streaming (initial burst), then steady state
+  settles to ~6 edits/min per session (~1 every 10s).
+- Edit coalescing ensures that when the budget blocks edits, only the
+  latest content per message is kept. When a token becomes available,
+  it sends current content — never stale text from seconds ago.
+- The `flush_one()` loop skips budget-blocked entries to avoid
+  head-of-line blocking: if session A's chat is over budget but session
+  B's isn't, session B's operations still go through.
+
+### RL01 — Three concurrent sessions produce no 429 errors
+
+The primary scenario that caused the original bug: 3 sessions streaming
+in the same supergroup, generating ~120 edits/min collectively, exceeding
+Telegram's 20/min group limit.
+
+**Steps:**
+1. Start three pi sessions: `e2e-rl01-a`, `e2e-rl01-b`, `e2e-rl01-c`
+2. Wait for all three topics to appear; note their topic IDs
+3. Send long prompts to all three simultaneously (within 2 seconds):
+   ```bash
+   tg.py send SUPERGROUP TOPIC_A "write a detailed essay about the history of the internet"
+   tg.py send SUPERGROUP TOPIC_B "write a detailed essay about the history of programming languages"
+   tg.py send SUPERGROUP TOPIC_C "write a detailed essay about the history of operating systems"
+   ```
+4. Wait for all three agents to finish (up to 120s)
+5. Grep pup logs for `rate limited` or `429`:
+   ```bash
+   tmux -S "$SOCKET" capture-pane -p -t e2e:pup -S -500 | grep -i "rate.limit\|429"
+   ```
+6. Read all three topic histories:
+   ```bash
+   tg.py history SUPERGROUP TOPIC_A
+   tg.py history SUPERGROUP TOPIC_B
+   tg.py history SUPERGROUP TOPIC_C
+   ```
+
+**Expected:**
+- No `rate limited` or `429` entries in pup logs
+- All three topics have complete bot responses (the final edit for each
+  session contains the full essay text)
+- No cross-contamination between topics
+- The total number of API calls logged is ≤ 18/min sustained (may burst
+  higher in the first ~10 seconds from the initial token fill)
+
+---
+
+### RL02 — All sessions receive updates during concurrent streaming
+
+Verify that no session is starved — each session's topic gets at least
+some edits during streaming, even under rate pressure.
+
+**Steps:**
+1. Start three pi sessions: `e2e-rl02-a`, `e2e-rl02-b`, `e2e-rl02-c`
+2. Wait for all three topics
+3. Start pup with `RUST_LOG=debug` to capture per-operation outbox logs
+4. Send long prompts to all three simultaneously
+5. While agents are streaming (after ~15s), read each topic:
+   ```bash
+   tg.py history SUPERGROUP TOPIC_A
+   tg.py history SUPERGROUP TOPIC_B
+   tg.py history SUPERGROUP TOPIC_C
+   ```
+6. Wait for all agents to finish
+7. Read final topic histories
+8. Count `outbox_flush` log entries per topic to verify distribution:
+   ```bash
+   tmux -S "$SOCKET" capture-pane -p -t e2e:pup -S -2000 | grep "outbox_flush" | wc -l
+   ```
+
+**Expected:**
+- After 15s of concurrent streaming (past the initial burst), each
+  topic's bot message contains _some_ streaming content — no session
+  is completely starved
+- The final histories for all three topics contain complete responses
+- The outbox log shows operations for all three sessions (not just one
+  monopolizing the budget)
+- The `pending_edits` FIFO rotates fairly: roughly equal edit counts
+  per session in the logs
+
+---
+
+### RL03 — Finished session's final edit delivered promptly
+
+When one session finishes while others are still streaming, its final
+edit (removing the cancel keyboard and showing complete content) must
+go through without being blocked behind the other sessions' edits.
+
+**Steps:**
+1. Start three pi sessions: `e2e-rl03-a`, `e2e-rl03-b`, `e2e-rl03-c`
+2. Wait for all three topics; note their topic IDs
+3. Send a **short** prompt to session A:
+   `tg.py send SUPERGROUP TOPIC_A "reply with only the word KIWI"`
+4. Simultaneously send **long** prompts to B and C:
+   ```bash
+   tg.py send SUPERGROUP TOPIC_B "write a very detailed essay about databases"
+   tg.py send SUPERGROUP TOPIC_C "write a very detailed essay about compilers"
+   ```
+5. Wait for session A's response:
+   `tg.py wait SUPERGROUP --topic TOPIC_A --contains KIWI --timeout 30`
+6. Note how long session A took to show its final response
+7. Check session A's message in the topic — verify the cancel keyboard
+   is removed (no inline keyboard, or empty buttons list)
+
+**Expected:**
+- Session A finishes within ~10s (a trivial response)
+- Session A's final edit goes through promptly — not delayed until B
+  and C finish streaming. The `end_turn` path calls
+  `clear_edit_cooldown()` and enqueues the final edit, which gets the
+  next available token.
+- The final message for session A has no cancel keyboard (`empty_keyboard`)
+- Sessions B and C continue streaming unaffected
+
+---
+
+### RL04 — Edit coalescing under rate pressure
+
+Verify that when the budget is exhausted and multiple edit updates
+accumulate, only the latest content is shown — no stale intermediate
+edits appear in the topic.
+
+**Steps:**
+1. Start three pi sessions: `e2e-rl04-a`, `e2e-rl04-b`, `e2e-rl04-c`
+2. Wait for all three topics
+3. Send long prompts to all three simultaneously
+4. Wait for all agents to finish (up to 120s)
+5. Read each topic's final message content
+6. Check pup logs for the edit count:
+   ```bash
+   tmux -S "$SOCKET" capture-pane -p -t e2e:pup -S -2000 | grep "editMessageText" | wc -l
+   ```
+
+**Expected:**
+- The total `editMessageText` calls over the entire run is well below
+  what it would be without rate limiting (3 sessions × 40 edits/min =
+  120/min → should be capped at ~18/min sustained)
+- Each topic's final message contains the **complete** response — no
+  truncation from a stale intermediate edit surviving as the final state
+- The edit count per session is roughly equal (round-robin fairness)
+
+**Note:** Edit coalescing is invisible to the user — they just see
+fewer intermediate updates. The key property is that every update that
+_does_ go through shows the latest accumulated text, not text from
+10 seconds ago. If coalescing were broken, you'd see a final message
+that's missing the last few paragraphs (because a stale edit was sent
+after the fresh one).
+
+---
+
+### RL05 — Sends take priority over edits under rate pressure
+
+When a new session starts (triggering a `sendMessage`) while other
+sessions are streaming (generating edits), the send should go through
+first because sends have higher priority in the outbox heap.
+
+**Steps:**
+1. Start two pi sessions: `e2e-rl05-a`, `e2e-rl05-b`
+2. Wait for both topics
+3. Send long prompts to both to saturate the budget:
+   ```bash
+   tg.py send SUPERGROUP TOPIC_A "write a very long detailed essay about networks"
+   tg.py send SUPERGROUP TOPIC_B "write a very long detailed essay about cryptography"
+   ```
+4. Wait 15s (past the initial burst, budget should be tight)
+5. Start a third pi session: `e2e-rl05-c`
+6. Wait for session C's topic to appear; note how long it takes:
+   ```bash
+   for i in $(seq 1 30); do
+     sleep 1
+     tg.py topics SUPERGROUP | grep -q "rl05-c" && break
+   done
+   ```
+7. Send a message to session C's topic to verify it works
+
+**Expected:**
+- Session C's topic is created within a few seconds of the session
+  starting — the `sendMessage` for the initial turn message gets
+  priority over the pending edits for sessions A and B
+- The `sendMessage` consumes a token from the shared bucket, but it
+  goes through ahead of queued edits (Send priority=3 > Edit priority=1)
+- Session C responds to messages normally
+
+---
+
+### RL06 — Single session does not hit rate limits
+
+Baseline test: a single session streaming alone should never trigger
+rate limiting (1 edit per 1.5s = 40/min, but the budget is 18/min, so
+the bucket eventually throttles — verify this produces smooth updates,
+not 429 errors).
+
+**Steps:**
+1. Start one pi session: `e2e-rl06`
+2. Wait for topic; note the topic ID
+3. Send a long prompt:
+   `tg.py send SUPERGROUP TOPIC_ID "write a comprehensive guide to rust programming, covering ownership, borrowing, lifetimes, traits, and async"`
+4. Wait for the agent to finish (up to 120s)
+5. Check pup logs for 429 errors
+6. Read the topic history
+
+**Expected:**
+- No 429 errors in pup logs
+- The response is complete in the topic
+- The initial ~50 seconds have frequent updates (~1 per 1.5s, consuming
+  the initial 18-token burst plus refill)
+- After the burst, updates slow to ~1 per 3.3s (token refill rate)
+- The user sees a smooth slowdown, not a sudden freeze followed by a
+  burst (this is the token bucket advantage over the old sliding window)
+
+---
+
+### RL07 — Budget recovers after sessions finish
+
+After concurrent sessions finish, the token bucket should refill to
+capacity. A new session starting afterward should have the full burst
+budget available.
+
+**Steps:**
+1. Start three pi sessions and send prompts to all three (same as RL01)
+2. Wait for all three to finish
+3. Wait 60 seconds (full bucket refill: 18 tokens at 0.3/sec = 60s)
+4. Start a new pi session: `e2e-rl07-fresh`
+5. Wait for topic; send a long prompt
+6. Observe the streaming updates
+
+**Expected:**
+- The new session streams with the full initial burst (updates every
+  1.5s for the first ~50s)
+- No residual rate limiting from the previous sessions
+- The token bucket has refilled to capacity (18 tokens)
+- No 429 errors
+
+---
+
+### RL08 — Delete operations go through during edit pressure
+
+When a session finishes and its topic is cleaned up (or a session exits),
+the `deleteMessage` operation should go through even if edits for other
+sessions are pending. Deletes have priority 2 (between Send=3 and Edit=1).
+
+**Steps:**
+1. Start three pi sessions: `e2e-rl08-a`, `e2e-rl08-b`, `e2e-rl08-c`
+2. Wait for all three topics
+3. Send long prompts to all three
+4. While A and B are streaming, exit session C:
+   ```bash
+   tmux -S "$SOCKET" send-keys -t e2e:pi-e2e-rl08-c C-c
+   sleep 0.5
+   tmux -S "$SOCKET" send-keys -t e2e:pi-e2e-rl08-c C-d
+   ```
+5. Wait up to 45s (30s grace period + buffer)
+6. List topics: `tg.py topics SUPERGROUP`
+
+**Expected:**
+- Session C's topic is deleted after the grace period despite A and B
+  still actively streaming
+- The delete operation consumed a token from the shared bucket but
+  went through with priority over pending edits
+- Sessions A and B continue streaming (their edits resume after the
+  delete)
+
+---
+
+### RL09 — No head-of-line blocking across different chats
+
+This test only applies when sessions are in **different chats** (e.g.,
+one in a supergroup and one in a DM). Verify that an over-budget chat
+doesn't block operations for other chats.
+
+**Steps:**
+1. Configure pup with both DM mode and topics mode enabled
+2. Start two pi sessions: `e2e-rl09-topic` and `e2e-rl09-dm`
+3. Wait for `e2e-rl09-topic`'s topic in the supergroup
+4. Attach to `e2e-rl09-dm` via DM: `/attach e2e-rl09-dm`
+5. Send long prompts to both:
+   - Topic: `tg.py send SUPERGROUP TOPIC_ID "write a long essay about AI"`
+   - DM: `tg.py send DM_CHAT_ID "write a long essay about ML"`
+6. Wait for both to finish
+7. Check pup logs for 429 errors
+
+**Expected:**
+- The supergroup and DM have **separate** token buckets (different
+  `chat_id`s)
+- Both streams update independently — the supergroup being at its
+  budget limit doesn't block DM edits, and vice versa
+- No 429 errors
+- Both responses are complete
+
+**Note:** This tests the `flush_one()` head-of-line blocking fix. The
+old code would pop the first entry from the heap, check budget, and if
+blocked, push it back and return `false` — blocking ALL operations. The
+fix scans past budget-blocked entries to find one that can go through.
+
+---
+
+### RL10 — Outbox drains completely at end of turn
+
+When an agent finishes, the `AgentEnd` handler runs
+`while self.outbox.flush_one().await {}` to drain remaining operations.
+Verify this completes — the final edit and any overflow sends all go
+through.
+
+**Steps:**
+1. Start a pi session: `e2e-rl10`
+2. Wait for topic; note the topic ID
+3. Send a prompt that produces a **very long** response (longer than
+   one Telegram message):
+   `tg.py send SUPERGROUP TOPIC_ID "generate a numbered list from 1 to 500"`
+4. Wait for the agent to finish (up to 120s)
+5. Read the topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
+6. Count the bot messages in the topic
+
+**Expected:**
+- The response is split across multiple Telegram messages (each under
+  4096 chars / 3500 body chars)
+- All overflow chunks are delivered (the `end_turn` code enqueues
+  overflow `Send` operations, and the drain loop flushes them all)
+- The first message has no cancel keyboard (final edit removed it)
+- Overflow messages have no keyboard
+- The numbers go from 1 through 500 across all chunks (no gaps from
+  dropped overflow sends)
+
+---
+
+### RL11 — Rapid short prompts don't exhaust budget permanently
+
+If a user sends many short prompts in quick succession (each producing
+a fast response), the budget should recover between bursts.
+
+**Steps:**
+1. Start a pi session: `e2e-rl11`
+2. Wait for topic; note the topic ID
+3. Send 10 short prompts in quick succession (1 second apart):
+   ```bash
+   for i in $(seq 1 10); do
+     tg.py send SUPERGROUP TOPIC_ID "reply with only the number $i"
+     sleep 1
+   done
+   ```
+4. Wait for all responses (up to 60s)
+5. Verify all 10 responses are in the topic:
+   `tg.py history SUPERGROUP TOPIC_ID`
+6. Check pup logs for 429 errors
+
+**Expected:**
+- The first several responses arrive quickly (initial burst budget)
+- Later responses may be slightly delayed as the budget tightens
+- All 10 responses eventually appear in the topic
+- No 429 errors
+- Each response appears as a separate turn (a new bot message per
+  agent turn, not edits to the same message)
+- The content is correct: responses contain the numbers 1 through 10

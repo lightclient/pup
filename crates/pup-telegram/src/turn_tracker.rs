@@ -200,8 +200,14 @@ impl TurnTracker {
     }
 
     /// Enable or disable verbose mode (tool call visibility).
+    ///
+    /// Updates the tracker default AND all currently active turns so the
+    /// change takes effect immediately — not just on the next turn.
     pub fn set_verbose(&mut self, verbose: bool) {
         self.verbose = verbose;
+        for state in self.turns.values_mut() {
+            state.verbose = verbose;
+        }
     }
 
     /// Check if a turn is being tracked for the given session.
