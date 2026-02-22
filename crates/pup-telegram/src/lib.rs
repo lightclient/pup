@@ -33,6 +33,9 @@ use turn_tracker::TurnTracker;
 struct PendingPrompt {
     /// The slash command name (without the leading `/`).
     command: String,
+    /// If true, this is a pup-level command handled locally (e.g. /verbose).
+    /// If false, the completed command is forwarded to the session via IPC.
+    local: bool,
 }
 
 /// If a slash command requires an argument and was invoked without one,
@@ -42,6 +45,28 @@ fn prompt_for_command(cmd: &str) -> Option<&'static str> {
         "name" => Some("What name would you like to set?"),
         _ => None,
     }
+}
+
+/// Format help text for topic mode (commands available inside a session topic).
+fn format_topics_help() -> String {
+    [
+        "<b>pup — Telegram bridge for pi</b>",
+        "",
+        "<b>Commands:</b>",
+        "/cancel — Abort the current agent operation",
+        "/status — Show session status (model, context usage)",
+        "/verbose [on|off] — Toggle verbose mode (thinking + tools)",
+        "/compact — Compact session context",
+        "/name &lt;name&gt; — Set session name",
+        "/new — Start a new session",
+        "/quit — Quit pi session",
+        "/help — Show this help",
+        "",
+        "<b>Messaging:</b>",
+        "Type normally to send a message (interrupts agent).",
+        "Prefix with &gt;&gt; to queue as follow-up.",
+    ]
+    .join("\n")
 }
 
 /// Spawn a background typing indicator loop for a session, running until
@@ -119,6 +144,8 @@ pub struct TelegramBackend {
     dm_chat_id: Option<i64>,
     /// Pending interactive prompts, keyed by session ID.
     pending_prompts: HashMap<String, PendingPrompt>,
+    /// Pending DM-level interactive prompt (not per-session, e.g. /verbose).
+    pending_dm_prompt: Option<PendingPrompt>,
     /// Whisper transcriber for voice messages (loaded on start).
     transcriber: Option<Arc<Mutex<whisper::Transcriber>>>,
     /// Pre-turn typing indicators, keyed by session ID.
@@ -161,6 +188,7 @@ impl TelegramBackend {
             incoming_rx: Some(incoming_rx),
             dm_chat_id: None,
             pending_prompts: HashMap::new(),
+            pending_dm_prompt: None,
             transcriber: None,
             pre_turn_typing: HashMap::new(),
         }
@@ -188,6 +216,7 @@ impl TelegramBackend {
             incoming_rx: Some(incoming_rx),
             dm_chat_id: None,
             pending_prompts: HashMap::new(),
+            pending_dm_prompt: None,
             transcriber: None,
             pre_turn_typing: HashMap::new(),
         }
@@ -314,6 +343,53 @@ impl TelegramBackend {
                         return;
                     }
 
+                    // Handle /help locally.
+                    if trimmed == "/help" || trimmed == "/start" {
+                        self.pending_prompts.remove(&session_id);
+                        self.outbox.enqueue(OutboxOp::Send {
+                            chat_id: topics.chat_id(),
+                            text: format_topics_help(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: None,
+                            message_thread_id: Some(thread_id),
+                            result_tx: None,
+                        });
+                        return;
+                    }
+
+                    // Handle /verbose locally (pup-level command).
+                    if trimmed == "/verbose" || trimmed.starts_with("/verbose ") {
+                        self.pending_prompts.remove(&session_id);
+                        let args = trimmed.strip_prefix("/verbose").unwrap().trim();
+                        if args.is_empty() {
+                            self.pending_prompts.insert(
+                                session_id.clone(),
+                                PendingPrompt { command: "verbose".to_owned(), local: true },
+                            );
+                            self.outbox.enqueue(OutboxOp::Send {
+                                chat_id: topics.chat_id(),
+                                text: "<i>Verbose mode shows thinking and tool calls while the agent works.\n\nReply <b>on</b> or <b>off</b>.</i>".to_owned(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: Some(thread_id),
+                                result_tx: None,
+                            });
+                        } else {
+                            let on = matches!(args, "on" | "true" | "1" | "yes");
+                            self.turn_tracker.set_verbose(on);
+                            let label = if on { "on" } else { "off" };
+                            self.outbox.enqueue(OutboxOp::Send {
+                                chat_id: topics.chat_id(),
+                                text: format!("Verbose mode: <b>{label}</b>"),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: Some(thread_id),
+                                result_tx: None,
+                            });
+                        }
+                        return;
+                    }
+
                     // Start typing immediately so the user sees activity
                     // while we parse, transcribe, or wait for the agent.
                     spawn_typing_loop(
@@ -328,13 +404,34 @@ impl TelegramBackend {
                     // prompt, treat their reply as the argument.
                     if !trimmed.starts_with('/') {
                         if let Some(prompt) = self.pending_prompts.remove(&session_id) {
-                            let full_cmd = format!("/{} {}", prompt.command, trimmed);
-                            let _ = self.incoming_tx.send(IncomingMessage {
-                                session_id,
-                                text: full_cmd,
-                                mode: SendMode::Steer,
-                                is_cancel: false,
-                            }).await;
+                            if prompt.local {
+                                // Handle pup-level command locally.
+                                self.pre_turn_typing.remove(&session_id);
+                                match prompt.command.as_str() {
+                                    "verbose" => {
+                                        let on = matches!(trimmed, "on" | "true" | "1" | "yes");
+                                        self.turn_tracker.set_verbose(on);
+                                        let label = if on { "on" } else { "off" };
+                                        self.outbox.enqueue(OutboxOp::Send {
+                                            chat_id: topics.chat_id(),
+                                            text: format!("Verbose mode: <b>{label}</b>"),
+                                            parse_mode: Some("HTML".to_owned()),
+                                            reply_markup: None,
+                                            message_thread_id: Some(thread_id),
+                                            result_tx: None,
+                                        });
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                let full_cmd = format!("/{} {}", prompt.command, trimmed);
+                                let _ = self.incoming_tx.send(IncomingMessage {
+                                    session_id,
+                                    text: full_cmd,
+                                    mode: SendMode::Steer,
+                                    is_cancel: false,
+                                }).await;
+                            }
                             return;
                         }
                     } else {
@@ -355,7 +452,7 @@ impl TelegramBackend {
                                 self.pre_turn_typing.remove(&session_id);
                                 self.pending_prompts.insert(
                                     session_id.clone(),
-                                    PendingPrompt { command: cmd_name.to_owned() },
+                                    PendingPrompt { command: cmd_name.to_owned(), local: false },
                                 );
                                 self.outbox.enqueue(OutboxOp::Send {
                                     chat_id: topics.chat_id(),
@@ -395,8 +492,9 @@ impl TelegramBackend {
 
     /// Handle a DM message (commands or forwarding).
     async fn handle_dm_message(&mut self, chat_id: i64, text: &str) {
-        // Any slash command cancels a pending interactive prompt.
+        // Any slash command cancels pending interactive prompts.
         if text.trim().starts_with('/') {
+            self.pending_dm_prompt = None;
             if let Some(sid) = &self.dm.attached {
                 self.pending_prompts.remove(sid.as_str());
             }
@@ -486,14 +584,42 @@ impl TelegramBackend {
                 }
             }
             DmCommand::Verbose { toggle } => {
-                self.dm.verbose = toggle.unwrap_or(!self.dm.verbose);
-                let state = if self.dm.verbose { "on" } else { "off" };
-                self.send_dm(chat_id, &format!("Verbose mode: <b>{state}</b>"));
+                if let Some(on) = toggle {
+                    self.turn_tracker.set_verbose(on);
+                    let label = if on { "on" } else { "off" };
+                    self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                } else {
+                    // No argument — interactive prompt.
+                    self.pending_dm_prompt = Some(PendingPrompt {
+                        command: "verbose".to_owned(),
+                        local: true,
+                    });
+                    self.send_dm(
+                        chat_id,
+                        "<i>Verbose mode shows thinking and tool calls while the agent works.\n\nReply <b>on</b> or <b>off</b>.</i>",
+                    );
+                }
             }
             DmCommand::Help => {
                 self.send_dm(chat_id, &DmState::format_help());
             }
             DmCommand::Message { text, mode } => {
+                // Check DM-level pending prompt first (e.g. /verbose).
+                if !text.starts_with('/') {
+                    if let Some(prompt) = self.pending_dm_prompt.take() {
+                        match prompt.command.as_str() {
+                            "verbose" => {
+                                let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                                self.turn_tracker.set_verbose(on);
+                                let label = if on { "on" } else { "off" };
+                                self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                }
+
                 if let Some(sid) = self.dm.attached.clone() {
                     // Start typing immediately.
                     spawn_typing_loop(
@@ -507,13 +633,26 @@ impl TelegramBackend {
                     // Check for pending prompt completion.
                     if !text.starts_with('/') {
                         if let Some(prompt) = self.pending_prompts.remove(&sid) {
-                            let full_cmd = format!("/{} {}", prompt.command, text);
-                            let _ = self.incoming_tx.send(IncomingMessage {
-                                session_id: sid,
-                                text: full_cmd,
-                                mode: SendMode::Steer,
-                                is_cancel: false,
-                            }).await;
+                            if prompt.local {
+                                self.pre_turn_typing.remove(&sid);
+                                match prompt.command.as_str() {
+                                    "verbose" => {
+                                        let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                                        self.turn_tracker.set_verbose(on);
+                                        let label = if on { "on" } else { "off" };
+                                        self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                                    }
+                                    _ => {}
+                                }
+                            } else {
+                                let full_cmd = format!("/{} {}", prompt.command, text);
+                                let _ = self.incoming_tx.send(IncomingMessage {
+                                    session_id: sid,
+                                    text: full_cmd,
+                                    mode: SendMode::Steer,
+                                    is_cancel: false,
+                                }).await;
+                            }
                             return;
                         }
                     }
@@ -531,7 +670,7 @@ impl TelegramBackend {
                                 self.pre_turn_typing.remove(&sid);
                                 self.pending_prompts.insert(
                                     sid,
-                                    PendingPrompt { command: cmd_name.to_owned() },
+                                    PendingPrompt { command: cmd_name.to_owned(), local: false },
                                 );
                                 self.send_dm(chat_id, &format!("<i>{question}</i>"));
                                 return;
@@ -867,7 +1006,7 @@ impl ChatBackend for TelegramBackend {
                 ("detach".to_owned(), "Detach from session".to_owned()),
                 ("cancel".to_owned(), "Cancel current operation".to_owned()),
                 ("status".to_owned(), "Show session status (model, context usage)".to_owned()),
-                ("verbose".to_owned(), "Toggle tool call visibility".to_owned()),
+                ("verbose".to_owned(), "Toggle verbose mode (thinking + tools)".to_owned()),
                 ("help".to_owned(), "Show help".to_owned()),
             ];
             let _ = self
@@ -886,7 +1025,9 @@ impl ChatBackend for TelegramBackend {
                 ("new".to_owned(), "Start a new session".to_owned()),
                 ("compact".to_owned(), "Compact session context".to_owned()),
                 ("name".to_owned(), "Set session name".to_owned()),
+                ("verbose".to_owned(), "Toggle verbose mode (thinking + tools)".to_owned()),
                 ("quit".to_owned(), "Quit pi session".to_owned()),
+                ("help".to_owned(), "Show available commands".to_owned()),
             ];
             let _ = self
                 .bot

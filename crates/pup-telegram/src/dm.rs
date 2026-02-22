@@ -166,7 +166,7 @@ impl DmState {
             "/detach — Detach from current session",
             "/cancel — Abort the current agent operation",
             "/status — Show session status (model, context usage)",
-            "/verbose [on|off] — Toggle tool call visibility",
+            "/verbose [on|off] — Toggle verbose mode (thinking + tools)",
             "/help — Show this help",
             "",
             "<b>Messaging:</b>",

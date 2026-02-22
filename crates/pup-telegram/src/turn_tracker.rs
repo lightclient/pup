@@ -39,6 +39,8 @@ struct TurnState {
     streaming_text: String,
     /// Whether the model is currently in a thinking/reasoning phase.
     thinking: bool,
+    /// Accumulated thinking/chain-of-thought text.
+    thinking_text: String,
     /// Last time we sent an edit to Telegram.
     last_edit: Instant,
     /// Whether content has changed since the last edit.
@@ -102,9 +104,29 @@ impl TurnState {
             }
         }
 
-        // Thinking indicator.
+        // Thinking content (shown while model is reasoning, before response text).
         if self.thinking && self.streaming_text.is_empty() {
-            parts.push("💭 <i>Thinking…</i>".to_owned());
+            if self.thinking_text.is_empty() {
+                parts.push("💭 <i>Thinking…</i>".to_owned());
+            } else {
+                // Show the tail of the thinking text (most recent reasoning).
+                // Cap at 2000 chars to leave room for tools/formatting within
+                // Telegram's 4096 char message limit.
+                const MAX_THINKING_DISPLAY: usize = 2000;
+                let display = if self.thinking_text.len() > MAX_THINKING_DISPLAY {
+                    let start = self.thinking_text.len() - MAX_THINKING_DISPLAY;
+                    // Don't split mid-char.
+                    let safe_start = self.thinking_text[start..]
+                        .char_indices()
+                        .next()
+                        .map(|(i, _)| start + i)
+                        .unwrap_or(start);
+                    format!("…{}", &self.thinking_text[safe_start..])
+                } else {
+                    self.thinking_text.clone()
+                };
+                parts.push(format!("💭 <i>{}</i>", escape_html(&display)));
+            }
         }
 
         // Streaming text.
@@ -233,6 +255,7 @@ impl TurnTracker {
                 send_rx: None,
                 streaming_text: String::new(),
                 thinking: false,
+                thinking_text: String::new(),
                 last_edit: Instant::now(),
                 dirty: false,
                 typing_stop: Some(stop_tx),
@@ -277,20 +300,21 @@ impl TurnTracker {
         args: &serde_json::Value,
         outbox: &mut Outbox,
     ) {
+        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+        if !verbose {
+            return;
+        }
         if let Some(state) = self.turns.get_mut(session_id) {
-            if state.verbose {
-                state.tools.push(TrackedTool {
-                    tool_name: tool_name.to_owned(),
-                    args: args.clone(),
-                    content: None,
-                    is_error: false,
-                    done: false,
-                });
-                state.dirty = true;
-            }
+            state.tools.push(TrackedTool {
+                tool_name: tool_name.to_owned(),
+                args: args.clone(),
+                content: None,
+                is_error: false,
+                done: false,
+            });
+            state.dirty = true;
         }
         self.ensure_message(session_id, "…", outbox);
-        // Flush the tool start state.
         if let Some(state) = self.turns.get_mut(session_id) {
             state.flush(outbox, self.edit_interval_ms);
         }
@@ -321,13 +345,15 @@ impl TurnTracker {
     }
 
     /// Note that thinking/reasoning content is streaming.
-    pub fn thinking_delta(&mut self, session_id: &str, _text: &str, outbox: &mut Outbox) {
-        // We don't accumulate the thinking text (it can be very long);
-        // just flip the flag so render() shows "💭 Thinking…".
-        self.ensure_message(session_id, "💭 <i>Thinking…</i>", outbox);
+    pub fn thinking_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
+        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
         if let Some(state) = self.turns.get_mut(session_id) {
-            if !state.thinking {
-                state.thinking = true;
+            state.thinking = true;
+            state.thinking_text.push_str(text);
+        }
+        if verbose {
+            self.ensure_message(session_id, "💭 <i>Thinking…</i>", outbox);
+            if let Some(state) = self.turns.get_mut(session_id) {
                 state.dirty = true;
                 state.flush(outbox, self.edit_interval_ms);
             }
@@ -336,33 +362,36 @@ impl TurnTracker {
 
     /// Accumulate a streaming text delta.
     pub fn message_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
-        // If no message sent yet, send with the first chunk of text.
-        let initial = {
-            let needs_send = self
-                .turns
-                .get(session_id)
-                .map_or(false, |s| s.telegram_message_id.is_none() && !s.send_pending);
-            if needs_send {
-                // Render current state (tools + text) for the initial send.
-                let state = self.turns.get(session_id).unwrap();
-                let mut preview = state.render();
-                let delta_html = to_telegram_html(text);
-                if !delta_html.is_empty() {
-                    if !preview.is_empty() {
-                        preview.push_str("\n\n");
+        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+
+        if verbose {
+            // If no message sent yet, send with the first chunk of text.
+            let initial = {
+                let needs_send = self
+                    .turns
+                    .get(session_id)
+                    .map_or(false, |s| s.telegram_message_id.is_none() && !s.send_pending);
+                if needs_send {
+                    let state = self.turns.get(session_id).unwrap();
+                    let mut preview = state.render();
+                    let delta_html = to_telegram_html(text);
+                    if !delta_html.is_empty() {
+                        if !preview.is_empty() {
+                            preview.push_str("\n\n");
+                        }
+                        preview.push_str(&delta_html);
                     }
-                    preview.push_str(&delta_html);
+                    if preview.is_empty() {
+                        preview = "…".to_owned();
+                    }
+                    Some(preview)
+                } else {
+                    None
                 }
-                if preview.is_empty() {
-                    preview = "…".to_owned();
-                }
-                Some(preview)
-            } else {
-                None
+            };
+            if let Some(initial_text) = initial {
+                self.ensure_message(session_id, &initial_text, outbox);
             }
-        };
-        if let Some(initial_text) = initial {
-            self.ensure_message(session_id, &initial_text, outbox);
         }
 
         let Some(state) = self.turns.get_mut(session_id) else {
@@ -372,8 +401,11 @@ impl TurnTracker {
         // First text delta means thinking is done.
         state.thinking = false;
         state.streaming_text.push_str(text);
-        state.dirty = true;
-        state.flush(outbox, self.edit_interval_ms);
+
+        if state.verbose {
+            state.dirty = true;
+            state.flush(outbox, self.edit_interval_ms);
+        }
     }
 
     /// Handle the end of a streaming message. Sets the complete final content
@@ -385,12 +417,16 @@ impl TurnTracker {
         content: &str,
         outbox: &mut Outbox,
     ) {
-        // If no deltas were received (e.g. very short response with extended
-        // thinking), ensure a Telegram message is created with the final content.
-        if !content.is_empty() {
-            let html = to_telegram_html(content);
-            let initial = if html.is_empty() { "…".to_owned() } else { html };
-            self.ensure_message(session_id, &initial, outbox);
+        let verbose = self.turns.get(session_id).map_or(false, |s| s.verbose);
+
+        if verbose {
+            // If no deltas were received (e.g. very short response with extended
+            // thinking), ensure a Telegram message is created with the final content.
+            if !content.is_empty() {
+                let html = to_telegram_html(content);
+                let initial = if html.is_empty() { "…".to_owned() } else { html };
+                self.ensure_message(session_id, &initial, outbox);
+            }
         }
 
         let Some(state) = self.turns.get_mut(session_id) else {
@@ -400,10 +436,13 @@ impl TurnTracker {
         if !content.is_empty() {
             state.streaming_text = content.to_owned();
         }
-        state.dirty = true;
-        // Force an immediate edit (bypass throttle) so the final content
-        // is shown promptly.
-        state.flush(outbox, 0);
+
+        if state.verbose {
+            state.dirty = true;
+            // Force an immediate edit (bypass throttle) so the final content
+            // is shown promptly.
+            state.flush(outbox, 0);
+        }
     }
 
     /// Finalize the turn: send the last edit with the complete content
