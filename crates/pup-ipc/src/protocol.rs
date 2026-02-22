@@ -78,6 +78,7 @@ pub enum IpcEvent {
     TurnEnd { turn_index: u64 },
     MessageStart { role: String, message_id: String },
     MessageDelta { message_id: String, text: String },
+    ThinkingDelta { message_id: String, text: String },
     MessageEnd { message_id: String, role: String, content: String },
     ToolStart { tool_call_id: String, tool_name: String, args: serde_json::Value },
     ToolUpdate { tool_call_id: String, tool_name: String, content: String },
@@ -239,6 +240,18 @@ impl IpcEvent {
                     .to_owned(),
             },
             "message_delta" => Self::MessageDelta {
+                message_id: data
+                    .get("message_id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                text: data
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+            },
+            "thinking_delta" => Self::ThinkingDelta {
                 message_id: data
                     .get("message_id")
                     .and_then(serde_json::Value::as_str)

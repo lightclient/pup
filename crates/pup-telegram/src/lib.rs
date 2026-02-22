@@ -1117,6 +1117,16 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::MessageStart { .. } => {
                 // Nothing to do — the turn tracker already has the message.
             }
+            SessionEvent::ThinkingDelta {
+                ref session_id,
+                ref text,
+                ..
+            } => {
+                debug!(session_id, len = text.len(), "thinking_delta");
+                self.ensure_turn(session_id);
+                self.turn_tracker
+                    .thinking_delta(session_id, text, &mut self.outbox);
+            }
             SessionEvent::MessageDelta {
                 ref session_id,
                 ref text,

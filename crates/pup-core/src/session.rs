@@ -305,6 +305,11 @@ impl SessionManager {
                 message_id,
                 text,
             },
+            IpcEvent::ThinkingDelta { message_id, text } => SessionEvent::ThinkingDelta {
+                session_id: session_id.to_owned(),
+                message_id,
+                text,
+            },
             IpcEvent::MessageEnd {
                 message_id,
                 role,

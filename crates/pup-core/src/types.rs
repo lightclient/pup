@@ -25,6 +25,12 @@ pub enum SessionEvent {
         message_id: String,
         text: String,
     },
+    /// Streaming thinking/chain-of-thought delta (extended thinking).
+    ThinkingDelta {
+        session_id: String,
+        message_id: String,
+        text: String,
+    },
     /// An assistant message finished.
     MessageEnd {
         session_id: String,

@@ -49,6 +49,7 @@ export default function (pi: ExtensionAPI) {
 	let isStreaming = false;
 	let currentMessageId: string | null = null;
 	let accumulatedText = "";
+	let accumulatedThinking = "";
 
 	// ── Client management ───────────────────────────────────────
 
@@ -600,6 +601,7 @@ export default function (pi: ExtensionAPI) {
 			isStreaming = false;
 			currentMessageId = null;
 			accumulatedText = "";
+			accumulatedThinking = "";
 			broadcastEvent("session_reset");
 			updateAlias(ctx);
 			return;
@@ -615,6 +617,7 @@ export default function (pi: ExtensionAPI) {
 		isStreaming = false;
 		currentMessageId = null;
 		accumulatedText = "";
+		accumulatedThinking = "";
 	});
 
 	pi.on("agent_start", async () => {
@@ -625,6 +628,7 @@ export default function (pi: ExtensionAPI) {
 		isStreaming = false;
 		currentMessageId = null;
 		accumulatedText = "";
+		accumulatedThinking = "";
 		broadcastEvent("agent_end");
 	});
 
@@ -645,6 +649,7 @@ export default function (pi: ExtensionAPI) {
 			isStreaming = true;
 			currentMessageId = messageId;
 			accumulatedText = "";
+			accumulatedThinking = "";
 		}
 
 		broadcastEvent("message_start", { role, message_id: messageId });
@@ -653,9 +658,27 @@ export default function (pi: ExtensionAPI) {
 	pi.on("message_update", async (event) => {
 		if (!currentMessageId) return;
 
+		const msg = event.message;
+
+		// Extract thinking content (extended thinking / chain-of-thought).
+		const currentThinking = Array.isArray(msg.content)
+			? msg.content
+					.filter((c: any) => c.type === "thinking")
+					.map((c: any) => c.thinking)
+					.join("")
+			: "";
+
+		if (currentThinking.length > accumulatedThinking.length) {
+			const thinkingDelta = currentThinking.slice(accumulatedThinking.length);
+			accumulatedThinking = currentThinking;
+			broadcastEvent("thinking_delta", {
+				message_id: currentMessageId,
+				text: thinkingDelta,
+			});
+		}
+
 		// Extract the current full text from event.message.content.
 		// This works regardless of provider streaming format.
-		const msg = event.message;
 		const currentText = Array.isArray(msg.content)
 			? msg.content
 					.filter((c: any) => c.type === "text")

@@ -37,6 +37,8 @@ struct TurnState {
     send_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<crate::bot::SentMessage>>>,
     /// Accumulated streaming text for the current assistant message.
     streaming_text: String,
+    /// Whether the model is currently in a thinking/reasoning phase.
+    thinking: bool,
     /// Last time we sent an edit to Telegram.
     last_edit: Instant,
     /// Whether content has changed since the last edit.
@@ -98,6 +100,11 @@ impl TurnState {
                 }
                 parts.push(line);
             }
+        }
+
+        // Thinking indicator.
+        if self.thinking && self.streaming_text.is_empty() {
+            parts.push("💭 <i>Thinking…</i>".to_owned());
         }
 
         // Streaming text.
@@ -225,6 +232,7 @@ impl TurnTracker {
                 send_pending: false,
                 send_rx: None,
                 streaming_text: String::new(),
+                thinking: false,
                 last_edit: Instant::now(),
                 dirty: false,
                 typing_stop: Some(stop_tx),
@@ -312,6 +320,20 @@ impl TurnTracker {
         }
     }
 
+    /// Note that thinking/reasoning content is streaming.
+    pub fn thinking_delta(&mut self, session_id: &str, _text: &str, outbox: &mut Outbox) {
+        // We don't accumulate the thinking text (it can be very long);
+        // just flip the flag so render() shows "💭 Thinking…".
+        self.ensure_message(session_id, "💭 <i>Thinking…</i>", outbox);
+        if let Some(state) = self.turns.get_mut(session_id) {
+            if !state.thinking {
+                state.thinking = true;
+                state.dirty = true;
+                state.flush(outbox, self.edit_interval_ms);
+            }
+        }
+    }
+
     /// Accumulate a streaming text delta.
     pub fn message_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
         // If no message sent yet, send with the first chunk of text.
@@ -347,6 +369,8 @@ impl TurnTracker {
             return;
         };
 
+        // First text delta means thinking is done.
+        state.thinking = false;
         state.streaming_text.push_str(text);
         state.dirty = true;
         state.flush(outbox, self.edit_interval_ms);
