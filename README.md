@@ -13,7 +13,7 @@
 Pickup your [pi](https://github.com/badlogic/pi) sessions on the go.
 
 pup bridges pi coding agent sessions to chat platforms so you can monitor and
-interact with them from your phone. Telegram first, others later.
+interact with them from your phone.
 
 ```
 ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
