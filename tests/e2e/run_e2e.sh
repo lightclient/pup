@@ -1851,6 +1851,134 @@ test_n08() {
   wait_all_topics_gone 45 || true
 }
 
+# ─── Extension guard tests ───────────────────────────────────
+
+test_x01() {
+  log "X01 — Double-load guard prevents duplicate sockets"
+  clean_stale_topics
+  # Clear the isolated socket dir so we can count fresh sockets
+  rm -f "$PUP_SOCKET_DIR"/*.sock "$PUP_SOCKET_DIR"/*.alias
+
+  local work
+  work=$(mktemp -d)
+  # Create a project-local extension symlink (global already exists)
+  mkdir -p "$work/.pi/extensions"
+  ln -s /root/pup/main/extension "$work/.pi/extensions/pup"
+
+  # Start pi in the dir with BOTH global and project-local extensions
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-e2e-x01"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-x01" \
+    "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-x01" "/name e2e-x01" Enter
+  sleep 5
+
+  # Count sockets — should be exactly 1, not 2
+  local sock_count
+  sock_count=$(ls "$PUP_SOCKET_DIR"/*.sock 2>/dev/null | wc -l)
+  if [ "$sock_count" = "1" ]; then
+    # Verify pup sees exactly one session / one topic
+    if wait_topic "e2e-x01" 20 >/dev/null; then
+      local cnt
+      cnt=$(count_topics)
+      if [ "$cnt" = "1" ]; then
+        # Verify session is functional
+        local tid
+        tid=$(get_topic_id "e2e-x01")
+        $TG send "$SUPERGROUP" "$tid" "reply with only the word SINGLE_X01" 2>/dev/null >/dev/null
+        if wait_bot_msg "$tid" "SINGLE_X01" 60 >/dev/null; then
+          pass "X01"
+        else
+          fail "X01" "session not responsive (sock_count=$sock_count, topics=$cnt)"
+        fi
+      else
+        fail "X01" "expected 1 topic, got $cnt (double-load guard may have failed)"
+      fi
+    else
+      fail "X01" "topic never appeared despite 1 socket"
+    fi
+  else
+    fail "X01" "expected 1 socket, got $sock_count (double-load guard failed)"
+  fi
+  exit_pi "e2e-x01"
+  # Clean up the project-local symlink
+  rm -rf "$work/.pi"
+  wait_all_topics_gone 45 || true
+}
+
+test_x02() {
+  log "X02 — Double-load guard allows /new to work"
+  clean_stale_topics
+  rm -f "$PUP_SOCKET_DIR"/*.sock "$PUP_SOCKET_DIR"/*.alias
+
+  local work
+  work=$(mktemp -d)
+  mkdir -p "$work/.pi/extensions"
+  ln -s /root/pup/main/extension "$work/.pi/extensions/pup"
+
+  tmux -S "$SOCKET" new-window -t e2e -n "pi-e2e-x02"
+  sleep 0.5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-x02" \
+    "cd $work && PUP_SOCKET_DIR=$PUP_SOCKET_DIR pi --dangerously-skip-permissions" Enter
+  sleep 5
+  tmux -S "$SOCKET" send-keys -t "e2e:pi-e2e-x02" "/name e2e-x02" Enter
+  sleep 5
+
+  if ! wait_topic "e2e-x02" 20 >/dev/null; then
+    fail "X02" "topic never appeared"
+    exit_pi "e2e-x02"
+    rm -rf "$work/.pi"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-x02")
+
+  # Verify functional before /new
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word BEFORE_X02" 2>/dev/null >/dev/null
+  if ! wait_bot_msg "$tid" "BEFORE_X02" 60 >/dev/null; then
+    fail "X02" "session not responsive before /new"
+    exit_pi "e2e-x02"
+    rm -rf "$work/.pi"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+
+  # Send /new — extension stays loaded (same process), guard flag persists
+  pi_send "e2e-x02" "/new"
+  sleep 10
+
+  # Still 1 socket
+  local sock_count
+  sock_count=$(ls "$PUP_SOCKET_DIR"/*.sock 2>/dev/null | wc -l)
+  if [ "$sock_count" != "1" ]; then
+    fail "X02" "socket count changed after /new: $sock_count"
+    exit_pi "e2e-x02"
+    rm -rf "$work/.pi"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+
+  # Verify functional after /new
+  local active_tid
+  active_tid=$(get_any_topic_id)
+  if [ -z "$active_tid" ]; then
+    fail "X02" "no topic after /new"
+    exit_pi "e2e-x02"
+    rm -rf "$work/.pi"
+    return
+  fi
+  $TG send "$SUPERGROUP" "$active_tid" "reply with only the word AFTER_X02" 2>/dev/null >/dev/null
+  if wait_bot_msg "$active_tid" "AFTER_X02" 60 >/dev/null; then
+    pass "X02"
+  else
+    fail "X02" "session not responsive after /new"
+  fi
+  exit_pi "e2e-x02"
+  rm -rf "$work/.pi"
+  wait_all_topics_gone 45 || true
+}
+
 if [ "$TESTS" = "all" ]; then
   # Core lifecycle
   test_t01   # topic created
@@ -1923,6 +2051,10 @@ if [ "$TESTS" = "all" ]; then
   test_n06   # name inherited across both pi and pup restart
   test_n07   # new /name overrides inherited name
   test_n08   # /compact preserves session name
+
+  # Extension guard (double-load prevention)
+  test_x01   # double-load guard prevents duplicate sockets
+  test_x02   # double-load guard allows /new to work
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do

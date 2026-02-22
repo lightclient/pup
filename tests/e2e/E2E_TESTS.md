@@ -3088,3 +3088,73 @@ a fast response), the budget should recover between bursts.
 - Each response appears as a separate turn (a new bot message per
   agent turn, not edits to the same message)
 - The content is correct: responses contain the numbers 1 through 10
+
+---
+
+## Extension Guard Tests
+
+These tests verify the extension's self-protection against being loaded
+multiple times in the same pi process. Pi discovers extensions from both
+`~/.pi/agent/extensions/` (global) and `.pi/extensions/` (project-local)
+independently — if the same extension is reachable from both paths (e.g.,
+via symlinks), it gets loaded twice, creating two socket servers and two
+Telegram topics for one session.
+
+The extension uses a `Symbol.for()` guard on `globalThis` to detect and
+skip duplicate loads.
+
+### X01 — Double-load guard prevents duplicate sockets
+
+The extension is discoverable from both global and project-local paths.
+Only one socket should be created.
+
+**Steps:**
+1. Ensure the global extension symlink exists:
+   `~/.pi/agent/extensions/pup -> /root/pup/main/extension`
+2. Create a temp working directory: `WORK=$(mktemp -d)`
+3. Create a project-local extension symlink inside it:
+   `mkdir -p $WORK/.pi/extensions && ln -s /root/pup/main/extension $WORK/.pi/extensions/pup`
+4. Start a pi session in `$WORK`, name it `e2e-x01`
+5. Wait 10s for the extension(s) to initialize
+6. Count `.sock` files in `$PUP_SOCKET_DIR`
+
+**Expected:**
+- Exactly **one** `.sock` file exists in `$PUP_SOCKET_DIR`
+- The second load was skipped (the `Symbol.for("pup-extension-loaded")`
+  guard on `globalThis` prevented it)
+- Pi's stderr/logs contain `[pup] extension already loaded in this
+  process, skipping duplicate`
+- The session works normally — wait for topic, send a message, get a
+  response
+
+**Cleanup:**
+- Exit the pi session
+- Remove the project-local symlink
+
+---
+
+### X02 — Double-load guard allows reload after /new
+
+The `Symbol.for()` guard must not prevent the extension from functioning
+after a `/new` (session reset). Since `/new` does NOT reload extensions
+(same process, same `globalThis`), the guard flag stays set and the
+single instance keeps working.
+
+**Steps:**
+1. Set up both global and project-local symlinks (same as X01)
+2. Start a pi session, name it `e2e-x02`
+3. Wait for topic; note the topic ID
+4. Send a message: `"say BEFORE_RESET_X02"`
+5. Wait for response
+6. Send `/new` in the pi TUI
+7. Wait 10s
+8. Count `.sock` files — should still be 1
+9. Send a message via Telegram: `"say AFTER_RESET_X02"`
+10. Wait for response
+
+**Expected:**
+- Only one socket throughout (the guard flag persists across `/new`)
+- The session responds both before and after `/new`
+- Only one topic exists (same topic ID)
+- No "extension already loaded" message on `/new` (extensions aren't
+  re-initialized on session reset, only on `/reload`)

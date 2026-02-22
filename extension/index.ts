@@ -24,7 +24,16 @@ const SOCKET_CHECK_INTERVAL = 2000;
 // so the daemon keeps the same topic for the lifetime of the process.
 const INSTANCE_ID = crypto.randomUUID();
 
+// Guard against double-loading when the extension is reachable from both
+// ~/.pi/agent/extensions/ and .pi/extensions/ (pi doesn't dedup).
+const PUP_LOADED = Symbol.for("pup-extension-loaded");
+
 export default function (pi: ExtensionAPI) {
+	if ((globalThis as any)[PUP_LOADED]) {
+		console.error("[pup] extension already loaded in this process, skipping duplicate");
+		return;
+	}
+	(globalThis as any)[PUP_LOADED] = true;
 	let server: net.Server | null = null;
 	let clients: Set<net.Socket> = new Set();
 	let socketPath: string | null = null;
