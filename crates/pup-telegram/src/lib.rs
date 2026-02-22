@@ -44,6 +44,35 @@ fn prompt_for_command(cmd: &str) -> Option<&'static str> {
     }
 }
 
+/// Spawn a background typing indicator loop for a session, running until
+/// the returned [`tokio::sync::watch::Sender`] is dropped.  Does nothing
+/// if a loop is already running for the given session.
+fn spawn_typing_loop(
+    pre_turn_typing: &mut HashMap<String, tokio::sync::watch::Sender<bool>>,
+    bot: &BotClient,
+    session_id: &str,
+    chat_id: i64,
+    thread_id: Option<i64>,
+) {
+    if pre_turn_typing.contains_key(session_id) {
+        return;
+    }
+    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    let bot = bot.clone();
+    let sid = session_id.to_owned();
+    tokio::spawn(async move {
+        loop {
+            let _ = bot.send_chat_action(chat_id, "typing", thread_id).await;
+            tokio::select! {
+                () = async { let _ = stop_rx.changed().await; } => break,
+                () = tokio::time::sleep(std::time::Duration::from_secs(4)) => {}
+            }
+        }
+        debug!(session_id = %sid, "pre-turn typing indicator stopped");
+    });
+    pre_turn_typing.insert(session_id.to_owned(), stop_tx);
+}
+
 /// Configuration for the Telegram backend.
 #[derive(Debug, Clone)]
 pub struct TelegramConfig {
@@ -92,6 +121,10 @@ pub struct TelegramBackend {
     pending_prompts: HashMap<String, PendingPrompt>,
     /// Whisper transcriber for voice messages (loaded on start).
     transcriber: Option<Arc<Mutex<whisper::Transcriber>>>,
+    /// Pre-turn typing indicators, keyed by session ID.
+    /// Active from message receipt until AgentStart (where the turn
+    /// tracker starts its own typing loop).
+    pre_turn_typing: HashMap<String, tokio::sync::watch::Sender<bool>>,
 }
 
 impl TelegramBackend {
@@ -129,6 +162,7 @@ impl TelegramBackend {
             dm_chat_id: None,
             pending_prompts: HashMap::new(),
             transcriber: None,
+            pre_turn_typing: HashMap::new(),
         }
     }
 
@@ -155,6 +189,7 @@ impl TelegramBackend {
             dm_chat_id: None,
             pending_prompts: HashMap::new(),
             transcriber: None,
+            pre_turn_typing: HashMap::new(),
         }
     }
 
@@ -279,6 +314,16 @@ impl TelegramBackend {
                         return;
                     }
 
+                    // Start typing immediately so the user sees activity
+                    // while we parse, transcribe, or wait for the agent.
+                    spawn_typing_loop(
+                        &mut self.pre_turn_typing,
+                        &self.bot,
+                        &session_id,
+                        topics.chat_id(),
+                        Some(thread_id),
+                    );
+
                     // If the user sent a non-command and there's a pending
                     // prompt, treat their reply as the argument.
                     if !trimmed.starts_with('/') {
@@ -307,6 +352,7 @@ impl TelegramBackend {
                         };
                         if args.is_empty() {
                             if let Some(question) = prompt_for_command(cmd_name) {
+                                self.pre_turn_typing.remove(&session_id);
                                 self.pending_prompts.insert(
                                     session_id.clone(),
                                     PendingPrompt { command: cmd_name.to_owned() },
@@ -449,6 +495,15 @@ impl TelegramBackend {
             }
             DmCommand::Message { text, mode } => {
                 if let Some(sid) = self.dm.attached.clone() {
+                    // Start typing immediately.
+                    spawn_typing_loop(
+                        &mut self.pre_turn_typing,
+                        &self.bot,
+                        &sid,
+                        chat_id,
+                        None,
+                    );
+
                     // Check for pending prompt completion.
                     if !text.starts_with('/') {
                         if let Some(prompt) = self.pending_prompts.remove(&sid) {
@@ -473,6 +528,7 @@ impl TelegramBackend {
                         };
                         if args.is_empty() {
                             if let Some(question) = prompt_for_command(cmd_name) {
+                                self.pre_turn_typing.remove(&sid);
                                 self.pending_prompts.insert(
                                     sid,
                                     PendingPrompt { command: cmd_name.to_owned() },
@@ -511,19 +567,22 @@ impl TelegramBackend {
         if let Some(ref topics) = self.topics {
             if let Some(thread_id) = topics.thread_for_session(session_id) {
                 debug!(session_id, "auto-creating turn state (missed AgentStart)");
+                let existing = self.pre_turn_typing.remove(session_id);
                 self.turn_tracker.start_turn(
                     session_id,
                     topics.chat_id(),
                     Some(thread_id),
                     &self.bot,
+                    existing,
                 );
             }
         } else if self.dm.attached.as_deref() == Some(session_id)
             && let Some(chat_id) = self.dm_chat_id
         {
             debug!(session_id, "auto-creating turn state for DM (missed AgentStart)");
+            let existing = self.pre_turn_typing.remove(session_id);
             self.turn_tracker
-                .start_turn(session_id, chat_id, None, &self.bot);
+                .start_turn(session_id, chat_id, None, &self.bot, existing);
         }
     }
 
@@ -574,6 +633,15 @@ impl TelegramBackend {
             return;
         };
 
+        // Start typing immediately — covers download + transcription time.
+        spawn_typing_loop(
+            &mut self.pre_turn_typing,
+            &self.bot,
+            &session_id,
+            chat_id,
+            thread_id,
+        );
+
         // Macro-like helper: reply to the right place.
         macro_rules! reply {
             ($text:expr) => {
@@ -586,6 +654,7 @@ impl TelegramBackend {
         }
 
         if self.transcriber.is_none() {
+            self.pre_turn_typing.remove(&session_id);
             reply!("⚠️ Voice messages are not supported. \
                     Set <code>voice = true</code> under <code>[backends.telegram]</code> in your pup config to enable transcription.");
             return;
@@ -602,6 +671,7 @@ impl TelegramBackend {
             Ok(data) => data,
             Err(e) => {
                 warn!(error = %e, "failed to download voice message");
+                self.pre_turn_typing.remove(&session_id);
                 reply!(&format!(
                     "⚠️ Failed to download voice message: <code>{}</code>",
                     escape_html(&e.to_string()),
@@ -613,12 +683,14 @@ impl TelegramBackend {
         // Convert OGG/Opus → 16 kHz PCM and transcribe.
         let text = match self.transcribe_audio(ogg_data).await {
             Ok(t) if t.is_empty() => {
+                self.pre_turn_typing.remove(&session_id);
                 reply!("⚠️ Could not recognise any speech in this voice message.");
                 return;
             }
             Ok(t) => t,
             Err(e) => {
                 warn!(error = %e, "voice transcription failed");
+                self.pre_turn_typing.remove(&session_id);
                 reply!(&format!(
                     "⚠️ Voice transcription failed: <code>{}</code>",
                     escape_html(&e.to_string()),
@@ -942,6 +1014,8 @@ impl ChatBackend for TelegramBackend {
                 }
             }
             SessionEvent::Disconnected { ref session_id } => {
+                self.pre_turn_typing.remove(session_id);
+
                 // Grab the cwd before removing from our session list.
                 let cwd = self
                     .sessions
@@ -988,6 +1062,7 @@ impl ChatBackend for TelegramBackend {
             }
             SessionEvent::SessionReset { ref session_id } => {
                 info!(session_id, "session reset");
+                self.pre_turn_typing.remove(session_id);
                 self.pending_prompts.remove(session_id.as_str());
                 // End any in-progress turn cleanly.
                 self.outbox.clear_edit_cooldown();
@@ -1003,9 +1078,14 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::AgentStart { ref session_id } => {
                 debug!(session_id, "agent started");
 
+                // Transfer the pre-turn typing loop (if any) to the turn
+                // tracker so it keeps running seamlessly.  If there is no
+                // pre-turn loop (e.g. the turn was triggered from the TUI),
+                // the tracker spawns a fresh one.
+                let existing_typing = self.pre_turn_typing.remove(session_id);
+
                 // Start a new turn — the tracker will send the first
                 // Telegram message lazily on the first tool/delta event.
-                // Also starts a typing indicator loop in the background.
                 if let Some(ref topics) = self.topics {
                     if let Some(thread_id) = topics.thread_for_session(session_id) {
                         self.turn_tracker.start_turn(
@@ -1013,17 +1093,19 @@ impl ChatBackend for TelegramBackend {
                             topics.chat_id(),
                             Some(thread_id),
                             &self.bot,
+                            existing_typing,
                         );
                     }
                 } else if self.dm.attached.as_deref() == Some(session_id.as_str())
                     && let Some(chat_id) = self.dm_chat_id
                 {
                     self.turn_tracker
-                        .start_turn(session_id, chat_id, None, &self.bot);
+                        .start_turn(session_id, chat_id, None, &self.bot, existing_typing);
                 }
             }
             SessionEvent::AgentEnd { ref session_id } => {
                 debug!(session_id, "agent ended");
+                self.pre_turn_typing.remove(session_id);
                 self.ensure_turn(session_id);
                 // Clear edit cooldowns so the final edit (removing the cancel
                 // keyboard) goes through even if a recent content edit just ran.

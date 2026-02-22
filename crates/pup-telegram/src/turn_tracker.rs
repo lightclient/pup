@@ -182,30 +182,38 @@ impl TurnTracker {
 
     /// Start tracking a new agent turn.
     ///
-    /// Spawns a background typing indicator loop that keeps the "typing…"
-    /// status alive in Telegram until the turn ends. Does NOT send a
-    /// content message yet — that happens on the first tool/delta event.
+    /// If `existing_typing` is provided (e.g. a pre-turn typing loop that
+    /// was already running), it is reused instead of spawning a new one.
+    /// Otherwise a fresh background typing indicator loop is spawned.
+    /// Does NOT send a content message yet — that happens on the first
+    /// tool/delta event.
     pub fn start_turn(
         &mut self,
         session_id: &str,
         chat_id: i64,
         thread_id: Option<i64>,
         bot: &BotClient,
+        existing_typing: Option<tokio::sync::watch::Sender<bool>>,
     ) {
-        // Spawn typing indicator loop. Dropping the tx end stops it.
-        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-        let bot = bot.clone();
-        tokio::spawn(async move {
-            loop {
-                if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
-                    debug!(error = %e, "typing indicator failed");
+        let stop_tx = if let Some(tx) = existing_typing {
+            tx
+        } else {
+            // Spawn typing indicator loop. Dropping the tx end stops it.
+            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+            let bot = bot.clone();
+            tokio::spawn(async move {
+                loop {
+                    if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
+                        debug!(error = %e, "typing indicator failed");
+                    }
+                    tokio::select! {
+                        _ = stop_rx.changed() => break,
+                        _ = tokio::time::sleep(Duration::from_secs(4)) => {}
+                    }
                 }
-                tokio::select! {
-                    _ = stop_rx.changed() => break,
-                    _ = tokio::time::sleep(Duration::from_secs(4)) => {}
-                }
-            }
-        });
+            });
+            stop_tx
+        };
 
         self.turns.insert(
             session_id.to_owned(),
