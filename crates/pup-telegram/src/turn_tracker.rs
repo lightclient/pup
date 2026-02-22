@@ -283,8 +283,10 @@ pub struct TurnTracker {
     turns: HashMap<String, TurnState>,
     /// Minimum interval between edits.
     edit_interval_ms: u64,
-    /// Whether to show tool call details.
-    verbose: bool,
+    /// Default verbose for sessions without an explicit override.
+    default_verbose: bool,
+    /// Per-session verbose overrides (persists across turns).
+    session_verbose: HashMap<String, bool>,
     /// How many tool calls to keep in the rendered message.
     tool_call_limit: ToolCallLimit,
     /// How many lines of tool output to show per tool call.
@@ -296,7 +298,8 @@ impl TurnTracker {
         Self {
             turns: HashMap::new(),
             edit_interval_ms,
-            verbose: false,
+            default_verbose: false,
+            session_verbose: HashMap::new(),
             tool_call_limit: ToolCallLimit::default(),
             tool_output_lines: ToolOutputLines::default(),
         }
@@ -318,15 +321,30 @@ impl TurnTracker {
         }
     }
 
-    /// Enable or disable verbose mode (tool call visibility).
+    /// Set the default verbose mode for sessions without an explicit override.
+    pub fn set_default_verbose(&mut self, verbose: bool) {
+        self.default_verbose = verbose;
+    }
+
+    /// Enable or disable verbose mode for a specific session.
     ///
-    /// Updates the tracker default AND all currently active turns so the
-    /// change takes effect immediately — not just on the next turn.
-    pub fn set_verbose(&mut self, verbose: bool) {
-        self.verbose = verbose;
-        for state in self.turns.values_mut() {
+    /// Persists across turns so the setting sticks until changed again.
+    /// Also updates the currently active turn (if any) so the change
+    /// takes effect immediately.
+    pub fn set_verbose(&mut self, session_id: &str, verbose: bool) {
+        self.session_verbose
+            .insert(session_id.to_owned(), verbose);
+        if let Some(state) = self.turns.get_mut(session_id) {
             state.verbose = verbose;
         }
+    }
+
+    /// Get the effective verbose setting for a session.
+    pub fn is_verbose(&self, session_id: &str) -> bool {
+        self.session_verbose
+            .get(session_id)
+            .copied()
+            .unwrap_or(self.default_verbose)
     }
 
     /// Check if a turn is being tracked for the given session.
@@ -384,7 +402,7 @@ impl TurnTracker {
                 last_edit: Instant::now(),
                 dirty: false,
                 typing_stop: Some(stop_tx),
-                verbose: self.verbose,
+                verbose: self.is_verbose(session_id),
                 tool_call_limit: self.tool_call_limit,
                 tool_output_lines: self.tool_output_lines,
                 tools: Vec::new(),

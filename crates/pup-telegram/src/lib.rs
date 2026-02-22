@@ -164,7 +164,7 @@ impl TelegramBackend {
         let bot = BotClient::new(&config.bot_token);
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
-        turn_tracker.set_verbose(config.verbose);
+        turn_tracker.set_default_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
         turn_tracker.set_tool_output_lines(config.tool_output_lines);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
@@ -206,7 +206,7 @@ impl TelegramBackend {
     fn with_bot(config: TelegramConfig, bot: BotClient) -> Self {
         let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
-        turn_tracker.set_verbose(config.verbose);
+        turn_tracker.set_default_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
         turn_tracker.set_tool_output_lines(config.tool_output_lines);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
@@ -414,7 +414,7 @@ impl TelegramBackend {
                             });
                 } else {
                     let on = matches!(args, "on" | "true" | "1" | "yes");
-                    self.turn_tracker.set_verbose(on);
+                    self.turn_tracker.set_verbose(&session_id, on);
                     let label = if on { "on" } else { "off" };
                     self.outbox.enqueue(OutboxOp::Send {
                         chat_id: topics.chat_id(),
@@ -449,7 +449,7 @@ impl TelegramBackend {
                     self.pre_turn_typing.remove(&session_id);
                     if prompt.command.as_str() == "verbose" {
                         let on = matches!(trimmed, "on" | "true" | "1" | "yes");
-                        self.turn_tracker.set_verbose(on);
+                        self.turn_tracker.set_verbose(&session_id, on);
                         let label = if on { "on" } else { "off" };
                         self.outbox.enqueue(OutboxOp::Send {
                             chat_id: topics.chat_id(),
@@ -629,20 +629,24 @@ impl TelegramBackend {
                 }
             }
             DmCommand::Verbose { toggle } => {
-                if let Some(on) = toggle {
-                    self.turn_tracker.set_verbose(on);
-                    let label = if on { "on" } else { "off" };
-                    self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                if let Some(ref sid) = self.dm.attached {
+                    if let Some(on) = toggle {
+                        self.turn_tracker.set_verbose(sid, on);
+                        let label = if on { "on" } else { "off" };
+                        self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                    } else {
+                        // No argument — interactive prompt.
+                        self.pending_dm_prompt = Some(PendingPrompt {
+                            command: "verbose".to_owned(),
+                            local: true,
+                        });
+                        self.send_dm(
+                            chat_id,
+                            "<i>Verbose mode shows thinking and tool calls while the agent works.\n\nReply <b>on</b> or <b>off</b>.</i>",
+                        );
+                    }
                 } else {
-                    // No argument — interactive prompt.
-                    self.pending_dm_prompt = Some(PendingPrompt {
-                        command: "verbose".to_owned(),
-                        local: true,
-                    });
-                    self.send_dm(
-                        chat_id,
-                        "<i>Verbose mode shows thinking and tool calls while the agent works.\n\nReply <b>on</b> or <b>off</b>.</i>",
-                    );
+                    self.send_dm(chat_id, "Not attached to any session.");
                 }
             }
             DmCommand::Help => {
@@ -654,10 +658,14 @@ impl TelegramBackend {
                     && let Some(prompt) = self.pending_dm_prompt.take()
                 {
                     if prompt.command.as_str() == "verbose" {
-                        let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                        self.turn_tracker.set_verbose(on);
-                        let label = if on { "on" } else { "off" };
-                        self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                        if let Some(ref sid) = self.dm.attached {
+                            let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                            self.turn_tracker.set_verbose(sid, on);
+                            let label = if on { "on" } else { "off" };
+                            self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                        } else {
+                            self.send_dm(chat_id, "Not attached to any session.");
+                        }
                     }
                     return;
                 }
@@ -674,7 +682,7 @@ impl TelegramBackend {
                             self.pre_turn_typing.remove(&sid);
                             if prompt.command.as_str() == "verbose" {
                                 let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                                self.turn_tracker.set_verbose(on);
+                                self.turn_tracker.set_verbose(&sid, on);
                                 let label = if on { "on" } else { "off" };
                                 self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
                             }
