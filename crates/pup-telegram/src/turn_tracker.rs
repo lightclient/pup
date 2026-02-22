@@ -6,7 +6,7 @@ use tracing::debug;
 use crate::bot::BotClient;
 use crate::outbox::{Outbox, OutboxOp};
 use crate::render::{
-    cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html, MAX_BODY_CHARS,
+    MAX_BODY_CHARS, cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html,
 };
 
 /// How many recent tool calls to keep in the rendered message.
@@ -578,7 +578,11 @@ impl TurnTracker {
             // thinking), ensure a Telegram message is created with the final content.
             if !content.is_empty() {
                 let html = to_telegram_html(content);
-                let initial = if html.is_empty() { "…".to_owned() } else { html };
+                let initial = if html.is_empty() {
+                    "…".to_owned()
+                } else {
+                    html
+                };
                 self.ensure_message(session_id, &initial, outbox);
             }
         }
@@ -616,7 +620,8 @@ impl TurnTracker {
         // Resolve message ID if still pending.
         state.try_resolve_message_id();
 
-        let has_verbose_content = state.verbose && (!state.tools.is_empty() || !state.thinking_text.is_empty());
+        let has_verbose_content =
+            state.verbose && (!state.tools.is_empty() || !state.thinking_text.is_empty());
         let has_text = !state.streaming_text.is_empty();
 
         if let Some(tg_msg_id) = state.telegram_message_id {
@@ -756,10 +761,7 @@ mod tests {
     fn truncate_one_over_limit() {
         let input = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk";
         let result = truncate_tool_output(input, ToolOutputLines::First(10));
-        assert_eq!(
-            result,
-            "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n. . . (1 more lines)"
-        );
+        assert_eq!(result, "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n. . . (1 more lines)");
     }
 
     #[test]
@@ -777,10 +779,7 @@ mod tests {
 
     #[test]
     fn truncate_limit_zero_empty() {
-        assert_eq!(
-            truncate_tool_output("", ToolOutputLines::First(0)),
-            ""
-        );
+        assert_eq!(truncate_tool_output("", ToolOutputLines::First(0)), "");
     }
 
     #[test]

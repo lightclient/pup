@@ -179,7 +179,12 @@ pub fn to_telegram_html(input: &str) -> String {
                         }
                         url.push(c);
                     }
-                    let _ = write!(out, "<a href=\"{}\">{}</a>", escape_html(&url), escape_html(&text));
+                    let _ = write!(
+                        out,
+                        "<a href=\"{}\">{}</a>",
+                        escape_html(&url),
+                        escape_html(&text)
+                    );
                 } else {
                     out.push('[');
                     out.push_str(&escape_html(&text));
@@ -224,7 +229,12 @@ pub fn format_user_message(content: &str) -> String {
 }
 
 /// Format a tool call for verbose mode.
-pub fn format_tool_call(tool_name: &str, args: &serde_json::Value, content: &str, _is_error: bool) -> String {
+pub fn format_tool_call(
+    tool_name: &str,
+    args: &serde_json::Value,
+    content: &str,
+    _is_error: bool,
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
 
@@ -345,11 +355,7 @@ pub fn format_history(turns: &[pup_ipc::Turn], max_turns: usize) -> Vec<String> 
         }
 
         if !parts.is_empty() {
-            let label = format!(
-                "<i>— turn {}/{} —</i>\n",
-                start + i + 1,
-                turns.len()
-            );
+            let label = format!("<i>— turn {}/{} —</i>\n", start + i + 1, turns.len());
             msgs.push(format!("{label}{}", parts.join("\n\n")));
         }
     }

@@ -269,14 +269,11 @@ impl Config {
         }
 
         debug!(path = %config_path.display(), "loading config");
-        let content =
-            std::fs::read_to_string(&config_path).with_context(|| {
-                format!("failed to read {}", config_path.display())
-            })?;
+        let content = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
 
-        let config: Self = toml::from_str(&content).with_context(|| {
-            format!("failed to parse {}", config_path.display())
-        })?;
+        let config: Self = toml::from_str(&content)
+            .with_context(|| format!("failed to parse {}", config_path.display()))?;
 
         Ok(config)
     }
@@ -298,7 +295,8 @@ impl Config {
         let supergroup_id = tg.topics.as_ref().and_then(|t| t.supergroup_id);
         let topic_icon = tg
             .topics
-            .as_ref().map_or_else(default_topic_icon, |t| t.topic_icon.clone());
+            .as_ref()
+            .map_or_else(default_topic_icon, |t| t.topic_icon.clone());
         let max_message_length = tg
             .display
             .as_ref()
@@ -313,7 +311,9 @@ impl Config {
 
         let tool_output_lines = match &self.display.tool_output_lines {
             ToolOutputLinesValue::All => pup_telegram::turn_tracker::ToolOutputLines::All,
-            ToolOutputLinesValue::First(n) => pup_telegram::turn_tracker::ToolOutputLines::First(*n),
+            ToolOutputLinesValue::First(n) => {
+                pup_telegram::turn_tracker::ToolOutputLines::First(*n)
+            }
         };
 
         Some(pup_telegram::TelegramConfig {
@@ -347,9 +347,10 @@ pub(crate) fn default_config_path() -> Result<PathBuf> {
 /// Expand `~` in a path string to the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir() {
-            return home.join(rest);
-        }
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
     PathBuf::from(path)
 }
 
@@ -444,7 +445,10 @@ allowed_user_ids = [12345678]
         let config: Config = toml::from_str(toml).expect("parse");
         assert!(matches!(config.display.tool_calls, ToolCallsValue::Last(5)));
         let tg = config.telegram_config().expect("telegram config");
-        assert_eq!(tg.tool_call_limit, pup_telegram::turn_tracker::ToolCallLimit::Last(5));
+        assert_eq!(
+            tg.tool_call_limit,
+            pup_telegram::turn_tracker::ToolCallLimit::Last(5)
+        );
     }
 
     #[test]
@@ -461,7 +465,10 @@ allowed_user_ids = [12345678]
         let config: Config = toml::from_str(toml).expect("parse");
         assert!(matches!(config.display.tool_calls, ToolCallsValue::All));
         let tg = config.telegram_config().expect("telegram config");
-        assert_eq!(tg.tool_call_limit, pup_telegram::turn_tracker::ToolCallLimit::All);
+        assert_eq!(
+            tg.tool_call_limit,
+            pup_telegram::turn_tracker::ToolCallLimit::All
+        );
     }
 
     #[test]

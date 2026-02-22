@@ -29,8 +29,7 @@ pub(crate) async fn run_setup() -> Result<()> {
     println!("── Telegram ──\n");
 
     // Bot token
-    let bot_token =
-        prompt("1. Create a bot via @BotFather and paste the token.\n   Bot token: ")?;
+    let bot_token = prompt("1. Create a bot via @BotFather and paste the token.\n   Bot token: ")?;
 
     if bot_token.is_empty() {
         anyhow::bail!("Bot token is required.");
@@ -51,8 +50,7 @@ pub(crate) async fn run_setup() -> Result<()> {
     }
 
     // User ID
-    let user_id_str =
-        prompt("2. Get your Telegram user ID from @userinfobot.\n   User ID: ")?;
+    let user_id_str = prompt("2. Get your Telegram user ID from @userinfobot.\n   User ID: ")?;
     let user_id: i64 = user_id_str
         .parse()
         .context("Invalid user ID — must be a number")?;
@@ -68,11 +66,7 @@ pub(crate) async fn run_setup() -> Result<()> {
         // Drain any old updates so we only see fresh ones.
         let _ = bot.get_updates(0, 0).await;
         let drain = bot.get_updates(0, 0).await.unwrap_or_default();
-        let mut offset: i64 = drain
-            .iter()
-            .map(|u| u.update_id + 1)
-            .max()
-            .unwrap_or(0);
+        let mut offset: i64 = drain.iter().map(|u| u.update_id + 1).max().unwrap_or(0);
 
         println!("   Add the bot to your supergroup as an admin (with Manage Topics),");
         println!("   then send any message in the group. Waiting...");
@@ -85,9 +79,10 @@ pub(crate) async fn run_setup() -> Result<()> {
                     offset = update.update_id + 1;
                 }
                 if let Some(ref msg) = update.message
-                    && msg.chat.chat_type == "supergroup" {
-                        break; // not the outer loop — handled below
-                    }
+                    && msg.chat.chat_type == "supergroup"
+                {
+                    break; // not the outer loop — handled below
+                }
             }
             // Check if any update contained a supergroup message.
             if let Some(sg) = updates.iter().find_map(|u| {
@@ -124,9 +119,7 @@ pub(crate) async fn run_setup() -> Result<()> {
     // ── Generate config ─────────────────────────────────────────
 
     let config_path = default_config_path()?;
-    let config_dir = config_path
-        .parent()
-        .context("config path has no parent")?;
+    let config_dir = config_path.parent().context("config path has no parent")?;
 
     std::fs::create_dir_all(config_dir)?;
 
@@ -162,8 +155,7 @@ pub(crate) async fn run_setup() -> Result<()> {
 
 /// Write config file with 0600 permissions.
 fn write_config_file(path: &Path, content: &str) -> Result<()> {
-    std::fs::write(path, content)
-        .with_context(|| format!("failed to write {}", path.display()))?;
+    std::fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
 
     #[cfg(unix)]
     {

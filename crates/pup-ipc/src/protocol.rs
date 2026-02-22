@@ -74,25 +74,68 @@ pub enum IpcEvent {
     History(HistoryData),
     AgentStart,
     AgentEnd,
-    TurnStart { turn_index: u64 },
-    TurnEnd { turn_index: u64 },
-    MessageStart { role: String, message_id: String },
-    MessageDelta { message_id: String, text: String },
-    ThinkingDelta { message_id: String, text: String },
-    MessageEnd { message_id: String, role: String, content: String },
-    ToolStart { tool_call_id: String, tool_name: String, args: serde_json::Value },
-    ToolUpdate { tool_call_id: String, tool_name: String, content: String },
-    ToolEnd { tool_call_id: String, tool_name: String, content: String, is_error: bool },
-    SessionNameChanged { name: String },
-    ModelChanged { model: String },
-    UserMessage { content: String, source: String, echo: bool },
+    TurnStart {
+        turn_index: u64,
+    },
+    TurnEnd {
+        turn_index: u64,
+    },
+    MessageStart {
+        role: String,
+        message_id: String,
+    },
+    MessageDelta {
+        message_id: String,
+        text: String,
+    },
+    ThinkingDelta {
+        message_id: String,
+        text: String,
+    },
+    MessageEnd {
+        message_id: String,
+        role: String,
+        content: String,
+    },
+    ToolStart {
+        tool_call_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+    },
+    ToolUpdate {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
+    ToolEnd {
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+        is_error: bool,
+    },
+    SessionNameChanged {
+        name: String,
+    },
+    ModelChanged {
+        model: String,
+    },
+    UserMessage {
+        content: String,
+        source: String,
+        echo: bool,
+    },
     SessionEnd,
     /// The pi session was reset (/new or /compact). Same process, new conversation.
     SessionReset,
     /// A notification from the extension (command errors, status messages, etc).
-    Notification { text: String },
+    Notification {
+        text: String,
+    },
     /// An event type we don't specifically handle.
-    Unknown { event: String, data: serde_json::Value },
+    Unknown {
+        event: String,
+        data: serde_json::Value,
+    },
 }
 
 /// Data sent in the `hello` event on connection.

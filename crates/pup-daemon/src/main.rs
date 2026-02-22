@@ -42,8 +42,8 @@ async fn main() -> Result<()> {
     let _tracing_guard = tracing_setup::init()?;
 
     // Load config.
-    let config = config::Config::load(cli.config.as_deref())
-        .context("failed to load configuration")?;
+    let config =
+        config::Config::load(cli.config.as_deref()).context("failed to load configuration")?;
 
     let socket_dir = config.socket_dir();
     info!(

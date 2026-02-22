@@ -1,4 +1,4 @@
-use pup_ipc::{Turn, SendMode};
+use pup_ipc::{SendMode, Turn};
 use serde::{Deserialize, Serialize};
 
 /// Events the session manager pushes to backends.
@@ -70,10 +70,7 @@ pub enum SessionEvent {
         source: MessageSource,
     },
     /// A notification from the extension (command errors, status messages, etc).
-    Notification {
-        session_id: String,
-        text: String,
-    },
+    Notification { session_id: String, text: String },
 }
 
 /// Where a user message originated.
@@ -123,7 +120,10 @@ pub struct IncomingMessage {
 #[derive(Debug, Clone)]
 pub enum DiscoveryEvent {
     /// A new socket was found.
-    SocketAppeared { session_id: String, path: std::path::PathBuf },
+    SocketAppeared {
+        session_id: String,
+        path: std::path::PathBuf,
+    },
     /// A socket was removed.
     SocketRemoved { session_id: String },
 }

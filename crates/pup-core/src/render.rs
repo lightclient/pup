@@ -154,21 +154,24 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
 
     // Try to break at paragraph boundary
     if let Some(pos) = truncated.rfind("\n\n")
-        && pos > max_chars / 2 {
-            return format!("{}…", &truncated[..pos]);
-        }
+        && pos > max_chars / 2
+    {
+        return format!("{}…", &truncated[..pos]);
+    }
 
     // Try to break at line boundary
     if let Some(pos) = truncated.rfind('\n')
-        && pos > max_chars / 2 {
-            return format!("{}…", &truncated[..pos]);
-        }
+        && pos > max_chars / 2
+    {
+        return format!("{}…", &truncated[..pos]);
+    }
 
     // Break at word boundary
     if let Some(pos) = truncated.rfind(' ')
-        && pos > max_chars / 2 {
-            return format!("{}…", &truncated[..pos]);
-        }
+        && pos > max_chars / 2
+    {
+        return format!("{}…", &truncated[..pos]);
+    }
 
     format!("{truncated}…")
 }

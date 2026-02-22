@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tracing::{debug, debug_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, warn};
 
 use crate::bot::{BotClient, SentMessage};
 
@@ -225,9 +225,7 @@ impl EditMap {
             };
 
             // Per-message cooldown.
-            let cooldown_blocked = last_edit
-                .get(&key)
-                .is_some_and(|t| t.elapsed() < cooldown);
+            let cooldown_blocked = last_edit.get(&key).is_some_and(|t| t.elapsed() < cooldown);
             if cooldown_blocked {
                 self.order.push_back(key);
                 continue;
@@ -279,7 +277,12 @@ impl Outbox {
 
     /// Enqueue an operation.
     pub fn enqueue(&mut self, op: OutboxOp) {
-        if let OutboxOp::Edit { chat_id, message_id, .. } = &op {
+        if let OutboxOp::Edit {
+            chat_id,
+            message_id,
+            ..
+        } = &op
+        {
             // Coalesce: only keep the latest edit per message.
             self.pending_edits.upsert((*chat_id, *message_id), op);
         } else {
@@ -332,7 +335,12 @@ impl Outbox {
         if let Some(last) = self.last_send {
             let elapsed = last.elapsed();
             if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval.checked_sub(elapsed).expect("elapsed < min_interval")).await;
+                tokio::time::sleep(
+                    self.min_interval
+                        .checked_sub(elapsed)
+                        .expect("elapsed < min_interval"),
+                )
+                .await;
             }
         }
 
@@ -484,27 +492,36 @@ mod tests {
         let mut map = EditMap::default();
         let key = (100, 200);
 
-        map.upsert(key, OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 200,
-            text: "first".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
-        map.upsert(key, OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 200,
-            text: "second".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
-        map.upsert(key, OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 200,
-            text: "third".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
+        map.upsert(
+            key,
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 200,
+                text: "first".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
+        map.upsert(
+            key,
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 200,
+                text: "second".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
+        map.upsert(
+            key,
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 200,
+                text: "third".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
 
         // Should only have 1 entry.
         assert_eq!(map.len(), 1);
@@ -512,7 +529,9 @@ mod tests {
         // Pop should return the latest content.
         let empty_cooldown = HashMap::new();
         let mut empty_buckets = HashMap::new();
-        let op = map.pop_eligible(&empty_cooldown, Duration::ZERO, &mut empty_buckets).unwrap();
+        let op = map
+            .pop_eligible(&empty_cooldown, Duration::ZERO, &mut empty_buckets)
+            .unwrap();
         if let OutboxOp::Edit { text, .. } = op {
             assert_eq!(text, "third");
         } else {
@@ -527,43 +546,62 @@ mod tests {
     fn test_edit_coalescing_different_messages() {
         let mut map = EditMap::default();
 
-        map.upsert((100, 1), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 1,
-            text: "msg1-v2".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
-        map.upsert((100, 1), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 1,
-            text: "msg1-v3".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
-        map.upsert((100, 2), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 2,
-            text: "msg2-v1".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
+        map.upsert(
+            (100, 1),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 1,
+                text: "msg1-v2".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
+        map.upsert(
+            (100, 1),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 1,
+                text: "msg1-v3".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
+        map.upsert(
+            (100, 2),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 2,
+                text: "msg2-v1".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
 
         assert_eq!(map.len(), 2);
 
         // FIFO order: msg 1 first, then msg 2.
         let empty = HashMap::new();
         let mut buckets = HashMap::new();
-        let op1 = map.pop_eligible(&empty, Duration::ZERO, &mut buckets).unwrap();
-        if let OutboxOp::Edit { message_id, text, .. } = op1 {
+        let op1 = map
+            .pop_eligible(&empty, Duration::ZERO, &mut buckets)
+            .unwrap();
+        if let OutboxOp::Edit {
+            message_id, text, ..
+        } = op1
+        {
             assert_eq!(message_id, 1);
             assert_eq!(text, "msg1-v3");
         } else {
             panic!("expected Edit");
         }
 
-        let op2 = map.pop_eligible(&empty, Duration::ZERO, &mut buckets).unwrap();
-        if let OutboxOp::Edit { message_id, text, .. } = op2 {
+        let op2 = map
+            .pop_eligible(&empty, Duration::ZERO, &mut buckets)
+            .unwrap();
+        if let OutboxOp::Edit {
+            message_id, text, ..
+        } = op2
+        {
             assert_eq!(message_id, 2);
             assert_eq!(text, "msg2-v1");
         } else {
@@ -577,28 +615,39 @@ mod tests {
     #[test]
     fn test_edit_cooldown_skip() {
         let mut map = EditMap::default();
-        map.upsert((100, 1), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 1,
-            text: "blocked".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
-        map.upsert((100, 2), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 2,
-            text: "ok".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
+        map.upsert(
+            (100, 1),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 1,
+                text: "blocked".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
+        map.upsert(
+            (100, 2),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 2,
+                text: "ok".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
 
         // Message 1 was edited recently, message 2 was not.
         let mut last_edit = HashMap::new();
         last_edit.insert((100_i64, 1_i64), Instant::now());
 
         let mut buckets = HashMap::new();
-        let op = map.pop_eligible(&last_edit, Duration::from_secs(10), &mut buckets).unwrap();
-        if let OutboxOp::Edit { message_id, text, .. } = op {
+        let op = map
+            .pop_eligible(&last_edit, Duration::from_secs(10), &mut buckets)
+            .unwrap();
+        if let OutboxOp::Edit {
+            message_id, text, ..
+        } = op
+        {
             assert_eq!(message_id, 2);
             assert_eq!(text, "ok");
         } else {
@@ -643,21 +692,27 @@ mod tests {
     fn test_edit_budget_skip_across_chats() {
         let mut map = EditMap::default();
         // Chat 100: will be over budget.
-        map.upsert((100, 1), OutboxOp::Edit {
-            chat_id: 100,
-            message_id: 1,
-            text: "chat100".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
+        map.upsert(
+            (100, 1),
+            OutboxOp::Edit {
+                chat_id: 100,
+                message_id: 1,
+                text: "chat100".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
         // Chat 200: has budget.
-        map.upsert((200, 1), OutboxOp::Edit {
-            chat_id: 200,
-            message_id: 1,
-            text: "chat200".to_owned(),
-            parse_mode: None,
-            reply_markup: None,
-        });
+        map.upsert(
+            (200, 1),
+            OutboxOp::Edit {
+                chat_id: 200,
+                message_id: 1,
+                text: "chat200".to_owned(),
+                parse_mode: None,
+                reply_markup: None,
+            },
+        );
 
         let empty_cooldown = HashMap::new();
         let mut buckets = HashMap::new();
@@ -667,7 +722,9 @@ mod tests {
         buckets.insert(100_i64, b100);
 
         // Should skip chat 100 and return chat 200's edit.
-        let op = map.pop_eligible(&empty_cooldown, Duration::ZERO, &mut buckets).unwrap();
+        let op = map
+            .pop_eligible(&empty_cooldown, Duration::ZERO, &mut buckets)
+            .unwrap();
         assert_eq!(op.chat_id(), 200);
 
         // Chat 100's edit is still pending.

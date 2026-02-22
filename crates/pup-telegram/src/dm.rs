@@ -17,13 +17,20 @@ pub struct DmState {
 #[derive(Debug)]
 pub enum DmCommand {
     List,
-    Attach { reference: String },
+    Attach {
+        reference: String,
+    },
     Detach,
     Cancel,
-    Verbose { toggle: Option<bool> },
+    Verbose {
+        toggle: Option<bool>,
+    },
     Help,
     /// Not a command — a plain message to forward to the attached session.
-    Message { text: String, mode: SendMode },
+    Message {
+        text: String,
+        mode: SendMode,
+    },
 }
 
 /// Parse a DM text into a command or message.
@@ -89,13 +96,15 @@ impl DmState {
     ) -> ResolveResult<'a> {
         // Try index first.
         if let Ok(idx) = reference.parse::<usize>()
-            && idx >= 1 && idx <= self.last_list.len() {
-                let target_id = &self.last_list[idx - 1].session_id;
-                if let Some(session) = sessions.iter().find(|s| s.session_id == *target_id) {
-                    return ResolveResult::Found(session);
-                }
-                return ResolveResult::NotFound;
+            && idx >= 1
+            && idx <= self.last_list.len()
+        {
+            let target_id = &self.last_list[idx - 1].session_id;
+            if let Some(session) = sessions.iter().find(|s| s.session_id == *target_id) {
+                return ResolveResult::Found(session);
             }
+            return ResolveResult::NotFound;
+        }
 
         // Try name match.
         let by_name: Vec<&SessionInfo> = sessions
@@ -140,11 +149,7 @@ impl DmState {
                 .session_name
                 .as_deref()
                 .unwrap_or_else(|| &session.session_id[..8.min(session.session_id.len())]);
-            let cwd_short = session
-                .cwd
-                .rsplit('/')
-                .next()
-                .unwrap_or(&session.cwd);
+            let cwd_short = session.cwd.rsplit('/').next().unwrap_or(&session.cwd);
 
             let _ = write!(
                 out,
@@ -261,10 +266,19 @@ mod tests {
     fn test_parse_commands_with_bot_suffix() {
         // Telegram appends @botname when user picks from autocomplete in groups.
         assert!(matches!(parse_command("/ls@my_pup_bot"), DmCommand::List));
-        assert!(matches!(parse_command("/cancel@my_pup_bot"), DmCommand::Cancel));
-        assert!(matches!(parse_command("/detach@my_pup_bot"), DmCommand::Detach));
+        assert!(matches!(
+            parse_command("/cancel@my_pup_bot"),
+            DmCommand::Cancel
+        ));
+        assert!(matches!(
+            parse_command("/detach@my_pup_bot"),
+            DmCommand::Detach
+        ));
         assert!(matches!(parse_command("/help@my_pup_bot"), DmCommand::Help));
-        assert!(matches!(parse_command("/start@my_pup_bot"), DmCommand::Help));
+        assert!(matches!(
+            parse_command("/start@my_pup_bot"),
+            DmCommand::Help
+        ));
         match parse_command("/verbose@my_pup_bot on") {
             DmCommand::Verbose { toggle } => assert_eq!(toggle, Some(true)),
             _ => panic!("expected Verbose"),

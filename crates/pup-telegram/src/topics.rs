@@ -177,10 +177,7 @@ impl TopicsManager {
         // Fall back to old format: bare {"session_id": thread_id, ...}
         if let Ok(old) = serde_json::from_str::<HashMap<String, i64>>(&raw) {
             let known_threads: HashSet<i64> = old.values().copied().collect();
-            info!(
-                migrated = old.len(),
-                "migrated old topics state format"
-            );
+            info!(migrated = old.len(), "migrated old topics state format");
             return PersistedState {
                 topics: old,
                 known_threads,
@@ -339,11 +336,7 @@ impl TopicsManager {
         } else if let Some((repo, branch)) = resolve_git_info(&info.cwd).await {
             format!("{repo}/{branch}")
         } else {
-            let cwd_name = info
-                .cwd
-                .rsplit('/')
-                .find(|s| !s.is_empty())
-                .unwrap_or("");
+            let cwd_name = info.cwd.rsplit('/').find(|s| !s.is_empty()).unwrap_or("");
 
             if cwd_name.is_empty() || cwd_name == "~" {
                 info.session_id[..6.min(info.session_id.len())].to_owned()
@@ -436,11 +429,7 @@ impl TopicsManager {
     }
 
     /// Delete the topic for a disconnected session.
-    pub async fn delete_topic(
-        &mut self,
-        bot: &BotClient,
-        session_id: &str,
-    ) -> Result<()> {
+    pub async fn delete_topic(&mut self, bot: &BotClient, session_id: &str) -> Result<()> {
         let Some(thread_id) = self.session_topics.remove(session_id) else {
             debug!(session_id, "no topic to delete");
             return Ok(());
@@ -609,11 +598,7 @@ impl TopicsManager {
     }
 
     /// Rename a topic when session info changes.
-    pub async fn rename_topic(
-        &mut self,
-        bot: &BotClient,
-        info: &SessionInfo,
-    ) -> Result<()> {
+    pub async fn rename_topic(&mut self, bot: &BotClient, info: &SessionInfo) -> Result<()> {
         let Some(&thread_id) = self.session_topics.get(&info.session_id) else {
             return Ok(());
         };

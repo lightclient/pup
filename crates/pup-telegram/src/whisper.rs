@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use audiopus::coder::Decoder as OpusDecoder;
 use audiopus::{Channels, SampleRate};
 use ogg::reading::PacketReader;
@@ -12,8 +12,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 const DEFAULT_MODEL: &str = "base";
 
 /// Hugging Face mirror for ggml model files.
-const MODEL_BASE_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
+const MODEL_BASE_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
 
 /// Speech-to-text transcriber backed by whisper.cpp.
 pub(crate) struct Transcriber {
@@ -69,9 +68,10 @@ impl Transcriber {
 
         // Language: None means auto-detect.
         if let Some(ref lang) = self.language
-            && lang != "auto" {
-                params.set_language(Some(lang));
-            }
+            && lang != "auto"
+        {
+            params.set_language(Some(lang));
+        }
 
         params.set_print_special(false);
         params.set_print_progress(false);
@@ -88,9 +88,10 @@ impl Transcriber {
         let mut text = String::new();
         for i in 0..n {
             if let Some(seg) = state.get_segment(i)
-                && let Ok(s) = seg.to_str_lossy() {
-                    text.push_str(&s);
-                }
+                && let Ok(s) = seg.to_str_lossy()
+            {
+                text.push_str(&s);
+            }
         }
 
         Ok(text.trim().to_owned())
@@ -106,20 +107,15 @@ pub(crate) fn decode_ogg_opus(ogg_data: &[u8]) -> Result<Vec<f32>> {
     let mut reader = PacketReader::new(Cursor::new(ogg_data));
 
     // First packet: OpusHead header (RFC 7845 §5.1).
-    let head = reader
-        .read_packet()?
-        .context("missing OpusHead packet")?;
+    let head = reader.read_packet()?.context("missing OpusHead packet")?;
     if head.data.len() < 19 || &head.data[..8] != b"OpusHead" {
         bail!("invalid OpusHead header");
     }
     let channels = head.data[9] as usize;
-    let pre_skip =
-        u16::from_le_bytes([head.data[10], head.data[11]]) as usize;
+    let pre_skip = u16::from_le_bytes([head.data[10], head.data[11]]) as usize;
 
     // Second packet: OpusTags (skip).
-    reader
-        .read_packet()?
-        .context("missing OpusTags packet")?;
+    reader.read_packet()?.context("missing OpusTags packet")?;
 
     // Opus always decodes at 48 kHz.
     let ch = if channels == 1 {
@@ -143,9 +139,7 @@ pub(crate) fn decode_ogg_opus(ogg_data: &[u8]) -> Result<Vec<f32>> {
         if channels >= 2 {
             // Downmix to mono.
             for i in 0..n {
-                let sum: f32 = (0..channels)
-                    .map(|c| decode_buf[i * channels + c])
-                    .sum();
+                let sum: f32 = (0..channels).map(|c| decode_buf[i * channels + c]).sum();
                 #[allow(clippy::cast_precision_loss)]
                 pcm_48k.push(sum / channels as f32);
             }

@@ -4,12 +4,10 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use pup_ipc::{ClientMessage, IpcClient, IpcEvent, ServerMessage};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::discovery::Discovery;
-use crate::types::{
-    DiscoveryEvent, IncomingMessage, MessageSource, SessionEvent, SessionInfo,
-};
+use crate::types::{DiscoveryEvent, IncomingMessage, MessageSource, SessionEvent, SessionInfo};
 
 /// Internal message from per-session IPC reader tasks.
 #[derive(Debug)]
@@ -174,26 +172,28 @@ impl SessionManager {
 
         // Read the hello event (should be first).
         if let Some(msg) = client.recv().await?
-            && let ServerMessage::Event { event, data } = &msg {
-                let parsed = IpcEvent::parse(event, data);
-                if let IpcEvent::Hello(hello) = parsed {
-                    info.session_id = hello.session_id;
-                    info.session_name = hello.session_name;
-                    info.cwd = hello.cwd;
-                    info.model = hello.model;
-                }
+            && let ServerMessage::Event { event, data } = &msg
+        {
+            let parsed = IpcEvent::parse(event, data);
+            if let IpcEvent::Hello(hello) = parsed {
+                info.session_id = hello.session_id;
+                info.session_name = hello.session_name;
+                info.cwd = hello.cwd;
+                info.model = hello.model;
             }
+        }
 
         // Read the history event (should be second).
         if let Some(msg) = client.recv().await?
-            && let ServerMessage::Event { event, data } = &msg {
-                let parsed = IpcEvent::parse(event, data);
-                if let IpcEvent::History(history) = parsed {
-                    info.history = history.turns;
-                    info.streaming = history.streaming;
-                    info.partial_text = history.partial_text;
-                }
+            && let ServerMessage::Event { event, data } = &msg
+        {
+            let parsed = IpcEvent::parse(event, data);
+            if let IpcEvent::History(history) = parsed {
+                info.history = history.turns;
+                info.streaming = history.streaming;
+                info.partial_text = history.partial_text;
             }
+        }
 
         info!(
             session_id,
@@ -262,10 +262,8 @@ impl SessionManager {
         let connected_event = SessionEvent::Connected { info: info.clone() };
         self.fanout(connected_event).await;
 
-        self.sessions.insert(
-            session_id.to_owned(),
-            SessionConnection { info, cmd_tx },
-        );
+        self.sessions
+            .insert(session_id.to_owned(), SessionConnection { info, cmd_tx });
 
         Ok(())
     }

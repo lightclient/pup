@@ -1,6 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
-use tracing::{debug, debug_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, warn};
 
 /// Thin wrapper around the Telegram Bot API using raw reqwest calls.
 #[derive(Debug, Clone)]
@@ -166,10 +166,7 @@ impl BotClient {
                 let desc = body.description.unwrap_or_default();
 
                 if code == 429 {
-                    let retry_after = body
-                        .parameters
-                        .and_then(|p| p.retry_after)
-                        .unwrap_or(5);
+                    let retry_after = body.parameters.and_then(|p| p.retry_after).unwrap_or(5);
                     warn!(method, retry_after, "rate limited");
                     bail!("rate limited: retry after {retry_after}s");
                 }
@@ -258,11 +255,7 @@ impl BotClient {
     }
 
     /// Create a forum topic.
-    pub async fn create_forum_topic(
-        &self,
-        chat_id: i64,
-        name: &str,
-    ) -> Result<ForumTopic> {
+    pub async fn create_forum_topic(&self, chat_id: i64, name: &str) -> Result<ForumTopic> {
         debug!(chat_id, name, "creating forum topic");
         self.call(
             "createForumTopic",
@@ -293,11 +286,7 @@ impl BotClient {
     }
 
     /// Delete a forum topic.
-    pub async fn delete_forum_topic(
-        &self,
-        chat_id: i64,
-        message_thread_id: i64,
-    ) -> Result<bool> {
+    pub async fn delete_forum_topic(&self, chat_id: i64, message_thread_id: i64) -> Result<bool> {
         debug!(chat_id, message_thread_id, "deleting forum topic");
         self.call(
             "deleteForumTopic",
@@ -310,11 +299,7 @@ impl BotClient {
     }
 
     /// Get chat member info.
-    pub async fn get_chat_member(
-        &self,
-        chat_id: i64,
-        user_id: i64,
-    ) -> Result<ChatMemberResult> {
+    pub async fn get_chat_member(&self, chat_id: i64, user_id: i64) -> Result<ChatMemberResult> {
         self.call(
             "getChatMember",
             &serde_json::json!({
@@ -341,10 +326,7 @@ impl BotClient {
     }
 
     /// Set bot commands.
-    pub async fn set_my_commands(
-        &self,
-        commands: &[(String, String)],
-    ) -> Result<bool> {
+    pub async fn set_my_commands(&self, commands: &[(String, String)]) -> Result<bool> {
         let cmds: Vec<serde_json::Value> = commands
             .iter()
             .map(|(cmd, desc)| {
@@ -354,11 +336,8 @@ impl BotClient {
                 })
             })
             .collect();
-        self.call(
-            "setMyCommands",
-            &serde_json::json!({ "commands": cmds }),
-        )
-        .await
+        self.call("setMyCommands", &serde_json::json!({ "commands": cmds }))
+            .await
     }
 
     /// Register commands with a specific scope.
@@ -393,11 +372,8 @@ impl BotClient {
 
     /// Get file info (for downloading).
     pub async fn get_file(&self, file_id: &str) -> Result<FileInfo> {
-        self.call(
-            "getFile",
-            &serde_json::json!({ "file_id": file_id }),
-        )
-        .await
+        self.call("getFile", &serde_json::json!({ "file_id": file_id }))
+            .await
     }
 
     /// Download a file by its `file_path` from `getFile`.

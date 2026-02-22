@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tracing::{debug, debug_span, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, debug_span, info, info_span, warn};
 
 use crate::types::DiscoveryEvent;
 
@@ -51,16 +51,13 @@ impl Discovery {
                 move |res| {
                     let _ = fs_tx.blocking_send(res);
                 },
-                notify::Config::default()
-                    .with_poll_interval(Duration::from_secs(2)),
+                notify::Config::default().with_poll_interval(Duration::from_secs(2)),
             )
             .context("failed to create filesystem watcher")?;
 
             watcher
                 .watch(&self.socket_dir, RecursiveMode::NonRecursive)
-                .with_context(|| {
-                    format!("failed to watch {}", self.socket_dir.display())
-                })?;
+                .with_context(|| format!("failed to watch {}", self.socket_dir.display()))?;
 
             info!("watching for socket changes");
 
@@ -113,9 +110,7 @@ impl Discovery {
         async {
             let mut dir = tokio::fs::read_dir(&self.socket_dir)
                 .await
-                .with_context(|| {
-                    format!("failed to read {}", self.socket_dir.display())
-                })?;
+                .with_context(|| format!("failed to read {}", self.socket_dir.display()))?;
 
             let mut socket_count = 0u32;
             let mut alive_count = 0u32;
@@ -193,13 +188,14 @@ impl Discovery {
                         continue;
                     }
                     if let Some(session_id) = socket_session_id(path)
-                        && self.known.remove(&session_id) {
-                            debug!(session_id, "socket removed");
-                            let _ = self
-                                .tx
-                                .send(DiscoveryEvent::SocketRemoved { session_id })
-                                .await;
-                        }
+                        && self.known.remove(&session_id)
+                    {
+                        debug!(session_id, "socket removed");
+                        let _ = self
+                            .tx
+                            .send(DiscoveryEvent::SocketRemoved { session_id })
+                            .await;
+                    }
                 }
             }
             _ => {}
@@ -250,9 +246,10 @@ pub async fn resolve_aliases(socket_dir: &Path) -> Vec<(String, String)> {
             continue;
         };
         if let Ok(target) = tokio::fs::read_link(&path).await
-            && let Some(session_id) = socket_session_id(&target) {
-                aliases.push((name.to_owned(), session_id));
-            }
+            && let Some(session_id) = socket_session_id(&target)
+        {
+            aliases.push((name.to_owned(), session_id));
+        }
     }
 
     aliases

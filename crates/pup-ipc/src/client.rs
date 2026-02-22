@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
-use tracing::{debug, debug_span, trace, Instrument};
+use tracing::{Instrument, debug, debug_span, trace};
 
 use crate::protocol::{ClientMessage, ServerMessage};
 
@@ -127,7 +127,9 @@ mod tests {
 
         // Client sends a command
         client
-            .send(&ClientMessage::GetInfo { id: Some("1".into()) })
+            .send(&ClientMessage::GetInfo {
+                id: Some("1".into()),
+            })
             .await
             .expect("send");
 

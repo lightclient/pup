@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 /// Guard that must be held alive for non-blocking file writer flush.
 pub(crate) struct TracingGuard {
@@ -21,8 +21,8 @@ pub(crate) fn init() -> Result<TracingGuard> {
     let mut guards = Vec::new();
 
     // Console layer.
-    let console_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     let console_layer = fmt::layer()
         .compact()
@@ -40,8 +40,8 @@ pub(crate) fn init() -> Result<TracingGuard> {
         let (non_blocking, guard) = tracing_appender::non_blocking(file);
         guards.push(guard);
 
-        let file_filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("debug"));
+        let file_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
 
         let file_layer = fmt::layer()
             .json()
@@ -56,9 +56,7 @@ pub(crate) fn init() -> Result<TracingGuard> {
             .with(file_layer)
             .init();
     } else {
-        tracing_subscriber::registry()
-            .with(console_layer)
-            .init();
+        tracing_subscriber::registry().with(console_layer).init();
     }
 
     Ok(TracingGuard { _guards: guards })

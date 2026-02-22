@@ -7,16 +7,16 @@ pub mod turn_tracker;
 pub(crate) mod whisper;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use pup_core::types::{IncomingMessage, MessageSource, SessionEvent, SessionInfo};
 use pup_core::ChatBackend;
+use pup_core::types::{IncomingMessage, MessageSource, SessionEvent, SessionInfo};
 use pup_ipc::SendMode;
 use tokio::sync::mpsc;
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{Instrument, debug, info, info_span, warn};
 
 use bot::{BotClient, Update};
 use dm::{DmCommand, DmState, ResolveResult};
@@ -241,9 +241,10 @@ impl TelegramBackend {
     fn chat_id_for_session(&self, session_id: &str) -> Option<i64> {
         // Topics mode: use the supergroup.
         if let Some(ref topics) = self.topics
-            && topics.thread_for_session(session_id).is_some() {
-                return Some(topics.chat_id());
-            }
+            && topics.thread_for_session(session_id).is_some()
+        {
+            return Some(topics.chat_id());
+        }
 
         // DM mode: use the DM chat if attached to this session.
         if self.dm.attached.as_deref() == Some(session_id) {
@@ -259,7 +260,11 @@ impl TelegramBackend {
             Some(ref mut topics) => topics.drain_expired(),
             None => return,
         };
-        let chat_id = self.topics.as_ref().expect("topics checked above").chat_id();
+        let chat_id = self
+            .topics
+            .as_ref()
+            .expect("topics checked above")
+            .chat_id();
         for (session_id, thread_id) in expired {
             info!(session_id = %session_id, thread_id, "deleting expired topic");
             if let Err(e) = self.bot.delete_forum_topic(chat_id, thread_id).await {
@@ -282,24 +287,28 @@ impl TelegramBackend {
                 return;
             }
             if let Some(data) = &cb.data
-                && let Some(session_id) = data.strip_prefix("cancel:") {
-                    // Send the abort to the session FIRST — the Telegram API
-                    // call below can take 250ms–2s and the agent may finish
-                    // before the abort arrives if we wait.
-                    let _ = self.incoming_tx.send(IncomingMessage {
+                && let Some(session_id) = data.strip_prefix("cancel:")
+            {
+                // Send the abort to the session FIRST — the Telegram API
+                // call below can take 250ms–2s and the agent may finish
+                // before the abort arrives if we wait.
+                let _ = self
+                    .incoming_tx
+                    .send(IncomingMessage {
                         session_id: session_id.to_owned(),
                         text: String::new(),
                         mode: SendMode::Steer,
                         is_cancel: true,
-                    }).await;
-                    // Answer the callback query in the background so we don't
-                    // block the poll loop.
-                    let bot = self.bot.clone();
-                    let cb_id = cb.id.clone();
-                    tokio::spawn(async move {
-                        let _ = bot.answer_callback_query(&cb_id, Some("Cancelling…")).await;
-                    });
-                }
+                    })
+                    .await;
+                // Answer the callback query in the background so we don't
+                // block the poll loop.
+                let bot = self.bot.clone();
+                let cb_id = cb.id.clone();
+                tokio::spawn(async move {
+                    let _ = bot.answer_callback_query(&cb_id, Some("Cancelling…")).await;
+                });
+            }
             return;
         }
 
@@ -329,63 +338,73 @@ impl TelegramBackend {
         // Topics mode: message in a forum topic.
         if let Some(thread_id) = message.message_thread_id
             && let Some(ref topics) = self.topics
-                && let Some(session_id) = topics.session_for_thread(thread_id) {
-                    let session_id = session_id.to_owned();
+            && let Some(session_id) = topics.session_for_thread(thread_id)
+        {
+            let session_id = session_id.to_owned();
 
-                    // Strip @botname suffix from slash commands. Telegram
-                    // appends @botname when the user picks a command from the
-                    // autocomplete menu in a group (e.g. "/new@my_bot" → "/new").
-                    let cleaned_text = if text.starts_with('/') {
-                        let first_word_end = text.find(' ').unwrap_or(text.len());
-                        let first_word = &text[..first_word_end];
-                        if let Some(at_pos) = first_word.find('@') {
-                            format!("{}{}", &text[..at_pos], &text[first_word_end..])
-                        } else {
-                            text.clone()
-                        }
-                    } else {
-                        text.clone()
-                    };
+            // Strip @botname suffix from slash commands. Telegram
+            // appends @botname when the user picks a command from the
+            // autocomplete menu in a group (e.g. "/new@my_bot" → "/new").
+            let cleaned_text = if text.starts_with('/') {
+                let first_word_end = text.find(' ').unwrap_or(text.len());
+                let first_word = &text[..first_word_end];
+                if let Some(at_pos) = first_word.find('@') {
+                    format!("{}{}", &text[..at_pos], &text[first_word_end..])
+                } else {
+                    text.clone()
+                }
+            } else {
+                text.clone()
+            };
 
-                    let trimmed = cleaned_text.trim();
+            let trimmed = cleaned_text.trim();
 
-                    // /cancel always takes effect immediately and clears any
-                    // pending interactive prompt.
-                    if trimmed.split_whitespace().next() == Some("/cancel") {
-                        self.pending_prompts.remove(&session_id);
-                        let _ = self.incoming_tx.send(IncomingMessage {
-                            session_id,
-                            text: String::new(),
-                            mode: SendMode::Steer,
-                            is_cancel: true,
-                        }).await;
-                        return;
-                    }
+            // /cancel always takes effect immediately and clears any
+            // pending interactive prompt.
+            if trimmed.split_whitespace().next() == Some("/cancel") {
+                self.pending_prompts.remove(&session_id);
+                let _ = self
+                    .incoming_tx
+                    .send(IncomingMessage {
+                        session_id,
+                        text: String::new(),
+                        mode: SendMode::Steer,
+                        is_cancel: true,
+                    })
+                    .await;
+                return;
+            }
 
-                    // Handle /help locally.
-                    if trimmed == "/help" || trimmed == "/start" {
-                        self.pending_prompts.remove(&session_id);
-                        self.outbox.enqueue(OutboxOp::Send {
-                            chat_id: topics.chat_id(),
-                            text: format_topics_help(),
-                            parse_mode: Some("HTML".to_owned()),
-                            reply_markup: None,
-                            message_thread_id: Some(thread_id),
-                            result_tx: None,
-                        });
-                        return;
-                    }
+            // Handle /help locally.
+            if trimmed == "/help" || trimmed == "/start" {
+                self.pending_prompts.remove(&session_id);
+                self.outbox.enqueue(OutboxOp::Send {
+                    chat_id: topics.chat_id(),
+                    text: format_topics_help(),
+                    parse_mode: Some("HTML".to_owned()),
+                    reply_markup: None,
+                    message_thread_id: Some(thread_id),
+                    result_tx: None,
+                });
+                return;
+            }
 
-                    // Handle /verbose locally (pup-level command).
-                    if trimmed == "/verbose" || trimmed.starts_with("/verbose ") {
-                        self.pending_prompts.remove(&session_id);
-                        let args = trimmed.strip_prefix("/verbose").expect("checked above").trim();
-                        if args.is_empty() {
-                            self.pending_prompts.insert(
-                                session_id.clone(),
-                                PendingPrompt { command: "verbose".to_owned(), local: true },
-                            );
-                            self.outbox.enqueue(OutboxOp::Send {
+            // Handle /verbose locally (pup-level command).
+            if trimmed == "/verbose" || trimmed.starts_with("/verbose ") {
+                self.pending_prompts.remove(&session_id);
+                let args = trimmed
+                    .strip_prefix("/verbose")
+                    .expect("checked above")
+                    .trim();
+                if args.is_empty() {
+                    self.pending_prompts.insert(
+                        session_id.clone(),
+                        PendingPrompt {
+                            command: "verbose".to_owned(),
+                            local: true,
+                        },
+                    );
+                    self.outbox.enqueue(OutboxOp::Send {
                                 chat_id: topics.chat_id(),
                                 text: "<i>Verbose mode shows thinking and tool calls while the agent works.\n\nReply <b>on</b> or <b>off</b>.</i>".to_owned(),
                                 parse_mode: Some("HTML".to_owned()),
@@ -393,107 +412,117 @@ impl TelegramBackend {
                                 message_thread_id: Some(thread_id),
                                 result_tx: None,
                             });
-                        } else {
-                            let on = matches!(args, "on" | "true" | "1" | "yes");
-                            self.turn_tracker.set_verbose(on);
-                            let label = if on { "on" } else { "off" };
-                            self.outbox.enqueue(OutboxOp::Send {
-                                chat_id: topics.chat_id(),
-                                text: format!("Verbose mode: <b>{label}</b>"),
-                                parse_mode: Some("HTML".to_owned()),
-                                reply_markup: None,
-                                message_thread_id: Some(thread_id),
-                                result_tx: None,
-                            });
-                        }
-                        return;
-                    }
+                } else {
+                    let on = matches!(args, "on" | "true" | "1" | "yes");
+                    self.turn_tracker.set_verbose(on);
+                    let label = if on { "on" } else { "off" };
+                    self.outbox.enqueue(OutboxOp::Send {
+                        chat_id: topics.chat_id(),
+                        text: format!("Verbose mode: <b>{label}</b>"),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: None,
+                        message_thread_id: Some(thread_id),
+                        result_tx: None,
+                    });
+                }
+                return;
+            }
 
-                    // Start typing immediately so the user sees activity
-                    // while we parse, transcribe, or wait for the agent.
-                    spawn_typing_loop(
-                        &mut self.pre_turn_typing,
-                        &self.bot,
-                        &session_id,
-                        topics.chat_id(),
-                        Some(thread_id),
+            // Start typing immediately so the user sees activity
+            // while we parse, transcribe, or wait for the agent.
+            spawn_typing_loop(
+                &mut self.pre_turn_typing,
+                &self.bot,
+                &session_id,
+                topics.chat_id(),
+                Some(thread_id),
+            );
+
+            // If the user sent a non-command and there's a pending
+            // prompt, treat their reply as the argument.
+            if trimmed.starts_with('/') {
+                // A new slash command cancels any pending prompt.
+                self.pending_prompts.remove(&session_id);
+            } else if let Some(prompt) = self.pending_prompts.remove(&session_id) {
+                if prompt.local {
+                    // Handle pup-level command locally.
+                    self.pre_turn_typing.remove(&session_id);
+                    if prompt.command.as_str() == "verbose" {
+                        let on = matches!(trimmed, "on" | "true" | "1" | "yes");
+                        self.turn_tracker.set_verbose(on);
+                        let label = if on { "on" } else { "off" };
+                        self.outbox.enqueue(OutboxOp::Send {
+                            chat_id: topics.chat_id(),
+                            text: format!("Verbose mode: <b>{label}</b>"),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: None,
+                            message_thread_id: Some(thread_id),
+                            result_tx: None,
+                        });
+                    }
+                } else {
+                    let full_cmd = format!("/{} {}", prompt.command, trimmed);
+                    let _ = self
+                        .incoming_tx
+                        .send(IncomingMessage {
+                            session_id,
+                            text: full_cmd,
+                            mode: SendMode::Steer,
+                            is_cancel: false,
+                        })
+                        .await;
+                }
+                return;
+            }
+
+            // If this is a slash command that needs an argument but
+            // was invoked without one, start an interactive prompt.
+            if let Some(after_slash) = trimmed.strip_prefix('/') {
+                let (cmd_name, args) = match after_slash.split_once(' ') {
+                    Some((c, a)) => (c, a.trim()),
+                    None => (after_slash, ""),
+                };
+                if args.is_empty()
+                    && let Some(question) = prompt_for_command(cmd_name)
+                {
+                    self.pre_turn_typing.remove(&session_id);
+                    self.pending_prompts.insert(
+                        session_id.clone(),
+                        PendingPrompt {
+                            command: cmd_name.to_owned(),
+                            local: false,
+                        },
                     );
-
-                    // If the user sent a non-command and there's a pending
-                    // prompt, treat their reply as the argument.
-                    if trimmed.starts_with('/') {
-                        // A new slash command cancels any pending prompt.
-                        self.pending_prompts.remove(&session_id);
-                    } else if let Some(prompt) = self.pending_prompts.remove(&session_id) {
-                        if prompt.local {
-                            // Handle pup-level command locally.
-                            self.pre_turn_typing.remove(&session_id);
-                            if prompt.command.as_str() == "verbose" {
-                                let on = matches!(trimmed, "on" | "true" | "1" | "yes");
-                                self.turn_tracker.set_verbose(on);
-                                let label = if on { "on" } else { "off" };
-                                self.outbox.enqueue(OutboxOp::Send {
-                                    chat_id: topics.chat_id(),
-                                    text: format!("Verbose mode: <b>{label}</b>"),
-                                    parse_mode: Some("HTML".to_owned()),
-                                    reply_markup: None,
-                                    message_thread_id: Some(thread_id),
-                                    result_tx: None,
-                                });
-                            }
-                        } else {
-                            let full_cmd = format!("/{} {}", prompt.command, trimmed);
-                            let _ = self.incoming_tx.send(IncomingMessage {
-                                session_id,
-                                text: full_cmd,
-                                mode: SendMode::Steer,
-                                is_cancel: false,
-                            }).await;
-                        }
-                        return;
-                    }
-
-                    // If this is a slash command that needs an argument but
-                    // was invoked without one, start an interactive prompt.
-                    if let Some(after_slash) = trimmed.strip_prefix('/') {
-                        let (cmd_name, args) = match after_slash.split_once(' ') {
-                            Some((c, a)) => (c, a.trim()),
-                            None => (after_slash, ""),
-                        };
-                        if args.is_empty()
-                            && let Some(question) = prompt_for_command(cmd_name) {
-                                self.pre_turn_typing.remove(&session_id);
-                                self.pending_prompts.insert(
-                                    session_id.clone(),
-                                    PendingPrompt { command: cmd_name.to_owned(), local: false },
-                                );
-                                self.outbox.enqueue(OutboxOp::Send {
-                                    chat_id: topics.chat_id(),
-                                    text: format!("<i>{question}</i>"),
-                                    parse_mode: Some("HTML".to_owned()),
-                                    reply_markup: None,
-                                    message_thread_id: Some(thread_id),
-                                    result_tx: None,
-                                });
-                                return;
-                            }
-                    }
-
-                    // Determine send mode.
-                    let (msg_text, mode) = if let Some(stripped) = cleaned_text.strip_prefix(">>") {
-                        (stripped.trim().to_owned(), SendMode::FollowUp)
-                    } else {
-                        (cleaned_text, SendMode::Steer)
-                    };
-
-                    let _ = self.incoming_tx.send(IncomingMessage {
-                        session_id,
-                        text: msg_text,
-                        mode,
-                        is_cancel: false,
-                    }).await;
+                    self.outbox.enqueue(OutboxOp::Send {
+                        chat_id: topics.chat_id(),
+                        text: format!("<i>{question}</i>"),
+                        parse_mode: Some("HTML".to_owned()),
+                        reply_markup: None,
+                        message_thread_id: Some(thread_id),
+                        result_tx: None,
+                    });
                     return;
                 }
+            }
+
+            // Determine send mode.
+            let (msg_text, mode) = if let Some(stripped) = cleaned_text.strip_prefix(">>") {
+                (stripped.trim().to_owned(), SendMode::FollowUp)
+            } else {
+                (cleaned_text, SendMode::Steer)
+            };
+
+            let _ = self
+                .incoming_tx
+                .send(IncomingMessage {
+                    session_id,
+                    text: msg_text,
+                    mode,
+                    is_cancel: false,
+                })
+                .await;
+            return;
+        }
 
         // DM mode.
         if self.config.dm_enabled {
@@ -585,12 +614,15 @@ impl TelegramBackend {
             }
             DmCommand::Cancel => {
                 if let Some(ref sid) = self.dm.attached {
-                    let _ = self.incoming_tx.send(IncomingMessage {
-                        session_id: sid.clone(),
-                        text: String::new(),
-                        mode: SendMode::Steer,
-                        is_cancel: true,
-                    }).await;
+                    let _ = self
+                        .incoming_tx
+                        .send(IncomingMessage {
+                            session_id: sid.clone(),
+                            text: String::new(),
+                            mode: SendMode::Steer,
+                            is_cancel: true,
+                        })
+                        .await;
                     self.send_dm(chat_id, "Cancelling…");
                 } else {
                     self.send_dm(chat_id, "Not attached to any session.");
@@ -619,48 +651,47 @@ impl TelegramBackend {
             DmCommand::Message { text, mode } => {
                 // Check DM-level pending prompt first (e.g. /verbose).
                 if !text.starts_with('/')
-                    && let Some(prompt) = self.pending_dm_prompt.take() {
-                        if prompt.command.as_str() == "verbose" {
-                            let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                            self.turn_tracker.set_verbose(on);
-                            let label = if on { "on" } else { "off" };
-                            self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
-                        }
-                        return;
+                    && let Some(prompt) = self.pending_dm_prompt.take()
+                {
+                    if prompt.command.as_str() == "verbose" {
+                        let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                        self.turn_tracker.set_verbose(on);
+                        let label = if on { "on" } else { "off" };
+                        self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
                     }
+                    return;
+                }
 
                 if let Some(sid) = self.dm.attached.clone() {
                     // Start typing immediately.
-                    spawn_typing_loop(
-                        &mut self.pre_turn_typing,
-                        &self.bot,
-                        &sid,
-                        chat_id,
-                        None,
-                    );
+                    spawn_typing_loop(&mut self.pre_turn_typing, &self.bot, &sid, chat_id, None);
 
                     // Check for pending prompt completion.
                     if !text.starts_with('/')
-                        && let Some(prompt) = self.pending_prompts.remove(&sid) {
-                            if prompt.local {
-                                self.pre_turn_typing.remove(&sid);
-                                if prompt.command.as_str() == "verbose" {
-                                    let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
-                                    self.turn_tracker.set_verbose(on);
-                                    let label = if on { "on" } else { "off" };
-                                    self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
-                                }
-                            } else {
-                                let full_cmd = format!("/{} {}", prompt.command, text);
-                                let _ = self.incoming_tx.send(IncomingMessage {
+                        && let Some(prompt) = self.pending_prompts.remove(&sid)
+                    {
+                        if prompt.local {
+                            self.pre_turn_typing.remove(&sid);
+                            if prompt.command.as_str() == "verbose" {
+                                let on = matches!(text.trim(), "on" | "true" | "1" | "yes");
+                                self.turn_tracker.set_verbose(on);
+                                let label = if on { "on" } else { "off" };
+                                self.send_dm(chat_id, &format!("Verbose mode: <b>{label}</b>"));
+                            }
+                        } else {
+                            let full_cmd = format!("/{} {}", prompt.command, text);
+                            let _ = self
+                                .incoming_tx
+                                .send(IncomingMessage {
                                     session_id: sid,
                                     text: full_cmd,
                                     mode: SendMode::Steer,
                                     is_cancel: false,
-                                }).await;
-                            }
-                            return;
+                                })
+                                .await;
                         }
+                        return;
+                    }
 
                     // Check if this is a pi slash command that needs an argument.
                     let msg_trimmed = text.trim();
@@ -670,28 +701,32 @@ impl TelegramBackend {
                             None => (after_slash.split('@').next().unwrap_or(after_slash), ""),
                         };
                         if args.is_empty()
-                            && let Some(question) = prompt_for_command(cmd_name) {
-                                self.pre_turn_typing.remove(&sid);
-                                self.pending_prompts.insert(
-                                    sid,
-                                    PendingPrompt { command: cmd_name.to_owned(), local: false },
-                                );
-                                self.send_dm(chat_id, &format!("<i>{question}</i>"));
-                                return;
-                            }
+                            && let Some(question) = prompt_for_command(cmd_name)
+                        {
+                            self.pre_turn_typing.remove(&sid);
+                            self.pending_prompts.insert(
+                                sid,
+                                PendingPrompt {
+                                    command: cmd_name.to_owned(),
+                                    local: false,
+                                },
+                            );
+                            self.send_dm(chat_id, &format!("<i>{question}</i>"));
+                            return;
+                        }
                     }
 
-                    let _ = self.incoming_tx.send(IncomingMessage {
-                        session_id: sid,
-                        text,
-                        mode,
-                        is_cancel: false,
-                    }).await;
+                    let _ = self
+                        .incoming_tx
+                        .send(IncomingMessage {
+                            session_id: sid,
+                            text,
+                            mode,
+                            is_cancel: false,
+                        })
+                        .await;
                 } else {
-                    self.send_dm(
-                        chat_id,
-                        "Not attached. Use /ls and /attach first.",
-                    );
+                    self.send_dm(chat_id, "Not attached. Use /ls and /attach first.");
                 }
             }
         }
@@ -721,7 +756,10 @@ impl TelegramBackend {
         } else if self.dm.attached.as_deref() == Some(session_id)
             && let Some(chat_id) = self.dm_chat_id
         {
-            debug!(session_id, "auto-creating turn state for DM (missed AgentStart)");
+            debug!(
+                session_id,
+                "auto-creating turn state for DM (missed AgentStart)"
+            );
             let existing = self.pre_turn_typing.remove(session_id);
             self.turn_tracker
                 .start_turn(session_id, chat_id, None, &self.bot, existing);
@@ -742,16 +780,17 @@ impl TelegramBackend {
     /// Send a message to a session's topic (if topics mode).
     fn send_to_topic(&mut self, session_id: &str, text: &str) {
         if let Some(ref topics) = self.topics
-            && let Some(thread_id) = topics.thread_for_session(session_id) {
-                self.outbox.enqueue(OutboxOp::Send {
-                    chat_id: topics.chat_id(),
-                    text: text.to_owned(),
-                    parse_mode: Some("HTML".to_owned()),
-                    reply_markup: None,
-                    message_thread_id: Some(thread_id),
-                    result_tx: None,
-                });
-            }
+            && let Some(thread_id) = topics.thread_for_session(session_id)
+        {
+            self.outbox.enqueue(OutboxOp::Send {
+                chat_id: topics.chat_id(),
+                text: text.to_owned(),
+                parse_mode: Some("HTML".to_owned()),
+                reply_markup: None,
+                message_thread_id: Some(thread_id),
+                result_tx: None,
+            });
+        }
     }
 
     /// Handle a voice message: download, transcribe, and forward as text.
@@ -797,8 +836,10 @@ impl TelegramBackend {
 
         if self.transcriber.is_none() {
             self.pre_turn_typing.remove(&session_id);
-            reply!("⚠️ Voice messages are not supported. \
-                    Set <code>voice = true</code> under <code>[backends.telegram]</code> in your pup config to enable transcription.");
+            reply!(
+                "⚠️ Voice messages are not supported. \
+                    Set <code>voice = true</code> under <code>[backends.telegram]</code> in your pup config to enable transcription."
+            );
             return;
         }
 
@@ -841,11 +882,7 @@ impl TelegramBackend {
             }
         };
 
-        info!(
-            session_id,
-            chars = text.len(),
-            "voice message transcribed"
-        );
+        info!(session_id, chars = text.len(), "voice message transcribed");
 
         // Show the transcribed text to the user.
         let preview = format!("🎙️ <i>{}</i>", escape_html(&text));
@@ -878,11 +915,7 @@ impl TelegramBackend {
 
     /// Decode OGG/Opus audio and run whisper transcription.
     async fn transcribe_audio(&self, ogg_data: Vec<u8>) -> Result<String> {
-        let transcriber = Arc::clone(
-            self.transcriber
-                .as_ref()
-                .context("no transcriber loaded")?,
-        );
+        let transcriber = Arc::clone(self.transcriber.as_ref().context("no transcriber loaded")?);
         // Both decoding and inference are CPU-bound.
         tokio::task::spawn_blocking(move || {
             let pcm = whisper::decode_ogg_opus(&ogg_data)?;
@@ -1130,8 +1163,9 @@ impl ChatBackend for TelegramBackend {
                         // have one. Try the grace-period name first, then the
                         // persistent cwd→name cache.
                         if info.session_name.is_none() {
-                            let name_to_restore = remembered_name
-                                .or_else(|| topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned));
+                            let name_to_restore = remembered_name.or_else(|| {
+                                topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned)
+                            });
                             if let Some(name) = name_to_restore {
                                 info!(
                                     session_id = %info.session_id,
@@ -1139,12 +1173,15 @@ impl ChatBackend for TelegramBackend {
                                     thread_id,
                                     "restoring session name from previous session"
                                 );
-                                let _ = self.incoming_tx.send(IncomingMessage {
-                                    session_id: info.session_id.clone(),
-                                    text: format!("/name {name}"),
-                                    mode: SendMode::Steer,
-                                    is_cancel: false,
-                                }).await;
+                                let _ = self
+                                    .incoming_tx
+                                    .send(IncomingMessage {
+                                        session_id: info.session_id.clone(),
+                                        text: format!("/name {name}"),
+                                        mode: SendMode::Steer,
+                                        is_cancel: false,
+                                    })
+                                    .await;
                             }
                         }
 
@@ -1156,19 +1193,23 @@ impl ChatBackend for TelegramBackend {
                         // No pending topic to reclaim — check persistent name
                         // cache and restore the name before creating the topic.
                         if info.session_name.is_none()
-                            && let Some(name) = topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned)
+                            && let Some(name) =
+                                topics.last_name_for_cwd(&info.cwd).map(ToOwned::to_owned)
                         {
                             info!(
                                 session_id = %info.session_id,
                                 name = %name,
                                 "restoring session name from cwd cache"
                             );
-                            let _ = self.incoming_tx.send(IncomingMessage {
-                                session_id: info.session_id.clone(),
-                                text: format!("/name {name}"),
-                                mode: SendMode::Steer,
-                                is_cancel: false,
-                            }).await;
+                            let _ = self
+                                .incoming_tx
+                                .send(IncomingMessage {
+                                    session_id: info.session_id.clone(),
+                                    text: format!("/name {name}"),
+                                    mode: SendMode::Steer,
+                                    is_cancel: false,
+                                })
+                                .await;
                         }
 
                         match topics.create_topic(&self.bot, info).await {
@@ -1177,10 +1218,8 @@ impl ChatBackend for TelegramBackend {
                                 // Reused topics already have their history from the
                                 // previous daemon run.
                                 if !reused && !info.history.is_empty() {
-                                    let msgs = format_history(
-                                        &info.history,
-                                        self.config.history_turns,
-                                    );
+                                    let msgs =
+                                        format_history(&info.history, self.config.history_turns);
                                     for msg in msgs {
                                         self.outbox.enqueue(OutboxOp::Send {
                                             chat_id: topics.chat_id(),
@@ -1268,9 +1307,10 @@ impl ChatBackend for TelegramBackend {
                 self.send_to_topic(session_id, "🔄 <i>Session reset</i>");
 
                 if self.dm.attached.as_deref() == Some(session_id.as_str())
-                    && let Some(chat_id) = self.dm_chat_id {
-                        self.send_dm(chat_id, "🔄 <i>Session reset</i>");
-                    }
+                    && let Some(chat_id) = self.dm_chat_id
+                {
+                    self.send_dm(chat_id, "🔄 <i>Session reset</i>");
+                }
             }
             SessionEvent::AgentStart { ref session_id } => {
                 debug!(session_id, "agent started");
@@ -1296,8 +1336,13 @@ impl ChatBackend for TelegramBackend {
                 } else if self.dm.attached.as_deref() == Some(session_id.as_str())
                     && let Some(chat_id) = self.dm_chat_id
                 {
-                    self.turn_tracker
-                        .start_turn(session_id, chat_id, None, &self.bot, existing_typing);
+                    self.turn_tracker.start_turn(
+                        session_id,
+                        chat_id,
+                        None,
+                        &self.bot,
+                        existing_typing,
+                    );
                 }
             }
             SessionEvent::AgentEnd { ref session_id } => {
@@ -1394,9 +1439,10 @@ impl ChatBackend for TelegramBackend {
                 self.send_to_topic(session_id, &html);
 
                 if self.dm.attached.as_deref() == Some(session_id.as_str())
-                    && let Some(chat_id) = self.dm_chat_id {
-                        self.send_dm(chat_id, &html);
-                    }
+                    && let Some(chat_id) = self.dm_chat_id
+                {
+                    self.send_dm(chat_id, &html);
+                }
             }
             SessionEvent::UserMessage {
                 ref session_id,
@@ -1415,9 +1461,10 @@ impl ChatBackend for TelegramBackend {
                     self.send_to_topic(session_id, &msg);
 
                     if self.dm.attached.as_deref() == Some(session_id.as_str())
-                        && let Some(chat_id) = self.dm_chat_id {
-                            self.send_dm(chat_id, &msg);
-                        }
+                        && let Some(chat_id) = self.dm_chat_id
+                    {
+                        self.send_dm(chat_id, &msg);
+                    }
                 }
             }
         }
@@ -1436,11 +1483,7 @@ impl ChatBackend for TelegramBackend {
             // Short poll (1s) so the outer select! loop can preempt us
             // between iterations to process session events (agent
             // responses, typing indicators, etc.).
-            match self
-                .bot
-                .get_updates(self.update_offset, 1)
-                .await
-            {
+            match self.bot.get_updates(self.update_offset, 1).await {
                 Ok(updates) => {
                     for update in updates {
                         if update.update_id >= self.update_offset {
@@ -1563,12 +1606,11 @@ mod tests {
                             if line == "\r\n" || line.is_empty() {
                                 break;
                             }
-                            if let Some(val) =
-                                line.strip_prefix("content-length:")
-                                    .or_else(|| line.strip_prefix("Content-Length:"))
+                            if let Some(val) = line
+                                .strip_prefix("content-length:")
+                                .or_else(|| line.strip_prefix("Content-Length:"))
                             {
-                                content_length =
-                                    val.trim().parse().unwrap_or(0);
+                                content_length = val.trim().parse().unwrap_or(0);
                             }
                         }
 
@@ -1577,8 +1619,7 @@ mod tests {
                         if reader.read_exact(&mut body).await.is_err() {
                             break;
                         }
-                        let body_str =
-                            String::from_utf8_lossy(&body).to_string();
+                        let body_str = String::from_utf8_lossy(&body).to_string();
 
                         // Extract API method from path.
                         let method = request_line
@@ -1606,8 +1647,7 @@ mod tests {
                                     })
                                 } else {
                                     // Subsequent calls: hang (long-poll).
-                                    tokio::time::sleep(Duration::from_secs(120))
-                                        .await;
+                                    tokio::time::sleep(Duration::from_secs(120)).await;
                                     return;
                                 }
                             }
@@ -1621,8 +1661,7 @@ mod tests {
                             _ => serde_json::json!({"ok": true, "result": true}),
                         };
 
-                        let payload =
-                            serde_json::to_string(&response_json).unwrap();
+                        let payload = serde_json::to_string(&response_json).unwrap();
                         let http = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -1805,11 +1844,8 @@ mod tests {
             }
         })];
 
-        let (base_url, api_calls) = mock_telegram_api_slow_callback(
-            updates,
-            Duration::from_secs(2),
-        )
-        .await;
+        let (base_url, api_calls) =
+            mock_telegram_api_slow_callback(updates, Duration::from_secs(2)).await;
 
         let bot = BotClient::with_base_url(&base_url);
         let mut backend = TelegramBackend::with_bot(test_config(), bot);
@@ -1819,11 +1855,8 @@ mod tests {
         // With the fix, the abort should be ready instantly even though
         // answerCallbackQuery takes 2 seconds.
         let start = tokio::time::Instant::now();
-        let result = tokio::time::timeout(
-            Duration::from_millis(500),
-            backend.recv_incoming(),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_millis(500), backend.recv_incoming()).await;
         let elapsed = start.elapsed();
 
         // The 500ms timeout must NOT fire — the abort should arrive
@@ -1882,17 +1915,11 @@ mod tests {
 
         // recv_incoming loops forever (second getUpdates hangs), so
         // use a timeout.  The prompt must be sent within this window.
-        let _ = tokio::time::timeout(
-            Duration::from_secs(5),
-            backend.recv_incoming(),
-        )
-        .await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), backend.recv_incoming()).await;
 
         let calls = api_calls.lock().unwrap();
-        let send_calls: Vec<&ApiCall> = calls
-            .iter()
-            .filter(|c| c.method == "sendMessage")
-            .collect();
+        let send_calls: Vec<&ApiCall> =
+            calls.iter().filter(|c| c.method == "sendMessage").collect();
 
         assert!(
             !send_calls.is_empty(),
