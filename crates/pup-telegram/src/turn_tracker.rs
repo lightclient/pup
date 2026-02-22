@@ -177,7 +177,13 @@ impl TurnState {
                 let mut line = format!("<b>{}</b>", escape_html(&tool.tool_name));
                 // Show command or path arg if present.
                 if let Some(cmd) = tool.args.get("command").and_then(|v| v.as_str()) {
-                    let truncated = if cmd.len() > 200 { &cmd[..200] } else { cmd };
+                    let truncated = if cmd.len() > 200 {
+                        // Don't split mid-char.
+                        let end = cmd.floor_char_boundary(200);
+                        &cmd[..end]
+                    } else {
+                        cmd
+                    };
                     let _ = write!(line, "\n<pre>{}</pre>", escape_html(truncated));
                 } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
                     let _ = write!(line, " <code>{}</code>", escape_html(path));
@@ -204,11 +210,8 @@ impl TurnState {
                 const MAX_THINKING_DISPLAY: usize = 2000;
                 let display = if self.thinking_text.len() > MAX_THINKING_DISPLAY {
                     let start = self.thinking_text.len() - MAX_THINKING_DISPLAY;
-                    // Don't split mid-char.
-                    let safe_start = self.thinking_text[start..]
-                        .char_indices()
-                        .next()
-                        .map_or(start, |(i, _)| start + i);
+                    // Don't split mid-char — snap forward to the next boundary.
+                    let safe_start = self.thinking_text.ceil_char_boundary(start);
                     format!("…{}", &self.thinking_text[safe_start..])
                 } else {
                     self.thinking_text.clone()
@@ -989,5 +992,79 @@ mod tests {
 
         let rendered = state.render_parts(true);
         assert!(rendered.contains("&lt;html&gt;&amp;amp;"));
+    }
+
+    // ── Multi-byte char boundary safety ─────────────────────────
+
+    #[test]
+    fn render_thinking_with_multibyte_chars_does_not_panic() {
+        // Build thinking text >2000 bytes using multi-byte chars (─ is 3 bytes).
+        // This is the exact scenario that caused the panic: the truncation
+        // point lands inside a multi-byte character.
+        let line = "┌─────────────┐\n";
+        let mut thinking = String::new();
+        while thinking.len() < 3000 {
+            thinking.push_str(line);
+        }
+
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: true,
+            thinking_text: thinking,
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            tools: Vec::new(),
+        };
+
+        // Must not panic.
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("…"));
+        assert!(rendered.contains("<i>"));
+    }
+
+    #[test]
+    fn render_tool_command_with_multibyte_chars_does_not_panic() {
+        // Command >200 bytes with multi-byte chars at the truncation boundary.
+        let cmd: String = "日本語テスト".repeat(50); // 6 chars × 3 bytes × 50 = 900 bytes
+        assert!(cmd.len() > 200);
+
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            tools: vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": cmd}),
+                content: String::new(),
+                is_error: false,
+                done: false,
+            }],
+        };
+
+        // Must not panic.
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("<b>Bash</b>"));
     }
 }

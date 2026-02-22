@@ -252,7 +252,8 @@ pub fn format_tool_call(
     if !content.is_empty() {
         out.push_str("\n━━━\n");
         let truncated = if content.len() > 500 {
-            format!("{}…", &content[..500])
+            let end = content.floor_char_boundary(500);
+            format!("{}…", &content[..end])
         } else {
             content.to_owned()
         };
@@ -285,15 +286,17 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
             break;
         }
 
-        // Find a good split point
-        let search_area = &remaining[..max_chars];
+        // Find a good split point (snap to char boundary to avoid
+        // panicking on multi-byte characters).
+        let safe_max = remaining.floor_char_boundary(max_chars);
+        let search_area = &remaining[..safe_max];
 
         // Prefer paragraph boundary
         let split_at = search_area
             .rfind("\n\n")
             .filter(|&p| p > max_chars / 3)
             .or_else(|| search_area.rfind('\n').filter(|&p| p > max_chars / 3))
-            .unwrap_or(max_chars);
+            .unwrap_or(safe_max);
 
         let (chunk_text, rest) = remaining.split_at(split_at);
 
