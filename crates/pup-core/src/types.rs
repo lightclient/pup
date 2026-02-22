@@ -44,6 +44,13 @@ pub enum SessionEvent {
         tool_name: String,
         args: serde_json::Value,
     },
+    /// Streaming partial output from a tool.
+    ToolUpdate {
+        session_id: String,
+        tool_call_id: String,
+        tool_name: String,
+        content: String,
+    },
     /// A tool finished executing.
     ToolEnd {
         session_id: String,

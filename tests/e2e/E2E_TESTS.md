@@ -363,6 +363,105 @@ and never updated.
 
 ---
 
+### T09c — Tool output visible in verbose mode
+
+Pup is configured with `verbose = true` and `tool_output_lines = 10`
+(the default). Tool output (both streamed via `tool_update` and final
+via `tool_end`) should appear in the Telegram message.
+
+**Steps:**
+1. Start a pi session, name it `e2e-t09c`
+2. Wait for topic; note the topic ID
+3. Ensure verbose is on: send `/verbose on` in the topic
+4. Send a prompt that triggers a tool call with output:
+   `tg.py send SUPERGROUP TOPIC_ID "run: echo TOOL_OUTPUT_TEST"`
+5. Wait for the agent to finish (up to 30s)
+6. Read the topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- The bot's verbose message contains:
+  - The tool name (`Bash` or `bash`)
+  - The command (`echo TOOL_OUTPUT_TEST`)
+  - The tool output (`TOOL_OUTPUT_TEST`) inside a `<pre>` block
+- The agent's final text response appears as a separate message
+
+---
+
+### T09d — Tool output truncated when exceeding line limit
+
+Pup is configured with `verbose = true` and `tool_output_lines = 10`
+(default). When a tool produces more than 10 lines of output, only the
+first 10 lines are shown, followed by a `. . . (N more lines)` indicator.
+
+**Steps:**
+1. Start a pi session, name it `e2e-t09d`
+2. Wait for topic; note the topic ID
+3. Ensure verbose is on: send `/verbose on` in the topic
+4. Send a prompt that produces multi-line tool output:
+   `tg.py send SUPERGROUP TOPIC_ID "run: seq 1 25"`
+5. Wait for the agent to finish (up to 30s)
+6. Read the topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- The tool output section shows the first 10 lines (numbers 1–10)
+- After the 10th line, a line reads `. . . (15 more lines)`
+- Numbers 11–25 are NOT shown in the tool output
+- The agent's final text response appears normally
+
+---
+
+### T09e — Tool output shows all lines when configured with "all"
+
+Pup is configured with `verbose = true` and `tool_output_lines = "all"`.
+All tool output lines should be shown without truncation.
+
+**Configuration override:** Set `tool_output_lines = "all"` in
+`[display]` of the test pup config.
+
+**Steps:**
+1. Start a pi session, name it `e2e-t09e`
+2. Wait for topic; note the topic ID
+3. Ensure verbose is on: send `/verbose on` in the topic
+4. Send a prompt that produces multi-line tool output:
+   `tg.py send SUPERGROUP TOPIC_ID "run: seq 1 20"`
+5. Wait for the agent to finish (up to 30s)
+6. Read the topic history:
+   `tg.py history SUPERGROUP TOPIC_ID`
+
+**Expected:**
+- The tool output shows all 20 lines (numbers 1–20)
+- No `. . .` truncation indicator
+- The agent's final text response appears normally
+
+---
+
+### T09f — Tool output streams incrementally during execution
+
+Pup is configured with `verbose = true`. Tool output from long-running
+commands should appear incrementally via `tool_update` events, not only
+at `tool_end`.
+
+**Steps:**
+1. Start a pi session, name it `e2e-t09f`
+2. Wait for topic; note the topic ID
+3. Ensure verbose is on: send `/verbose on` in the topic
+4. Send a prompt that triggers a long-running command:
+   `tg.py send SUPERGROUP TOPIC_ID "run: for i in $(seq 1 5); do echo LINE_$i; sleep 1; done"`
+5. While the command is running (within 3s), read the topic:
+   `tg.py history SUPERGROUP TOPIC_ID`
+6. Wait for the agent to finish
+7. Read the topic again
+
+**Expected:**
+- While the command is running, the bot's message shows partial tool
+  output (e.g., `LINE_1`, `LINE_2`) as it streams in
+- After the command finishes, the complete output is shown (all 5 lines)
+- The output appears inside a `<pre>` block under the tool name/command
+
+---
+
 ### T10 — Typing indicator shown during agent turn
 
 **Steps:**

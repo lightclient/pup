@@ -42,6 +42,11 @@ pub(crate) struct DisplayConfig {
     /// Default: 3.
     #[serde(default = "default_tool_calls")]
     pub tool_calls: ToolCallsValue,
+    /// How many lines of tool output to show per tool call.
+    /// A number (e.g. 10) shows the first N lines. The string "all" shows all.
+    /// Default: 10.
+    #[serde(default = "default_tool_output_lines")]
+    pub tool_output_lines: ToolOutputLinesValue,
 }
 
 impl Default for DisplayConfig {
@@ -50,6 +55,7 @@ impl Default for DisplayConfig {
             verbose: false,
             history_turns: 5,
             tool_calls: default_tool_calls(),
+            tool_output_lines: default_tool_output_lines(),
         }
     }
 }
@@ -105,6 +111,59 @@ impl<'de> Deserialize<'de> for ToolCallsValue {
 
 fn default_tool_calls() -> ToolCallsValue {
     ToolCallsValue::Last(3)
+}
+
+/// Represents the `tool_output_lines` config value: either a number or "all".
+#[derive(Debug, Clone)]
+pub(crate) enum ToolOutputLinesValue {
+    First(usize),
+    All,
+}
+
+impl<'de> Deserialize<'de> for ToolOutputLinesValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de;
+
+        struct Visitor;
+
+        impl de::Visitor<'_> for Visitor {
+            type Value = ToolOutputLinesValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a non-negative integer or the string \"all\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(ToolOutputLinesValue::First(v as usize))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                if v < 0 {
+                    return Err(de::Error::custom("tool_output_lines must be non-negative"));
+                }
+                Ok(ToolOutputLinesValue::First(v as usize))
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v.eq_ignore_ascii_case("all") {
+                    Ok(ToolOutputLinesValue::All)
+                } else {
+                    Err(de::Error::custom(
+                        "expected a number or \"all\" for tool_output_lines",
+                    ))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+fn default_tool_output_lines() -> ToolOutputLinesValue {
+    ToolOutputLinesValue::First(10)
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,6 +307,11 @@ impl Config {
             ToolCallsValue::Last(n) => pup_telegram::turn_tracker::ToolCallLimit::Last(*n),
         };
 
+        let tool_output_lines = match &self.display.tool_output_lines {
+            ToolOutputLinesValue::All => pup_telegram::turn_tracker::ToolOutputLines::All,
+            ToolOutputLinesValue::First(n) => pup_telegram::turn_tracker::ToolOutputLines::First(*n),
+        };
+
         Some(pup_telegram::TelegramConfig {
             bot_token: tg.bot_token.clone(),
             allowed_user_ids: tg.allowed_user_ids.clone(),
@@ -263,6 +327,7 @@ impl Config {
             socket_dir,
             voice: tg.voice,
             tool_call_limit,
+            tool_output_lines,
         })
     }
 }
@@ -392,5 +457,94 @@ allowed_user_ids = [12345678]
         assert!(matches!(config.display.tool_calls, ToolCallsValue::All));
         let tg = config.telegram_config().expect("telegram config");
         assert_eq!(tg.tool_call_limit, pup_telegram::turn_tracker::ToolCallLimit::All);
+    }
+
+    #[test]
+    fn test_tool_output_lines_default() {
+        let toml = r#"
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(
+            config.display.tool_output_lines,
+            ToolOutputLinesValue::First(10)
+        ));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.tool_output_lines,
+            pup_telegram::turn_tracker::ToolOutputLines::First(10)
+        );
+    }
+
+    #[test]
+    fn test_tool_output_lines_number() {
+        let toml = r#"
+[display]
+tool_output_lines = 5
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(
+            config.display.tool_output_lines,
+            ToolOutputLinesValue::First(5)
+        ));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.tool_output_lines,
+            pup_telegram::turn_tracker::ToolOutputLines::First(5)
+        );
+    }
+
+    #[test]
+    fn test_tool_output_lines_all() {
+        let toml = r#"
+[display]
+tool_output_lines = "all"
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(
+            config.display.tool_output_lines,
+            ToolOutputLinesValue::All
+        ));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.tool_output_lines,
+            pup_telegram::turn_tracker::ToolOutputLines::All
+        );
+    }
+
+    #[test]
+    fn test_tool_output_lines_zero() {
+        let toml = r#"
+[display]
+tool_output_lines = 0
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert!(matches!(
+            config.display.tool_output_lines,
+            ToolOutputLinesValue::First(0)
+        ));
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.tool_output_lines,
+            pup_telegram::turn_tracker::ToolOutputLines::First(0)
+        );
     }
 }

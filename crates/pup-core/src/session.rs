@@ -385,8 +385,18 @@ impl SessionManager {
                 self.disconnect_session(session_id, "session ended").await;
                 return;
             }
+            IpcEvent::ToolUpdate {
+                tool_call_id,
+                tool_name,
+                content,
+            } => SessionEvent::ToolUpdate {
+                session_id: session_id.to_owned(),
+                tool_call_id,
+                tool_name,
+                content,
+            },
             // Hello/History are handled during connect, not in the event stream.
-            IpcEvent::Hello(_) | IpcEvent::History(_) | IpcEvent::ToolUpdate { .. } => return,
+            IpcEvent::Hello(_) | IpcEvent::History(_) => return,
             IpcEvent::TurnStart { .. } | IpcEvent::TurnEnd { .. } => return,
             IpcEvent::Unknown { .. } => return,
         };

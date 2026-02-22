@@ -24,13 +24,73 @@ impl Default for ToolCallLimit {
     }
 }
 
+/// How many lines of tool output to show per tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutputLines {
+    /// Show the first N lines, then ". . . (M more lines)".
+    First(usize),
+    /// Show all lines.
+    All,
+}
+
+impl Default for ToolOutputLines {
+    fn default() -> Self {
+        Self::First(10)
+    }
+}
+
+/// Truncate tool output to at most `limit` lines.
+///
+/// If the output exceeds the limit, returns the first `limit` lines
+/// followed by a `. . . (N more lines)` indicator.
+/// If `limit` is `ToolOutputLines::All`, returns the input unchanged.
+pub fn truncate_tool_output(output: &str, limit: ToolOutputLines) -> String {
+    let max = match limit {
+        ToolOutputLines::All => return output.to_owned(),
+        ToolOutputLines::First(n) => n,
+    };
+
+    if max == 0 {
+        let total = output.lines().count();
+        if total == 0 {
+            return String::new();
+        }
+        return format!(". . . ({total} more lines)");
+    }
+
+    let mut lines = output.lines();
+    let mut kept: Vec<&str> = Vec::with_capacity(max);
+    for _ in 0..max {
+        match lines.next() {
+            Some(l) => kept.push(l),
+            None => return output.to_owned(),
+        }
+    }
+
+    // Count remaining lines.
+    let remaining: usize = lines.count();
+    if remaining == 0 {
+        return output.to_owned();
+    }
+
+    kept.push("");
+    let mut result = kept.join("\n");
+    // Replace the trailing empty-string join with the indicator line.
+    let indicator = format!(". . . ({remaining} more lines)");
+    // The last element was "" so the join appended "\n" at the end.
+    // We want to replace that trailing empty segment with the indicator.
+    // Actually, `kept` ended with "" so result ends with "\n".
+    result.push_str(&indicator);
+    result
+}
+
 /// A tracked tool call for verbose rendering.
 #[derive(Debug)]
 struct TrackedTool {
     tool_name: String,
     args: serde_json::Value,
-    #[allow(dead_code)]
-    content: Option<String>,
+    /// Accumulated tool output (from `tool_update` deltas and/or `tool_end`).
+    content: String,
     is_error: bool,
     done: bool,
 }
@@ -66,6 +126,8 @@ struct TurnState {
     verbose: bool,
     /// How many tool calls to keep in the rendered message.
     tool_call_limit: ToolCallLimit,
+    /// How many lines of tool output to show per tool call.
+    tool_output_lines: ToolOutputLines,
     /// Tracked tool calls in order.
     tools: Vec<TrackedTool>,
 }
@@ -120,6 +182,16 @@ impl TurnState {
                     line.push_str(&format!("\n<pre>{}</pre>", escape_html(truncated)));
                 } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
                     line.push_str(&format!(" <code>{}</code>", escape_html(path)));
+                }
+                // Show tool output (truncated by line limit).
+                if !tool.content.is_empty() {
+                    let truncated = truncate_tool_output(&tool.content, self.tool_output_lines);
+                    if !truncated.is_empty() {
+                        line.push_str(&format!(
+                            "\n<pre>{}</pre>",
+                            escape_html(&truncated)
+                        ));
+                    }
                 }
                 parts.push(line);
             }
@@ -216,6 +288,8 @@ pub struct TurnTracker {
     verbose: bool,
     /// How many tool calls to keep in the rendered message.
     tool_call_limit: ToolCallLimit,
+    /// How many lines of tool output to show per tool call.
+    tool_output_lines: ToolOutputLines,
 }
 
 impl TurnTracker {
@@ -225,6 +299,7 @@ impl TurnTracker {
             edit_interval_ms,
             verbose: false,
             tool_call_limit: ToolCallLimit::default(),
+            tool_output_lines: ToolOutputLines::default(),
         }
     }
 
@@ -233,6 +308,14 @@ impl TurnTracker {
         self.tool_call_limit = limit;
         for state in self.turns.values_mut() {
             state.tool_call_limit = limit;
+        }
+    }
+
+    /// Set the tool output line limit.
+    pub fn set_tool_output_lines(&mut self, limit: ToolOutputLines) {
+        self.tool_output_lines = limit;
+        for state in self.turns.values_mut() {
+            state.tool_output_lines = limit;
         }
     }
 
@@ -304,6 +387,7 @@ impl TurnTracker {
                 typing_stop: Some(stop_tx),
                 verbose: self.verbose,
                 tool_call_limit: self.tool_call_limit,
+                tool_output_lines: self.tool_output_lines,
                 tools: Vec::new(),
             },
         );
@@ -352,7 +436,7 @@ impl TurnTracker {
             state.tools.push(TrackedTool {
                 tool_name: tool_name.to_owned(),
                 args: args.clone(),
-                content: None,
+                content: String::new(),
                 is_error: false,
                 done: false,
             });
@@ -364,27 +448,56 @@ impl TurnTracker {
         }
     }
 
+    /// Accumulate streaming tool output.
+    pub fn tool_update(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        content: &str,
+        outbox: &mut Outbox,
+    ) {
+        if let Some(state) = self.turns.get_mut(session_id)
+            && state.verbose
+        {
+            // Find the last matching in-progress tool and append content.
+            for tool in state.tools.iter_mut().rev() {
+                if tool.tool_name == tool_name && !tool.done {
+                    tool.content.push_str(content);
+                    break;
+                }
+            }
+            state.dirty = true;
+            state.flush(outbox, self.edit_interval_ms);
+        }
+    }
+
     /// Note that a tool finished.
     pub fn tool_end(
         &mut self,
         session_id: &str,
         tool_name: &str,
+        content: &str,
         is_error: bool,
         outbox: &mut Outbox,
     ) {
-        if let Some(state) = self.turns.get_mut(session_id) {
-            if state.verbose {
-                // Find the last matching tool and mark it done.
-                for tool in state.tools.iter_mut().rev() {
-                    if tool.tool_name == tool_name && !tool.done {
-                        tool.done = true;
-                        tool.is_error = is_error;
-                        break;
+        if let Some(state) = self.turns.get_mut(session_id)
+            && state.verbose
+        {
+            // Find the last matching tool and mark it done.
+            for tool in state.tools.iter_mut().rev() {
+                if tool.tool_name == tool_name && !tool.done {
+                    tool.done = true;
+                    tool.is_error = is_error;
+                    // Use the final content from tool_end if we didn't
+                    // accumulate anything via tool_update deltas.
+                    if tool.content.is_empty() && !content.is_empty() {
+                        content.clone_into(&mut tool.content);
                     }
+                    break;
                 }
-                state.dirty = true;
-                state.flush(outbox, self.edit_interval_ms);
             }
+            state.dirty = true;
+            state.flush(outbox, self.edit_interval_ms);
         }
     }
 
@@ -600,5 +713,285 @@ impl TurnTracker {
     /// Get all session IDs with active turns.
     pub fn active_sessions(&self) -> Vec<String> {
         self.turns.keys().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_tool_output ────────────────────────────────────
+
+    #[test]
+    fn truncate_empty_input() {
+        assert_eq!(truncate_tool_output("", ToolOutputLines::First(10)), "");
+    }
+
+    #[test]
+    fn truncate_fewer_lines_than_limit() {
+        let input = "line1\nline2\nline3";
+        assert_eq!(
+            truncate_tool_output(input, ToolOutputLines::First(10)),
+            input
+        );
+    }
+
+    #[test]
+    fn truncate_exact_limit() {
+        let input = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10";
+        assert_eq!(
+            truncate_tool_output(input, ToolOutputLines::First(10)),
+            input
+        );
+    }
+
+    #[test]
+    fn truncate_over_limit() {
+        let input = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12";
+        let result = truncate_tool_output(input, ToolOutputLines::First(10));
+        assert_eq!(
+            result,
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n. . . (2 more lines)"
+        );
+    }
+
+    #[test]
+    fn truncate_one_over_limit() {
+        let input = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk";
+        let result = truncate_tool_output(input, ToolOutputLines::First(10));
+        assert_eq!(
+            result,
+            "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n. . . (1 more lines)"
+        );
+    }
+
+    #[test]
+    fn truncate_all_shows_everything() {
+        let input = "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12";
+        assert_eq!(truncate_tool_output(input, ToolOutputLines::All), input);
+    }
+
+    #[test]
+    fn truncate_limit_zero() {
+        let input = "a\nb\nc";
+        let result = truncate_tool_output(input, ToolOutputLines::First(0));
+        assert_eq!(result, ". . . (3 more lines)");
+    }
+
+    #[test]
+    fn truncate_limit_zero_empty() {
+        assert_eq!(
+            truncate_tool_output("", ToolOutputLines::First(0)),
+            ""
+        );
+    }
+
+    #[test]
+    fn truncate_limit_one() {
+        let input = "first\nsecond\nthird";
+        let result = truncate_tool_output(input, ToolOutputLines::First(1));
+        assert_eq!(result, "first\n. . . (2 more lines)");
+    }
+
+    #[test]
+    fn truncate_many_over_default() {
+        // 25 lines, default limit is 10
+        let lines: Vec<String> = (1..=25).map(|i| format!("line {i}")).collect();
+        let input = lines.join("\n");
+        let result = truncate_tool_output(&input, ToolOutputLines::default());
+        let expected_lines: Vec<String> = (1..=10).map(|i| format!("line {i}")).collect();
+        let expected = format!("{}\n. . . (15 more lines)", expected_lines.join("\n"));
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn truncate_single_line_within_limit() {
+        assert_eq!(
+            truncate_tool_output("hello", ToolOutputLines::First(10)),
+            "hello"
+        );
+    }
+
+    #[test]
+    fn truncate_preserves_empty_lines() {
+        let input = "a\n\nb\n\nc\n\nd\n\ne\n\nf\n\ng";
+        // 13 lines (some empty), limit 5
+        let result = truncate_tool_output(input, ToolOutputLines::First(5));
+        assert_eq!(result, "a\n\nb\n\nc\n. . . (8 more lines)");
+    }
+
+    // ── ToolOutputLines default ─────────────────────────────────
+
+    #[test]
+    fn tool_output_lines_default_is_10() {
+        assert_eq!(ToolOutputLines::default(), ToolOutputLines::First(10));
+    }
+
+    // ── TurnTracker tool output rendering ──────────────────────
+
+    #[test]
+    fn render_tool_with_output() {
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(3),
+            tools: vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls -la"}),
+                content: "file1.txt\nfile2.txt\nfile3.txt\nfile4.txt\nfile5.txt".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+        };
+
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("<b>Bash</b>"));
+        assert!(rendered.contains("ls -la"));
+        assert!(rendered.contains("file1.txt"));
+        assert!(rendered.contains("file3.txt"));
+        assert!(rendered.contains(". . . (2 more lines)"));
+        assert!(!rendered.contains("file4.txt"));
+    }
+
+    #[test]
+    fn render_tool_with_output_all_lines() {
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::All,
+            tools: vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "a\nb\nc\nd\ne".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+        };
+
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("a\nb\nc\nd\ne"));
+        assert!(!rendered.contains(". . ."));
+    }
+
+    #[test]
+    fn render_tool_no_output() {
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            tools: vec![TrackedTool {
+                tool_name: "Read".to_owned(),
+                args: serde_json::json!({"path": "/tmp/foo.txt"}),
+                content: String::new(),
+                is_error: false,
+                done: false,
+            }],
+        };
+
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("<b>Read</b>"));
+        assert!(rendered.contains("/tmp/foo.txt"));
+        // No <pre> block for empty content.
+        assert!(!rendered.contains("<pre>"));
+    }
+
+    #[test]
+    fn render_nonverbose_hides_tool_output() {
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: "hello".to_owned(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: false,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            tools: vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "echo hi"}),
+                content: "hi".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+        };
+
+        let rendered = state.render_parts(true);
+        // Non-verbose: no tool header or output, just the streaming text.
+        assert!(!rendered.contains("Bash"));
+        assert!(rendered.contains("hello"));
+    }
+
+    #[test]
+    fn render_tool_output_html_escaped() {
+        let state = TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: String::new(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::All,
+            tools: vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "echo '<html>'"}),
+                content: "<html>&amp;".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+        };
+
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("&lt;html&gt;&amp;amp;"));
     }
 }

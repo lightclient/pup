@@ -104,6 +104,7 @@ socket_dir = "~/.pi/pup"
 [display]
 verbose = false
 history_turns = 5
+tool_output_lines = 10  # or "all"
 
 [streaming]
 edit_interval_ms = 1500

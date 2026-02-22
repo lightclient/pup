@@ -119,6 +119,8 @@ pub struct TelegramConfig {
     pub voice: bool,
     /// How many tool calls to keep in the rendered message.
     pub tool_call_limit: turn_tracker::ToolCallLimit,
+    /// How many lines of tool output to show per tool call.
+    pub tool_output_lines: turn_tracker::ToolOutputLines,
 }
 
 /// The Telegram chat backend.
@@ -163,6 +165,7 @@ impl TelegramBackend {
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
+        turn_tracker.set_tool_output_lines(config.tool_output_lines);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
@@ -204,6 +207,7 @@ impl TelegramBackend {
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
+        turn_tracker.set_tool_output_lines(config.tool_output_lines);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         Self {
@@ -1359,9 +1363,20 @@ impl ChatBackend for TelegramBackend {
                 self.turn_tracker
                     .tool_start(session_id, tool_name, args, &mut self.outbox);
             }
+            SessionEvent::ToolUpdate {
+                ref session_id,
+                ref tool_name,
+                ref content,
+                ..
+            } => {
+                self.ensure_turn(session_id);
+                self.turn_tracker
+                    .tool_update(session_id, tool_name, content, &mut self.outbox);
+            }
             SessionEvent::ToolEnd {
                 ref session_id,
                 ref tool_name,
+                ref content,
                 is_error,
                 ..
             } => {
@@ -1369,6 +1384,7 @@ impl ChatBackend for TelegramBackend {
                 self.turn_tracker.tool_end(
                     session_id,
                     tool_name,
+                    content,
                     is_error,
                     &mut self.outbox,
                 );
@@ -1641,6 +1657,7 @@ mod tests {
             topics_state_path: PathBuf::from("/tmp/topics.json"),
             voice: false,
             tool_call_limit: turn_tracker::ToolCallLimit::default(),
+            tool_output_lines: turn_tracker::ToolOutputLines::default(),
         }
     }
 

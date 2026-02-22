@@ -346,6 +346,9 @@ enum SessionEvent {
     /// A tool started executing.
     ToolStart { session_id: String, tool_call_id: String, tool_name: String,
                 args: serde_json::Value },
+    /// Streaming partial output from a tool.
+    ToolUpdate { session_id: String, tool_call_id: String, tool_name: String,
+                 content: String },
     /// A tool finished executing.
     ToolEnd { session_id: String, tool_call_id: String, tool_name: String,
               content: String, is_error: bool },
@@ -636,11 +639,17 @@ Telegram HTML parse mode.
 
 **Tool calls** (verbose mode):
 ```html
-🔧 <b>bash</b>
+<b>bash</b>
 <pre>ls -la</pre>
-━━━
-<pre>output (truncated)</pre>
+<pre>file1.txt
+file2.txt
+file3.txt
+. . . (15 more lines)</pre>
 ```
+
+Tool output is streamed via `tool_update` events and shown incrementally.
+The number of output lines per tool call is controlled by `tool_output_lines`
+(default: 10). Set to `"all"` to show complete output.
 
 **Truncation:** `MAX_BODY_CHARS = 3500` (safety margin under Telegram's 4096
 limit). Long messages split at paragraph/code-fence boundaries. Code fences
@@ -704,6 +713,7 @@ socket_dir = "~/.pi/pup"
 [display]
 verbose = false                     # Show tool calls by default
 history_turns = 5                   # Turns to replay on attach/topic create
+tool_output_lines = 10              # Lines of tool output per call (or "all")
 
 [streaming]
 edit_interval_ms = 1500             # Min ms between message edits
