@@ -8,8 +8,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: ""
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
-  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: " "
 
 jobs:
   fmt:
@@ -28,7 +26,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libopus-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake clang mold libopus-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -41,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libopus-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake clang mold libopus-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
@@ -52,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y cmake clang libopus-dev
+        run: sudo apt-get update && sudo apt-get install -y cmake clang mold libopus-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --release
