@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 
 use crate::bot::BotClient;
-use crate::outbox::{Outbox, OutboxOp};
+use crate::outbox::{ChatBudget, Outbox, OutboxOp};
 use crate::render::{
     MAX_BODY_CHARS, cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html,
 };
@@ -395,6 +395,7 @@ impl TurnTracker {
         chat_id: i64,
         thread_id: Option<i64>,
         bot: &BotClient,
+        chat_budget: &ChatBudget,
         existing_typing: Option<tokio::sync::watch::Sender<bool>>,
     ) {
         let stop_tx = if let Some(tx) = existing_typing {
@@ -403,10 +404,14 @@ impl TurnTracker {
             // Spawn typing indicator loop. Dropping the tx end stops it.
             let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
             let bot = bot.clone();
+            let budget = chat_budget.clone();
             tokio::spawn(async move {
                 loop {
-                    if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
-                        debug!(error = %e, "typing indicator failed");
+                    // Only send if the shared per-chat budget allows it.
+                    if budget.try_consume(chat_id) {
+                        if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
+                            debug!(error = %e, "typing indicator failed");
+                        }
                     }
                     tokio::select! {
                         _ = stop_rx.changed() => break,

@@ -1,5 +1,6 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -124,6 +125,36 @@ struct TokenBucket {
 /// Default per-chat budget: 18 operations per minute.
 const DEFAULT_CHAT_BUDGET: f64 = 18.0;
 
+/// Shared per-chat rate limiter.
+///
+/// All Telegram API calls for a given chat should go through this so that
+/// the token budget is shared between the outbox (messages, edits, deletes)
+/// and background tasks (typing indicators, topic management).
+#[derive(Debug, Clone)]
+pub struct ChatBudget(Arc<Mutex<HashMap<i64, TokenBucket>>>);
+
+impl ChatBudget {
+    pub fn new() -> Self {
+        Self(Arc::new(Mutex::new(HashMap::new())))
+    }
+
+    /// Try to consume one token for `chat_id`. Returns `true` if allowed.
+    pub fn try_consume(&self, chat_id: i64) -> bool {
+        self.0
+            .lock()
+            .expect("chat budget lock poisoned")
+            .entry(chat_id)
+            .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET))
+            .try_consume()
+    }
+}
+
+impl Default for ChatBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TokenBucket {
     fn new(per_minute: f64) -> Self {
         Self {
@@ -181,8 +212,8 @@ pub struct Outbox {
     last_send: Option<Instant>,
     last_edit: HashMap<(i64, i64), Instant>,
     retry_until: Option<Instant>,
-    /// Per-chat token buckets.
-    chat_buckets: HashMap<i64, TokenBucket>,
+    /// Shared per-chat token buckets (also used by typing indicator tasks).
+    chat_budget: ChatBudget,
 }
 
 /// Coalesced edit map — stores only the latest edit per message.
@@ -216,7 +247,7 @@ impl EditMap {
         &mut self,
         last_edit: &HashMap<(i64, i64), Instant>,
         cooldown: Duration,
-        chat_buckets: &mut HashMap<i64, TokenBucket>,
+        chat_budget: &ChatBudget,
     ) -> Option<OutboxOp> {
         let len = self.order.len();
         for _ in 0..len {
@@ -233,10 +264,7 @@ impl EditMap {
 
             // Per-chat budget.
             let chat_id = key.0;
-            let bucket = chat_buckets
-                .entry(chat_id)
-                .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET));
-            if !bucket.try_consume() {
+            if !chat_budget.try_consume(chat_id) {
                 self.order.push_back(key);
                 continue;
             }
@@ -260,7 +288,7 @@ impl EditMap {
 }
 
 impl Outbox {
-    pub fn new(bot: BotClient, edit_cooldown_ms: u64) -> Self {
+    pub fn new(bot: BotClient, edit_cooldown_ms: u64, chat_budget: ChatBudget) -> Self {
         Self {
             bot,
             queue: BinaryHeap::new(),
@@ -271,8 +299,13 @@ impl Outbox {
             last_send: None,
             last_edit: HashMap::new(),
             retry_until: None,
-            chat_buckets: HashMap::new(),
+            chat_budget,
         }
+    }
+
+    /// Get a clone of the shared chat budget for use by background tasks.
+    pub fn chat_budget(&self) -> ChatBudget {
+        self.chat_budget.clone()
     }
 
     /// Enqueue an operation.
@@ -312,10 +345,7 @@ impl Outbox {
 
     /// Try to consume a token for `chat_id`. Returns `true` if allowed.
     fn chat_try_consume(&mut self, chat_id: i64) -> bool {
-        self.chat_buckets
-            .entry(chat_id)
-            .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET))
-            .try_consume()
+        self.chat_budget.try_consume(chat_id)
     }
 
     /// Flush one operation from the queue, respecting rate limits.
@@ -376,7 +406,7 @@ impl Outbox {
         if let Some(op) = self.pending_edits.pop_eligible(
             &self.last_edit,
             self.edit_cooldown,
-            &mut self.chat_buckets,
+            &self.chat_budget,
         ) {
             let span = debug_span!("outbox_flush", pending_edits = self.pending_edits.len());
             return async {
@@ -528,9 +558,9 @@ mod tests {
 
         // Pop should return the latest content.
         let empty_cooldown = HashMap::new();
-        let mut empty_buckets = HashMap::new();
+        let budget = ChatBudget::new();
         let op = map
-            .pop_eligible(&empty_cooldown, Duration::ZERO, &mut empty_buckets)
+            .pop_eligible(&empty_cooldown, Duration::ZERO, &budget)
             .unwrap();
         if let OutboxOp::Edit { text, .. } = op {
             assert_eq!(text, "third");
@@ -581,9 +611,9 @@ mod tests {
 
         // FIFO order: msg 1 first, then msg 2.
         let empty = HashMap::new();
-        let mut buckets = HashMap::new();
+        let budget = ChatBudget::new();
         let op1 = map
-            .pop_eligible(&empty, Duration::ZERO, &mut buckets)
+            .pop_eligible(&empty, Duration::ZERO, &budget)
             .unwrap();
         if let OutboxOp::Edit {
             message_id, text, ..
@@ -596,7 +626,7 @@ mod tests {
         }
 
         let op2 = map
-            .pop_eligible(&empty, Duration::ZERO, &mut buckets)
+            .pop_eligible(&empty, Duration::ZERO, &budget)
             .unwrap();
         if let OutboxOp::Edit {
             message_id, text, ..
@@ -640,9 +670,9 @@ mod tests {
         let mut last_edit = HashMap::new();
         last_edit.insert((100_i64, 1_i64), Instant::now());
 
-        let mut buckets = HashMap::new();
+        let budget = ChatBudget::new();
         let op = map
-            .pop_eligible(&last_edit, Duration::from_secs(10), &mut buckets)
+            .pop_eligible(&last_edit, Duration::from_secs(10), &budget)
             .unwrap();
         if let OutboxOp::Edit {
             message_id, text, ..
@@ -715,15 +745,13 @@ mod tests {
         );
 
         let empty_cooldown = HashMap::new();
-        let mut buckets = HashMap::new();
+        let budget = ChatBudget::new();
         // Exhaust chat 100's budget.
-        let mut b100 = TokenBucket::new(DEFAULT_CHAT_BUDGET);
-        while b100.try_consume() {}
-        buckets.insert(100_i64, b100);
+        while budget.try_consume(100) {}
 
         // Should skip chat 100 and return chat 200's edit.
         let op = map
-            .pop_eligible(&empty_cooldown, Duration::ZERO, &mut buckets)
+            .pop_eligible(&empty_cooldown, Duration::ZERO, &budget)
             .unwrap();
         assert_eq!(op.chat_id(), 200);
 

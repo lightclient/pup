@@ -20,7 +20,7 @@ use tracing::{Instrument, debug, info, info_span, warn};
 
 use bot::{BotClient, Update};
 use dm::{DmCommand, DmState, ResolveResult};
-use outbox::{Outbox, OutboxOp};
+use outbox::{ChatBudget, Outbox, OutboxOp};
 use render::{escape_html, format_history, format_user_message};
 use topics::TopicsManager;
 use turn_tracker::TurnTracker;
@@ -75,6 +75,7 @@ fn format_topics_help() -> String {
 fn spawn_typing_loop(
     pre_turn_typing: &mut HashMap<String, tokio::sync::watch::Sender<bool>>,
     bot: &BotClient,
+    chat_budget: &ChatBudget,
     session_id: &str,
     chat_id: i64,
     thread_id: Option<i64>,
@@ -84,10 +85,14 @@ fn spawn_typing_loop(
     }
     let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
     let bot = bot.clone();
+    let budget = chat_budget.clone();
     let sid = session_id.to_owned();
     tokio::spawn(async move {
         loop {
-            let _ = bot.send_chat_action(chat_id, "typing", thread_id).await;
+            // Only send if the shared per-chat budget allows it.
+            if budget.try_consume(chat_id) {
+                let _ = bot.send_chat_action(chat_id, "typing", thread_id).await;
+            }
             tokio::select! {
                 () = async { let _ = stop_rx.changed().await; } => break,
                 () = tokio::time::sleep(std::time::Duration::from_secs(4)) => {}
@@ -162,7 +167,8 @@ pub struct TelegramBackend {
 impl TelegramBackend {
     pub fn new(config: TelegramConfig) -> Self {
         let bot = BotClient::new(&config.bot_token);
-        let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
+        let chat_budget = ChatBudget::new();
+        let outbox = Outbox::new(bot.clone(), config.edit_interval_ms, chat_budget);
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_default_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
@@ -204,7 +210,7 @@ impl TelegramBackend {
     /// Create a backend with a custom [`BotClient`] (for testing).
     #[cfg(test)]
     fn with_bot(config: TelegramConfig, bot: BotClient) -> Self {
-        let outbox = Outbox::new(bot.clone(), config.edit_interval_ms);
+        let outbox = Outbox::new(bot.clone(), config.edit_interval_ms, ChatBudget::new());
         let mut turn_tracker = TurnTracker::new(config.edit_interval_ms);
         turn_tracker.set_default_verbose(config.verbose);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
@@ -433,6 +439,7 @@ impl TelegramBackend {
             spawn_typing_loop(
                 &mut self.pre_turn_typing,
                 &self.bot,
+                &self.outbox.chat_budget(),
                 &session_id,
                 topics.chat_id(),
                 Some(thread_id),
@@ -672,7 +679,7 @@ impl TelegramBackend {
 
                 if let Some(sid) = self.dm.attached.clone() {
                     // Start typing immediately.
-                    spawn_typing_loop(&mut self.pre_turn_typing, &self.bot, &sid, chat_id, None);
+                    spawn_typing_loop(&mut self.pre_turn_typing, &self.bot, &self.outbox.chat_budget(), &sid, chat_id, None);
 
                     // Check for pending prompt completion.
                     if !text.starts_with('/')
@@ -753,11 +760,13 @@ impl TelegramBackend {
             if let Some(thread_id) = topics.thread_for_session(session_id) {
                 debug!(session_id, "auto-creating turn state (missed AgentStart)");
                 let existing = self.pre_turn_typing.remove(session_id);
+                let budget = self.outbox.chat_budget();
                 self.turn_tracker.start_turn(
                     session_id,
                     topics.chat_id(),
                     Some(thread_id),
                     &self.bot,
+                    &budget,
                     existing,
                 );
             }
@@ -769,8 +778,9 @@ impl TelegramBackend {
                 "auto-creating turn state for DM (missed AgentStart)"
             );
             let existing = self.pre_turn_typing.remove(session_id);
+            let budget = self.outbox.chat_budget();
             self.turn_tracker
-                .start_turn(session_id, chat_id, None, &self.bot, existing);
+                .start_turn(session_id, chat_id, None, &self.bot, &budget, existing);
         }
     }
 
@@ -826,6 +836,7 @@ impl TelegramBackend {
         spawn_typing_loop(
             &mut self.pre_turn_typing,
             &self.bot,
+            &self.outbox.chat_budget(),
             &session_id,
             chat_id,
             thread_id,
@@ -1331,6 +1342,7 @@ impl ChatBackend for TelegramBackend {
 
                 // Start a new turn — the tracker will send the first
                 // Telegram message lazily on the first tool/delta event.
+                let budget = self.outbox.chat_budget();
                 if let Some(ref topics) = self.topics {
                     if let Some(thread_id) = topics.thread_for_session(session_id) {
                         self.turn_tracker.start_turn(
@@ -1338,6 +1350,7 @@ impl ChatBackend for TelegramBackend {
                             topics.chat_id(),
                             Some(thread_id),
                             &self.bot,
+                            &budget,
                             existing_typing,
                         );
                     }
@@ -1349,6 +1362,7 @@ impl ChatBackend for TelegramBackend {
                         chat_id,
                         None,
                         &self.bot,
+                        &budget,
                         existing_typing,
                     );
                 }
