@@ -1,14 +1,17 @@
 # pup — Architecture
 
-Pickup your pi sessions on the go.
+Pickup your coding agent sessions on the go.
 
-Bridge between pi coding agent sessions and chat platforms. Two components:
+Bridge between coding agent sessions and chat platforms. Supports two agent
+types:
 
-1. **Pi extension** (TypeScript) — runs inside each pi session, exposes session
-   state and streaming events over a Unix domain socket.
-2. **Daemon** (Rust) — discovers extension sockets, connects to them, and routes
-   everything through one or more chat **backends** (Telegram first, others
-   later).
+1. **Pi sessions** — via a TypeScript extension that runs inside each pi session,
+   exposing session state and streaming events over a Unix domain socket.
+2. **Claude Code sessions** — via transcript file watching and optional
+   `BUN_INSPECT` WebSocket injection for bidirectional control.
+
+Both feed into a single **daemon** (Rust) that routes everything through one or
+more chat **backends** (Telegram first, others later).
 
 ---
 
@@ -28,6 +31,7 @@ Bridge between pi coding agent sessions and chat platforms. Two components:
   - [Session Manager](#session-manager)
   - [Session Discovery](#session-discovery)
   - [IPC Client](#ipc-client)
+  - [pup-claude — Claude Code Integration](#pup-claude--claude-code-integration)
   - [pup-telegram — Telegram Backend](#pup-telegram--telegram-backend)
   - [Configuration](#configuration)
   - [Setup Wizard](#setup-wizard)
@@ -52,15 +56,18 @@ Bridge between pi coding agent sessions and chat platforms. Two components:
 | Term | Meaning |
 |------|---------|
 | **pi** | The coding agent TUI (`@mariozechner/pi-coding-agent`) |
-| **pup** | This project — the bridge between pi sessions and chat platforms |
+| **Claude Code** | Anthropic's CLI coding agent (`claude`) — supported via `pup-claude` |
+| **pup** | This project — the bridge between agent sessions and chat platforms |
 | **extension** | TypeScript module loaded into a pi session (our "Component 1") |
 | **daemon** | Long-running Rust process that connects to extensions and drives chat backends |
 | **backend** | A chat platform integration (Telegram, Discord, etc.) |
-| **session** | A pi agent session (conversation + tool history stored as JSONL) |
+| **session** | An agent session (conversation + tool history stored as JSONL) — either pi or Claude Code |
+| **transcript** | Claude Code's `.jsonl` conversation log in `~/.claude/projects/` |
+| **inspector** | Bun's `BUN_INSPECT` WebSocket debugger, used to inject stdin into Claude Code |
 | **steer** | Interrupt the agent mid-stream to deliver a message immediately |
 | **follow-up** | Queue a message until the agent finishes its current work |
 | **turn** | One LLM response plus any resulting tool calls |
-| **topic** | Telegram forum topic — one per pi session in topics mode |
+| **topic** | Telegram forum topic — one per session in topics mode |
 | **DM mode** | Telegram DM-based interaction with `/attach` / `/detach` |
 
 ---
@@ -68,34 +75,42 @@ Bridge between pi coding agent sessions and chat platforms. Two components:
 ## Overview
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ pi session 1│     │ pi session 2│     │ pi session N│
-│  + extension│     │  + extension│     │  + extension│
-│    (TUI ✓)  │     │    (TUI ✓)  │     │    (TUI ✓)  │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │ unix sock         │ unix sock         │ unix sock
-       │                   │                   │
-       └───────────┬───────┴───────────────────┘
-                   │
-            ┌──────┴──────┐
-            │     pup     │
-            │   (Rust)    │
-            │             │
-            │  ┌────────┐ │     future:
-            │  │telegram │ │     ┌──────────┐
-            │  └────┬───┘ │     │ discord  │
-            └───────┼─────┘     │ slack    │
-                    │           │ signal   │
-                    ▼           └──────────┘
-             ┌───────────┐
-             │  phone     │
-             └───────────┘
+  pi sessions                         Claude Code sessions
+┌─────────────┐  ┌─────────────┐    ┌─────────────┐  ┌─────────────┐
+│ pi session 1│  │ pi session N│    │ CC session 1│  │ CC session N│
+│  + extension│  │  + extension│    │   (TUI ✓)   │  │   (TUI ✓)   │
+│    (TUI ✓)  │  │    (TUI ✓)  │    └──────┬──────┘  └──────┬──────┘
+└──────┬──────┘  └──────┬──────┘           │ transcript      │ transcript
+       │ unix sock      │ unix sock        │ + inspector?    │ + inspector?
+       │                │                  │                 │
+       └────────┬───────┘                  └────────┬────────┘
+                │                                   │
+         ┌──────┴──────┐                   ┌────────┴────────┐
+         │ pi sessions │                   │  Claude Code    │
+         │  (pup-core) │                   │  (pup-claude)   │
+         └──────┬──────┘                   └────────┬────────┘
+                │         SessionEvent              │
+                └──────────────┬────────────────────┘
+                               │
+                        ┌──────┴──────┐
+                        │     pup     │
+                        │   (Rust)    │
+                        │             │
+                        │  ┌────────┐ │     future:
+                        │  │telegram │ │     ┌──────────┐
+                        │  └────┬───┘ │     │ discord  │
+                        └───────┼─────┘     │ slack    │
+                                │           │ signal   │
+                                ▼           └──────────┘
+                         ┌───────────┐
+                         │  phone     │
+                         └───────────┘
 ```
 
-The pi TUI continues to work normally. The extension runs in-process alongside
-it, subscribing to pi events and exposing them over a socket. The daemon is a
-separate long-running process that can drive multiple chat backends
-simultaneously.
+Both agent types feed the same `SessionEvent` stream to backends. Pi sessions
+use a Unix socket IPC protocol (bidirectional by default). Claude Code sessions
+use transcript file watching (read path) with optional `BUN_INSPECT` WebSocket
+injection (write path). The TUI for each agent continues to work normally.
 
 ---
 
@@ -297,6 +312,16 @@ daemon/
 │   │       ├── discovery.rs      # Watch socket dir for new/removed sockets
 │   │       ├── render.rs         # Markdown → plain text / common transforms
 │   │       └── types.rs          # SessionInfo, SessionEvent, IncomingMessage
+│   │
+│   ├── pup-claude/               # Claude Code session integration
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs            # Module exports
+│   │       ├── injector.rs       # ClaudeService — main loop, event routing
+│   │       ├── discovery.rs      # Process + transcript scanning
+│   │       ├── transcript.rs     # .jsonl parser + TranscriptWatcher
+│   │       ├── inspector.rs      # BUN_INSPECT WebSocket client
+│   │       └── session.rs        # Per-session state + inspector state machine
 │   │
 │   ├── pup-telegram/             # Telegram backend implementation
 │   │   ├── Cargo.toml
@@ -512,6 +537,293 @@ The `IpcClient` connects to a Unix socket, splits into reader/writer halves
 (like coop), and provides:
 - `async fn recv(&mut self) -> Result<ServerMessage>` — reads next line, deserializes
 - `async fn send(&mut self, msg: ClientMessage) -> Result<()>` — serializes, writes line
+
+### pup-claude — Claude Code Integration
+
+The `pup-claude` crate adds support for Claude Code sessions without requiring
+a pi extension. It discovers Claude Code sessions by watching transcript files
+and process state, then feeds the same `SessionEvent` stream to backends.
+
+Unlike pi sessions (which use a bidirectional Unix socket), Claude Code
+integration is asymmetric:
+
+- **Read path** (always available): parse `.jsonl` transcript files for
+  conversation events.
+- **Write path** (requires `BUN_INSPECT`): inject keystrokes into the Claude
+  Code TUI via Bun's WebKit Inspector Protocol.
+
+#### Architecture Overview
+
+```
+~/.claude/projects/                        /proc/<pid>/
+├── -root-myproject/                       ├── cmdline  → "claude\0..."
+│   ├── <session-uuid>.jsonl  ◄──poll──    ├── environ  → "BUN_INSPECT=ws://..."
+│   └── ...                                └── cwd      → /root/myproject
+│
+└── -home-user-code/
+    └── <session-uuid>.jsonl
+
+        │                                          │
+        │ TranscriptWatcher (500ms poll)           │ Process scan (5s)
+        ▼                                          ▼
+┌──────────────────────────────────────────────────────────┐
+│                    ClaudeService                         │
+│                                                          │
+│  ┌─────────────────┐  ┌───────────────────────────────┐  │
+│  │   Discovery      │  │  Per-session state            │  │
+│  │   (5s interval)  │  │  ┌──────────────────────┐    │  │
+│  │                  │  │  │ TranscriptWatcher     │    │  │
+│  │  proc scan ──────┤  │  │  (file offset tracking│    │  │
+│  │  transcript scan─┤  │  │   + entry → event)   │    │  │
+│  └─────────────────┘  │  ├──────────────────────┤    │  │
+│                        │  │ InspectorClient?     │    │  │
+│                        │  │  (WebSocket to Bun)  │    │  │
+│                        │  └──────────────────────┘    │  │
+│                        └───────────────────────────────┘  │
+│                                                          │
+│  convert_event() ──► mpsc<SessionEvent> ──► backends     │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### Session Discovery
+
+Two strategies run in parallel every 5 seconds:
+
+**1. Process scanning** (`find_claude_processes`):
+
+Iterates `/proc/<pid>/` entries looking for Claude Code processes. A process is
+identified as Claude Code if its cmdline contains `claude/versions/`,
+`claude-code`, or starts with `claude\0`. For each match, the scanner reads:
+
+| Source | Data |
+|--------|------|
+| `/proc/<pid>/cmdline` | Process identification |
+| `/proc/<pid>/environ` | `BUN_INSPECT` WebSocket URL, `PWD` |
+| `/proc/<pid>/cwd` | Fallback working directory |
+
+**2. Transcript scanning** (`find_recent_transcripts`):
+
+Watches `~/.claude/projects/<project-slug>/` for `.jsonl` files modified in the
+last 5 minutes. The project slug encodes the working directory path
+(`/root/myproject` → `-root-myproject`). This is lossy — directory names
+containing `-` are ambiguous — but sufficient for display.
+
+**Deduplication:** Multiple transcript files may exist for the same Claude Code
+process (e.g., old sessions that were resumed). The scanner picks the most
+recently modified transcript per PID to avoid duplicate tracking.
+
+**Stale session detection:** Sessions are marked gone when:
+- The transcript is no longer found in a scan
+- The transcript has been inactive longer than 60 seconds AND the process is dead
+
+Recently-gone sessions are suppressed for 10 minutes to prevent rediscovery
+loops (e.g., a transcript file that's still on disk after the process exits).
+
+**Same-PID replacement:** If a process starts a new session (same PID, different
+transcript), the old session is automatically disconnected and replaced.
+
+**Discovery events:**
+
+| Event | When |
+|-------|------|
+| `SessionAppeared` | New transcript + process match found |
+| `SessionGone` | Session inactive or process exited |
+| `InspectorDiscovered` | `BUN_INSPECT` URL found for a session that previously had none |
+
+#### Transcript Parsing
+
+**File format:** Claude Code writes all conversation data to
+`~/.claude/projects/<slug>/<session-uuid>.jsonl`. Each line is an independent
+JSON object with a `type` field.
+
+**Entry types:**
+
+| `type` field | Parsed as | Description |
+|-------------|-----------|-------------|
+| `"user"` (string content) | `UserText` | User prompt text |
+| `"user"` (array with `tool_result`) | `ToolResult` | Tool execution result |
+| `"assistant"` | `Assistant` | Model response — text, thinking, and tool_use blocks |
+| `"file-history-snapshot"` | `Ignored` | File backup metadata |
+| `"progress"` | `Ignored` | Subagent/task progress |
+
+**Assistant entry structure:**
+
+An assistant entry's `message.content` is an array of typed blocks:
+
+```json
+[
+  { "type": "thinking", "thinking": "let me think..." },
+  { "type": "text", "text": "Here's the answer." },
+  { "type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {"command": "ls"} }
+]
+```
+
+Multiple assistant entries may share the same `message.id` (the API message ID)
+as Claude Code writes incremental updates. The watcher tracks the latest state
+per API message ID and deduplicates accordingly.
+
+#### Transcript Watcher
+
+`TranscriptWatcher` polls a single `.jsonl` file for new content every 500ms.
+It uses file offset tracking — each poll seeks to where it left off and reads
+any new complete lines (partial lines are left for the next poll).
+
+**State tracking:**
+
+```rust
+struct TranscriptWatcher {
+    offset: u64,                                    // File position
+    seen_messages: HashMap<String, AssistantState>,  // Per API message
+    seen_tool_starts: HashSet<String>,               // Deduplicate ToolStart
+    pending_message_id: Option<String>,              // Awaiting MessageEnd
+    agent_started: bool,                             // Current turn state
+}
+```
+
+**Event generation:**
+
+| Transcript entry | Emitted events |
+|-----------------|----------------|
+| `UserText` | Flush pending → `UserMessage` |
+| `Assistant` (first for this `message.id`) | `AgentStart` (if first in turn) → `MessageStart` → `ToolStart` per new tool |
+| `Assistant` (update for existing `message.id`) | `ToolStart` for any new tool_use blocks |
+| `ToolResult` | Flush pending → `ToolEnd` |
+| 3s inactivity | Flush pending → `MessageEnd` + `AgentEnd` |
+
+**"Flush pending"** means: if there's an in-progress assistant message, emit
+`MessageEnd` with the accumulated text. This happens when a `UserText` or
+`ToolResult` entry arrives (indicating the previous assistant turn is complete),
+or after 3 seconds of inactivity (the stale timeout).
+
+**No streaming deltas:** Unlike the pi extension which emits `MessageDelta`
+events in real-time, the transcript watcher only sees complete entries. Backends
+receive `MessageStart` followed by `MessageEnd` with the full text — no
+intermediate edits. This means Telegram renders Claude Code responses as a
+single message rather than streaming edits.
+
+**History parsing:** On session connect, `parse_history()` reads the entire
+transcript to reconstruct `Turn` objects (user message + assistant response +
+tool calls). This is the same format used by pi sessions, so backends can render
+a catch-up summary.
+
+#### Inspector Client (BUN_INSPECT)
+
+The `InspectorClient` connects to Bun's WebKit Inspector Protocol over
+WebSocket. This is the write path — it enables sending messages to Claude Code
+from chat platforms.
+
+**Connection:**
+
+```
+claude process (Bun runtime)
+  └─ BUN_INSPECT=ws://127.0.0.1:9229/<id>
+       └─ WebSocket ← InspectorClient
+            └─ Runtime.evaluate("process.stdin.push(...)")
+```
+
+The client connects and immediately verifies with `1+1 = 2`. If verification
+fails, the connection is rejected.
+
+**Message injection** (`inject_stdin`):
+
+Injecting a message requires three separate `process.stdin.push()` calls,
+because Ink's TUI input handler processes each push as a discrete event:
+
+| Step | What | Why |
+|------|------|-----|
+| 1. `\x15` × 2 (Ctrl+U) | Clear existing input | 50ms delay between, ensures clean slate |
+| 2. Message text (hex-encoded) | Push the actual message | Hex encoding avoids JS string escaping issues |
+| 3. `\x0d` (Enter) | Submit | Triggers Ink's submit handler |
+
+**Cancel** (`inject_escape`): Sends `\x1b` (Escape) to abort the current
+operation.
+
+**Availability:** The inspector is only available when Claude Code was launched
+with the `BUN_INSPECT` environment variable set. Without it, the session is
+read-only — backends can display events but cannot send messages.
+
+#### Inspector State Machine
+
+Each session tracks its inspector connection through a state machine:
+
+```
+                         ┌───────────────┐
+     (no BUN_INSPECT) ──►│  Unavailable  │
+                         └───────────────┘
+
+                         ┌───────────────┐
+  (URL found in /proc) ──►│  Discovered  │
+                         └───────┬───────┘
+                                 │ connect_inspector()
+                          ┌──────┴──────┐
+                     ┌────▼────┐   ┌────▼────┐
+                     │Connected│   │  Lost   │
+                     │ (ready) │   │(backoff)│
+                     └─────────┘   └────┬────┘
+                                        │ retry (5s tick)
+                                        └─► Discovered
+```
+
+| State | Meaning |
+|-------|---------|
+| `Unavailable` | No `BUN_INSPECT` URL known. Read-only mode. |
+| `Discovered` | URL found, connection not yet attempted. |
+| `Connected` | WebSocket active, injection available. |
+| `Lost` | Connection failed. Exponential backoff: 2s → 4s → 8s → … → 30s max. |
+
+The `ClaudeService` retries `Lost` and `Discovered` connections every 5 seconds.
+A successful reconnection emits a notification to backends.
+
+#### ClaudeService (Integration Layer)
+
+`ClaudeService` (`injector.rs`) is the main entry point. It runs as a tokio task
+alongside the pi session manager, producing the same `SessionEvent` stream.
+
+**Run loop** (`tokio::select!`):
+
+| Arm | Source | Action |
+|-----|--------|--------|
+| Discovery events | `mpsc<DiscoveryEvent>` | Connect/disconnect sessions, update inspector URLs |
+| Commands | `mpsc<ClaudeCommand>` | Inject messages or cancel via inspector |
+| Transcript poll (500ms) | Timer | Poll all `TranscriptWatcher`s, emit `SessionEvent`s |
+| Inspector retry (5s) | Timer | Reconnect `Lost`/`Discovered` inspectors |
+| Shutdown | `watch<bool>` | Emit `Disconnected` for all sessions, exit |
+
+**Session lifecycle:**
+
+| Event | Actions |
+|-------|---------|
+| `SessionAppeared` | Create `ClaudeSession`, parse history, connect inspector (if URL available), emit `Connected` + capability notification |
+| `SessionGone` | Remove session, emit `Disconnected` |
+| `InspectorDiscovered` | Update session's inspector URL, attempt connection |
+
+**Commands:**
+
+```rust
+enum ClaudeCommand {
+    InjectMessage { session_id, text, reply: Sender<Result<()>> },
+    Cancel { session_id },
+}
+```
+
+`InjectMessage` routes to `inspector.inject_stdin()`. `Cancel` sends Escape.
+Both require a connected inspector — otherwise they return an error.
+
+**Event conversion:** Internal `pup_claude::SessionEvent` variants are mapped to
+`pup_core::SessionEvent` at the boundary via `convert_event()`. The mapping is
+straightforward except:
+
+- `thinking` blocks from assistant messages are currently discarded
+- `ToolEnd` events from transcripts don't carry `tool_name` (set to empty
+  string) because tool result entries in the transcript don't include it
+
+#### Session Registry
+
+A `SessionRegistry` (`Arc<RwLock<HashSet<String>>>`) tracks which session IDs
+belong to Claude Code sessions. The daemon uses this to route incoming messages
+— if a session ID is in the registry, the message goes to `ClaudeService` via
+`ClaudeCommand::InjectMessage` instead of the pi session manager's IPC
+connection.
 
 ### pup-telegram — Telegram Backend
 
@@ -868,6 +1180,8 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"            # WebSocket client for BUN_INSPECT
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-appender = "0.2"
@@ -929,6 +1243,19 @@ session_manager                              (socket_dir)
 └── route_incoming                           (session_id, backend, mode)
     └── ipc_send                             (session_id, command)
 
+claude_service
+├── claude_discovery                         (dir)
+│   └── scan                                (transcript_count, process_count)
+├── connect_session                          (session_id, path, inspector?)
+│   └── parse_history                        (turns, model)
+├── disconnect_session                       (session_id)
+├── handle_command                           (command_type, session_id)
+│   └── inject_stdin / inject_escape         (session_id)
+├── poll_all_transcripts                     (session_count)
+│   └── transcript_poll                      (session_id, events_emitted)
+└── retry_inspector_connections              (session_count)
+    └── inspector_connect                    (session_id, url, success)
+
 telegram_backend                             (bot_username, dm_enabled, topics_enabled)
 ├── init                                     (supergroup_id, user_count)
 │   └── validate_topics                      (chat_id, is_admin, can_manage_topics)
@@ -977,6 +1304,18 @@ telegram_backend                             (bot_username, dm_enabled, topics_e
 - Rate limit hit — `warn!(method, retry_after, "rate limited")`
 - Backend crash/restart — `error!(err, "backend crashed")`,
   `info!(attempt, backoff_ms, "restarting backend")`
+
+**`pup-claude`** — `tracing` only:
+- `ClaudeService::run()` — `info_span!("claude_service")`
+- `ClaudeDiscovery::run()` — `info_span!("claude_discovery", dir)`
+- Discovery scan — `debug!` on scan failures
+- Session connect — `info!(session_id, path, "connecting Claude Code session")`
+- Session disconnect — `info!(session_id, "Claude Code session disconnected")`
+- Inspector connect — `info!(session_id, "inspector connected")`,
+  `warn!(session_id, error, "inspector connect failed")`
+- Late inspector discovery — `info!(session_id, url, pid, "late inspector discovery")`
+- Stale session replacement — `info!(old_session, new_session, pid, "replacing stale CC session")`
+- Transcript poll errors — `debug!(session_id, error, "transcript poll failed")`
 
 **`pup-daemon`** — owns the subscriber setup:
 - `main()` — `info!(config_path, backends, "starting pup")`
@@ -1080,6 +1419,54 @@ User types in Telegram topic
                                 (TUI shows the message too)
 ```
 
+### Viewing a Claude Code response (Topics mode)
+
+```
+Claude Code writes assistant entry to transcript
+  │
+  ├─ TranscriptWatcher: poll() sees new line at offset N
+  │    └─ parse_line() → Assistant { api_message_id, text, tool_uses }
+  │         └─ process_assistant() → SessionEvent::AgentStart
+  │                                + SessionEvent::MessageStart
+  │                                + SessionEvent::ToolStart (per tool)
+  │              └─ convert_event() → pup_core::SessionEvent
+  │                   └─ event_tx → fan-out → TelegramBackend::handle_event
+  │                        └─ outbox.enqueue(Send) → topic gets message
+  │
+  └─ 3s stale timeout (no more transcript activity)
+       └─ maybe_flush_stale() → SessionEvent::MessageEnd + AgentEnd
+            └─ TelegramBackend: final message with complete content
+```
+
+Note: Unlike pi sessions which stream `MessageDelta` events, Claude Code
+sessions emit `MessageStart` + `MessageEnd` with full text (no intermediate
+edits). The backend receives the complete response in one shot.
+
+### Sending a message to Claude Code from Telegram
+
+```
+User types in Telegram topic
+  │
+  └─ getUpdates → TelegramBackend::poll_incoming
+       │
+       └─ returns IncomingMessage { session_id, text, Steer }
+            │
+            └─ daemon checks SessionRegistry:
+                 session_id in claude_registry?
+                 │
+                 ├─ YES → ClaudeCommand::InjectMessage { session_id, text }
+                 │         │
+                 │         └─ ClaudeService::handle_command
+                 │              └─ session.inject_message(text)
+                 │                   └─ InspectorClient::inject_stdin
+                 │                        ├─ Ctrl+U × 2 (clear)
+                 │                        ├─ hex-encoded text (push)
+                 │                        └─ Enter (submit)
+                 │                             └─ Claude Code processes prompt
+                 │
+                 └─ NO → IPC route to pi session (existing flow)
+```
+
 ### Session discovery (topics mode)
 
 ```
@@ -1106,6 +1493,37 @@ User exits `pi`
                  └─ TelegramBackend: deleteForumTopic(topic_id)
 ```
 
+### Claude Code session discovery
+
+```
+User starts `claude` in a project directory
+  │
+  └─ Claude Code writes to ~/.claude/projects/-root-myproject/<uuid>.jsonl
+       │
+       └─ ClaudeDiscovery: scan() finds recently-modified .jsonl
+            │
+            ├─ find_claude_processes(): match PID via cwd / session ID
+            │    └─ read BUN_INSPECT from /proc/<pid>/environ
+            │
+            └─ DiscoveryEvent::SessionAppeared
+                 │
+                 └─ ClaudeService: connect_session()
+                      ├─ parse_history() → Turn objects
+                      ├─ connect inspector (if BUN_INSPECT available)
+                      └─ emit SessionEvent::Connected → fan-out
+                           └─ TelegramBackend: createForumTopic("📎 myproject")
+
+User exits `claude`
+  │
+  └─ Process exits, transcript goes stale (60s timeout)
+       │
+       └─ ClaudeDiscovery: scan() detects gone
+            └─ DiscoveryEvent::SessionGone
+                 └─ ClaudeService: disconnect_session()
+                      └─ SessionEvent::Disconnected → fan-out
+                           └─ TelegramBackend: deleteForumTopic(topic_id)
+```
+
 ---
 
 ## Error Handling & Edge Cases
@@ -1126,6 +1544,11 @@ User exits `pi`
 | **Extension loaded but no daemon** | Socket sits idle. Negligible overhead. |
 | **One backend crashes** | Session manager logs the error. Other backends continue. The crashed backend's task is restarted after a delay. |
 | **Multiple backends enabled** | All receive all events. Each renders independently. A user message from Telegram goes to the session; the Discord backend sees it as a `UserMessage` event and can render it too. |
+| **Claude Code session without BUN_INSPECT** | Read-only mode. Backends display events but cannot inject messages. Backend replies "inspector not available" on send attempt. |
+| **Claude Code inspector disconnects** | State transitions to `Lost`. Exponential backoff retry (2s → 30s). Notification emitted on reconnection. |
+| **Claude Code transcript goes stale** | After 60s inactivity + dead process, session marked gone. 10-minute suppression prevents rediscovery loops. |
+| **Claude Code process restarts same session** | New PID detected, old session replaced. Inspector URL re-discovered from new process environ. |
+| **Multiple Claude Code transcripts for same PID** | Deduplication: only the most recently modified transcript is tracked per PID. |
 
 ---
 
@@ -1188,25 +1611,37 @@ main()
   ├─ config::load()
   ├─ tracing_setup::init()
   │
-  └─ SessionManager::run()                    [spawned task]
+  ├─ SessionManager::run()                    [spawned task]
+  │    │
+  │    ├─ discovery_loop()                    [spawned task]
+  │    │    └─ notify watcher + initial scan
+  │    │
+  │    ├─ per-session IPC reader              [spawned task per session]
+  │    │    └─ IpcClient::recv() loop
+  │    │
+  │    ├─ per-backend event consumer          [spawned task per backend]
+  │    │    └─ mpsc::Receiver<SessionEvent> loop
+  │    │
+  │    ├─ per-backend incoming poller         [spawned task per backend]
+  │    │    └─ poll_incoming() → mpsc::Sender<IncomingMessage>
+  │    │
+  │    └─ main select! loop:
+  │         ├─ IPC events (from per-session tasks via mpsc)
+  │         ├─ IncomingMessages (from backends via mpsc)
+  │         ├─ Discovery events (new/removed sockets)
+  │         └─ Shutdown signal (SIGINT/SIGTERM)
+  │
+  └─ ClaudeService::run()                    [spawned task]
        │
-       ├─ discovery_loop()                    [spawned task]
-       │    └─ notify watcher + initial scan
-       │
-       ├─ per-session IPC reader              [spawned task per session]
-       │    └─ IpcClient::recv() loop
-       │
-       ├─ per-backend event consumer          [spawned task per backend]
-       │    └─ mpsc::Receiver<SessionEvent> loop
-       │
-       ├─ per-backend incoming poller         [spawned task per backend]
-       │    └─ poll_incoming() → mpsc::Sender<IncomingMessage>
+       ├─ ClaudeDiscovery::run()             [spawned task]
+       │    └─ scan() every 5s (proc + transcript)
        │
        └─ main select! loop:
-            ├─ IPC events (from per-session tasks via mpsc)
-            ├─ IncomingMessages (from backends via mpsc)
-            ├─ Discovery events (new/removed sockets)
-            └─ Shutdown signal (SIGINT/SIGTERM)
+            ├─ DiscoveryEvents (session appeared/gone/inspector)
+            ├─ ClaudeCommands (inject message, cancel)
+            ├─ Transcript poll timer (500ms)
+            ├─ Inspector retry timer (5s)
+            └─ Shutdown signal
 ```
 
 ### Task Communication
@@ -1217,6 +1652,9 @@ main()
 | Session manager → backend | `mpsc<SessionEvent>` | One sender per backend, session manager fans out |
 | Backend → session manager | `mpsc<IncomingMessage>` | Shared sender, all backends write to same channel |
 | Discovery → session manager | `mpsc<DiscoveryEvent>` | New socket / removed socket notifications |
+| Claude discovery → Claude service | `mpsc<DiscoveryEvent>` | Session appeared / gone / inspector found |
+| Daemon → Claude service | `mpsc<ClaudeCommand>` | Inject message / cancel |
+| Claude service → backends | `mpsc<SessionEvent>` | Shared with pi session manager's event channel |
 
 All channels are bounded. Back-pressure from a slow backend does not block other
 backends or the IPC readers. If a backend's channel fills up, the session
@@ -1249,11 +1687,15 @@ configured rate.
 | Data | Where | Survives |
 |------|-------|----------|
 | Pi session history | `~/.pi/agent/sessions/.../*.jsonl` | Everything (pi manages this) |
+| Claude Code transcripts | `~/.claude/projects/<slug>/*.jsonl` | Everything (Claude Code manages this) |
 | Daemon config | `~/.config/pup/config.toml` | Daemon restarts |
 | Telegram topic → session mapping | In-memory `HashMap` | **Nothing** — rebuilt on restart |
 | DM attachment state | In-memory | **Nothing** — detached on restart |
 | Outbox queue | In-memory | **Nothing** — pending messages lost on crash |
 | Streaming accumulator | In-memory | **Nothing** — partial messages lost on crash |
+| Claude session registry | In-memory `HashSet` | **Nothing** — rebuilt from discovery |
+| Transcript watcher offsets | In-memory `u64` per session | **Nothing** — history reparsed on restart |
+| Inspector connections | In-memory WebSocket | **Nothing** — reconnected on restart |
 
 ### What Happens on Daemon Restart
 
@@ -1361,6 +1803,20 @@ logic needed — the daemon reconnects as a new client.
 connection fails, it's either because pi exited (permanent) or because of a
 transient filesystem issue (rare, next scan fixes it).
 
+### Claude Code Inspector Connection
+
+The inspector WebSocket connection has its own resilience model:
+
+| Failure | Behavior |
+|---------|----------|
+| Initial connection fails | State → `Lost`, retry with exponential backoff (2s base) |
+| Connection drops mid-session | State → `Lost`, next retry tick attempts reconnection |
+| `BUN_INSPECT` not available | State stays `Unavailable`, session is read-only |
+| Process restarts with new URL | Discovery detects new PID, resets to `Discovered` |
+
+Backoff: 2s → 4s → 8s → 16s → 30s (capped). Retries run every 5 seconds via a
+timer in the `ClaudeService` run loop.
+
 ### Telegram API Connection
 
 The `update_poller` task handles Telegram API failures:
@@ -1450,6 +1906,13 @@ run alongside new topics. The optional cleanup-on-startup config handles this.
 - `dm::parse_command()` — command parsing for all DM commands
 - `topics::topic_name()` — name generation from session info
 
+**`pup-claude`:**
+- `transcript::parse_line()` — user text, assistant (with thinking + tool_use
+  blocks), tool results, ignored entry types
+- `transcript::TranscriptWatcher` — offset tracking, stale flush, event
+  generation sequence
+- `discovery::slug_to_path()` — project slug → filesystem path conversion
+
 **`pup-daemon`:**
 - Config parsing: valid TOML, missing fields, invalid values, env var
   interpolation
@@ -1463,6 +1926,11 @@ run alongside new topics. The optional cleanup-on-startup config handles this.
 - Verify `hello` + `history` received
 - Send a `send` command, verify pi processes it
 - Verify streaming events flow through
+
+**Claude Code transcript parsing** (`#[ignore]` — requires real files):
+- Parse a real `.jsonl` transcript, verify entry counts
+- Load full history via `parse_history()`, verify turn reconstruction
+- Connect to a live inspector, verify `1+1` eval and message injection
 
 **Daemon ↔ Telegram (mock):**
 - Stand up a mock Telegram Bot API server (simple HTTP server that responds to
@@ -1601,3 +2069,22 @@ journalctl --user -u pup -f
 8. **Backend-to-backend.** If both Telegram and Discord are connected, a message
    sent from Telegram shows up in Discord via the `UserMessage` event. This is
    essentially free with the fan-out architecture.
+
+9. **Claude Code streaming deltas.** Currently, Claude Code responses arrive as
+   complete `MessageEnd` events (no `MessageDelta`). This means no streaming
+   edits in Telegram — the full response appears at once. Streaming could be
+   added by watching the transcript file more aggressively (sub-second polling
+   or `inotify`) and emitting deltas as partial assistant entries arrive.
+
+10. **Claude Code `tool_name` in `ToolEnd`.** Transcript `tool_result` entries
+    don't include the tool name, only the `tool_use_id`. The current workaround
+    sets `tool_name` to empty string. This could be fixed by maintaining a
+    lookup from `tool_use_id` → `tool_name` populated during `ToolStart`.
+
+11. **Claude Code thinking block forwarding.** Assistant thinking blocks are
+    parsed but currently discarded at the `convert_event()` boundary. Backends
+    could optionally render thinking content (e.g., in verbose mode).
+
+12. **Cross-platform process discovery.** Claude Code discovery currently uses
+    `/proc/` (Linux-only). macOS support would need `sysctl` or `ps`-based
+    scanning.
