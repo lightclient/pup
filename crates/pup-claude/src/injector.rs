@@ -7,7 +7,7 @@
 //! - Polls transcript watchers for conversation events
 //! - Converts internal events to `pup_core` types for backend fan-out
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -59,6 +59,11 @@ pub struct ClaudeService {
     discovery_rx: mpsc::Receiver<DiscoveryEvent>,
     /// Discovery event sender (passed to the discovery task).
     discovery_tx: mpsc::Sender<DiscoveryEvent>,
+    /// Recently injected messages per session, used to detect echoes.
+    /// When a message is injected via `InjectMessage`, its text is pushed
+    /// here. When the transcript watcher reports a matching `UserMessage`,
+    /// it is marked as an echo so backends don't redisplay it.
+    injected_messages: HashMap<String, VecDeque<String>>,
 }
 
 impl ClaudeService {
@@ -83,6 +88,7 @@ impl ClaudeService {
             command_rx,
             discovery_rx,
             discovery_tx,
+            injected_messages: HashMap::new(),
         };
 
         (service, command_tx, registry)
@@ -254,6 +260,20 @@ impl ClaudeService {
             return;
         }
 
+        // Check for --dangerously-skip-permissions. Without it, Claude Code
+        // will prompt for tool-use confirmations in the TUI which pup cannot
+        // answer, so we warn the user.
+        if discovered.pid.is_some() && !discovered.dangerously_skip_permissions {
+            warn!(session_id, "Claude Code was not started with --dangerously-skip-permissions");
+            let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
+                session_id: session_id.clone(),
+                text: "⚠️ Claude Code was not started with --dangerously-skip-permissions. \
+                       Permission prompts cannot be handled remotely — messages sent from \
+                       here may get stuck. Restart Claude Code with \
+                       --dangerously-skip-permissions to enable full remote control.".into(),
+            }).await;
+        }
+
         // Notify about injection capability.
         if can_inject {
             let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
@@ -276,6 +296,7 @@ impl ClaudeService {
     /// Disconnect from a session.
     async fn disconnect_session(&mut self, session_id: &str) {
         if self.sessions.remove(session_id).is_some() {
+            self.injected_messages.remove(session_id);
             if let Ok(mut reg) = self.registry.write() {
                 reg.remove(session_id);
             }
@@ -299,7 +320,21 @@ impl ClaudeService {
             } => {
                 let result = match self.sessions.get_mut(&session_id) {
                     Some(session) => match session.inject_message(&text).await {
-                        Ok(()) => Ok(()),
+                        Ok(()) => {
+                            // Remember the injected text so we can mark the
+                            // corresponding transcript entry as an echo.
+                            let queue = self
+                                .injected_messages
+                                .entry(session_id.clone())
+                                .or_default();
+                            queue.push_back(text);
+                            // Cap the queue to avoid unbounded growth if the
+                            // transcript watcher falls behind.
+                            while queue.len() > 32 {
+                                queue.pop_front();
+                            }
+                            Ok(())
+                        }
                         Err(e) => Err(e.to_string()),
                     },
                     None => Err(format!("no Claude Code session with id {session_id}")),
@@ -335,7 +370,7 @@ impl ClaudeService {
             };
 
             for event in events {
-                let core_event = convert_event(event);
+                let core_event = self.convert_event(event);
                 if self.event_tx.send(core_event).await.is_err() {
                     warn!("event channel closed");
                     return;
@@ -358,65 +393,88 @@ impl ClaudeService {
             }
         }
     }
-}
 
-/// Convert a `pup_claude::SessionEvent` to a `pup_core::SessionEvent`.
-fn convert_event(event: crate::session::SessionEvent) -> pup_core::types::SessionEvent {
-    match event {
-        crate::session::SessionEvent::UserMessage {
-            session_id,
-            content,
-        } => pup_core::types::SessionEvent::UserMessage {
-            session_id,
-            content,
-            echo: false,
-            source: pup_core::types::MessageSource::Interactive,
-        },
-        crate::session::SessionEvent::AgentStart { session_id } => {
-            pup_core::types::SessionEvent::AgentStart { session_id }
+    /// Convert a `pup_claude::SessionEvent` to a `pup_core::SessionEvent`,
+    /// detecting echoed messages that were injected from a backend.
+    fn convert_event(
+        &mut self,
+        event: crate::session::SessionEvent,
+    ) -> pup_core::types::SessionEvent {
+        match event {
+            crate::session::SessionEvent::UserMessage {
+                session_id,
+                content,
+            } => {
+                // Check if this message was injected by us (from a backend).
+                // If so, mark it as an echo so the backend doesn't redisplay it.
+                let echo = self
+                    .injected_messages
+                    .get_mut(&session_id)
+                    .and_then(|queue| {
+                        queue
+                            .iter()
+                            .position(|t| *t == content)
+                            .map(|idx| queue.remove(idx))
+                    })
+                    .is_some();
+
+                pup_core::types::SessionEvent::UserMessage {
+                    session_id,
+                    content,
+                    echo,
+                    source: if echo {
+                        pup_core::types::MessageSource::Extension
+                    } else {
+                        pup_core::types::MessageSource::Interactive
+                    },
+                }
+            }
+            crate::session::SessionEvent::AgentStart { session_id } => {
+                pup_core::types::SessionEvent::AgentStart { session_id }
+            }
+            crate::session::SessionEvent::AgentEnd { session_id } => {
+                pup_core::types::SessionEvent::AgentEnd { session_id }
+            }
+            crate::session::SessionEvent::MessageStart {
+                session_id,
+                message_id,
+            } => pup_core::types::SessionEvent::MessageStart {
+                session_id,
+                message_id,
+            },
+            crate::session::SessionEvent::MessageEnd {
+                session_id,
+                message_id,
+                text,
+                thinking: _,
+            } => pup_core::types::SessionEvent::MessageEnd {
+                session_id,
+                message_id,
+                content: text,
+            },
+            crate::session::SessionEvent::ToolStart {
+                session_id,
+                tool_use_id,
+                tool_name,
+                input,
+            } => pup_core::types::SessionEvent::ToolStart {
+                session_id,
+                tool_call_id: tool_use_id,
+                tool_name,
+                args: input,
+            },
+            crate::session::SessionEvent::ToolEnd {
+                session_id,
+                tool_use_id,
+                content,
+                is_error,
+            } => pup_core::types::SessionEvent::ToolEnd {
+                session_id,
+                tool_call_id: tool_use_id,
+                tool_name: String::new(), // Not available from transcript tool_result entries.
+                content,
+                is_error,
+            },
         }
-        crate::session::SessionEvent::AgentEnd { session_id } => {
-            pup_core::types::SessionEvent::AgentEnd { session_id }
-        }
-        crate::session::SessionEvent::MessageStart {
-            session_id,
-            message_id,
-        } => pup_core::types::SessionEvent::MessageStart {
-            session_id,
-            message_id,
-        },
-        crate::session::SessionEvent::MessageEnd {
-            session_id,
-            message_id,
-            text,
-            thinking: _,
-        } => pup_core::types::SessionEvent::MessageEnd {
-            session_id,
-            message_id,
-            content: text,
-        },
-        crate::session::SessionEvent::ToolStart {
-            session_id,
-            tool_use_id,
-            tool_name,
-            input,
-        } => pup_core::types::SessionEvent::ToolStart {
-            session_id,
-            tool_call_id: tool_use_id,
-            tool_name,
-            args: input,
-        },
-        crate::session::SessionEvent::ToolEnd {
-            session_id,
-            tool_use_id,
-            content,
-            is_error,
-        } => pup_core::types::SessionEvent::ToolEnd {
-            session_id,
-            tool_call_id: tool_use_id,
-            tool_name: String::new(), // Not available from transcript tool_result entries.
-            content,
-            is_error,
-        },
     }
 }

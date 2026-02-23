@@ -27,6 +27,9 @@ pub struct DiscoveredSession {
     pub inspector_url: Option<String>,
     /// Process ID of the Claude Code process, if found.
     pub pid: Option<u32>,
+    /// Whether `--dangerously-skip-permissions` was passed on the command line.
+    /// Only meaningful when `pid` is `Some` (i.e. the process was found).
+    pub dangerously_skip_permissions: bool,
 }
 
 /// Events from the discovery loop.
@@ -127,6 +130,7 @@ impl ClaudeDiscovery {
             cwd: String,
             inspector_url: Option<String>,
             pid: Option<u32>,
+            dangerously_skip_permissions: bool,
         }
 
         let mut best_per_pid: HashMap<u32, Candidate> = HashMap::new();
@@ -144,6 +148,7 @@ impl ClaudeDiscovery {
             let mut inspector_url = None;
             let mut pid = None;
             let mut cwd = cwd_from_dir.clone();
+            let mut dangerously_skip_permissions = false;
 
             for proc in &processes {
                 // Match by CWD (direct or slug-based) or session ID.
@@ -156,6 +161,7 @@ impl ClaudeDiscovery {
                 if cwd_matches || proc.session_ids.contains(session_id) {
                     inspector_url.clone_from(&proc.inspector_url);
                     pid = Some(proc.pid);
+                    dangerously_skip_permissions = proc.dangerously_skip_permissions;
                     if !proc.cwd.is_empty() {
                         cwd.clone_from(&proc.cwd);
                     }
@@ -170,6 +176,7 @@ impl ClaudeDiscovery {
                 cwd,
                 inspector_url,
                 pid,
+                dangerously_skip_permissions,
             };
 
             if let Some(p) = pid {
@@ -291,6 +298,7 @@ impl ClaudeDiscovery {
                     cwd: c.cwd.clone(),
                     inspector_url: c.inspector_url.clone(),
                     pid: c.pid,
+                    dangerously_skip_permissions: c.dangerously_skip_permissions,
                 }))
                 .await;
         }
@@ -341,6 +349,7 @@ struct ClaudeProcess {
     cwd: String,
     inspector_url: Option<String>,
     session_ids: Vec<String>,
+    dangerously_skip_permissions: bool,
 }
 
 /// Find running Claude Code processes and extract their `BUN_INSPECT` URLs.
@@ -379,6 +388,9 @@ async fn find_claude_processes() -> Vec<ClaudeProcess> {
             continue;
         }
 
+        let dangerously_skip_permissions =
+            cmdline_str.contains("--dangerously-skip-permissions");
+
         // Read environment variables.
         let environ_path = format!("/proc/{pid}/environ");
         let Ok(environ) = tokio::fs::read(&environ_path).await else {
@@ -411,6 +423,7 @@ async fn find_claude_processes() -> Vec<ClaudeProcess> {
             cwd,
             inspector_url,
             session_ids,
+            dangerously_skip_permissions,
         });
     }
 
