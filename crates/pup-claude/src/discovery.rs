@@ -132,7 +132,7 @@ impl ClaudeDiscovery {
         let mut best_per_pid: HashMap<u32, Candidate> = HashMap::new();
         let mut no_pid_candidates: Vec<Candidate> = Vec::new();
 
-        for (session_id, path, modified, cwd_from_dir) in &transcripts {
+        for (session_id, path, modified, cwd_from_dir, dir_slug) in &transcripts {
             // Skip sessions that were recently marked as gone to prevent
             // rediscovery loops. They can come back if the process restarts
             // (the recently_gone entry expires after 10 min, or the PID
@@ -146,7 +146,14 @@ impl ClaudeDiscovery {
             let mut cwd = cwd_from_dir.clone();
 
             for proc in &processes {
-                if proc.cwd == *cwd_from_dir || proc.session_ids.contains(session_id) {
+                // Match by CWD (direct or slug-based) or session ID.
+                // slug_to_path is lossy for paths with hyphens (e.g.,
+                // /root/pup/cc-test → /root/pup/cc/test) so we also
+                // compare the process CWD converted to a slug against
+                // the raw directory name.
+                let cwd_matches = proc.cwd == *cwd_from_dir
+                    || path_to_slug(&proc.cwd) == *dir_slug;
+                if cwd_matches || proc.session_ids.contains(session_id) {
                     inspector_url.clone_from(&proc.inspector_url);
                     pid = Some(proc.pid);
                     if !proc.cwd.is_empty() {
@@ -412,10 +419,10 @@ async fn find_claude_processes() -> Vec<ClaudeProcess> {
 
 /// Find recently-modified `.jsonl` transcript files under the projects directory.
 ///
-/// Returns `(session_id, path, modified_time, cwd_derived_from_dir_name)`.
+/// Returns `(session_id, path, modified_time, cwd_derived_from_dir_name, raw_dir_slug)`.
 async fn find_recent_transcripts(
     projects_dir: &Path,
-) -> Result<Vec<(String, PathBuf, std::time::SystemTime, String)>> {
+) -> Result<Vec<(String, PathBuf, std::time::SystemTime, String, String)>> {
     let mut result = Vec::new();
 
     let Ok(mut project_dirs) = tokio::fs::read_dir(projects_dir).await else {
@@ -472,11 +479,17 @@ async fn find_recent_transcripts(
                 continue;
             }
 
-            result.push((session_id, file_path, modified, cwd.clone()));
+            result.push((session_id, file_path, modified, cwd.clone(), dir_name.to_owned()));
         }
     }
 
     Ok(result)
+}
+
+/// Convert a filesystem path to the slug Claude Code uses for project directories.
+/// `/root/pup/cc-test` → `-root-pup-cc-test`
+fn path_to_slug(path: &str) -> String {
+    path.replace('/', "-")
 }
 
 /// Convert a Claude Code project slug back to a filesystem path.
