@@ -15,6 +15,8 @@ pub(crate) struct Config {
     pub streaming: StreamingConfig,
     #[serde(default)]
     pub backends: BackendsConfig,
+    #[serde(default)]
+    pub claude_code: ClaudeCodeConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +231,30 @@ pub(crate) struct TelegramDisplayConfig {
     pub max_message_length: usize,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct ClaudeCodeConfig {
+    /// Enable Claude Code session discovery (default: true).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Path to Claude Code projects directory.
+    /// Default: `~/.claude/projects`
+    #[serde(default = "default_claude_projects_dir")]
+    pub projects_dir: String,
+}
+
+impl Default for ClaudeCodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            projects_dir: default_claude_projects_dir(),
+        }
+    }
+}
+
+fn default_claude_projects_dir() -> String {
+    "~/.claude/projects".to_owned()
+}
+
 fn default_socket_dir() -> String {
     "~/.pi/pup".to_owned()
 }
@@ -281,6 +307,11 @@ impl Config {
     /// Resolve the socket directory path, expanding `~`.
     pub(crate) fn socket_dir(&self) -> PathBuf {
         expand_tilde(&self.pup.socket_dir)
+    }
+
+    /// Resolve the Claude Code projects directory path, expanding `~`.
+    pub(crate) fn claude_projects_dir(&self) -> PathBuf {
+        expand_tilde(&self.claude_code.projects_dir)
     }
 
     /// Build a `TelegramConfig` from the loaded config.

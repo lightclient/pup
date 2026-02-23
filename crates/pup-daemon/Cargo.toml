@@ -14,6 +14,7 @@ workspace = true
 anyhow = { workspace = true }
 clap = { workspace = true }
 dirs = { workspace = true }
+pup-claude = { path = "../pup-claude" }
 pup-core = { path = "../pup-core" }
 pup-ipc = { path = "../pup-ipc" }
 pup-telegram = { path = "../pup-telegram" }

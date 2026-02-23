@@ -2,6 +2,7 @@
 members = [
     "crates/pup-ipc",
     "crates/pup-core",
+    "crates/pup-claude",
     "crates/pup-telegram",
     "crates/pup-daemon",
 ]

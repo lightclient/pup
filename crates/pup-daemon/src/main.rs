@@ -4,10 +4,11 @@ mod tracing_setup;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use pup_claude::injector::{ClaudeCommand, ClaudeService, SessionRegistry};
 use pup_core::{ChatBackend, IncomingMessage, SessionEvent, SessionManager};
 use pup_telegram::TelegramBackend;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "pup", about = "Pickup your pi sessions on the go")]
@@ -62,6 +63,8 @@ async fn main() -> Result<()> {
     });
 
     // Set up backend channels.
+    // Incoming messages from backends go through a router that dispatches to
+    // either the pi session manager or the Claude Code service.
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingMessage>(64);
     let mut backend_txs: Vec<mpsc::Sender<SessionEvent>> = Vec::new();
 
@@ -124,13 +127,127 @@ async fn main() -> Result<()> {
         info!("no telegram backend configured");
     }
 
-    // Drop the original incoming_tx so the session manager's rx will eventually close
-    // when all backends drop their clones.
+    // Drop the original incoming_tx so channels close when all backends exit.
     drop(incoming_tx);
 
-    // ── Start session manager ───────────────────────────────────
+    // ── Initialize Claude Code service ──────────────────────────
 
-    let session_manager = SessionManager::new(socket_dir, backend_txs, incoming_rx);
+    let mut cc_cmd_tx: Option<mpsc::Sender<ClaudeCommand>> = None;
+    let mut cc_registry: Option<SessionRegistry> = None;
+
+    if config.claude_code.enabled {
+        let projects_dir = config.claude_projects_dir();
+        info!(projects_dir = %projects_dir.display(), "starting Claude Code service");
+
+        // Create an event channel for the CC service. A bridge task fans out
+        // CC events to all backend channels.
+        let (cc_event_tx, mut cc_event_rx) = mpsc::channel::<SessionEvent>(256);
+        let cc_backend_txs: Vec<mpsc::Sender<SessionEvent>> =
+            backend_txs.iter().map(mpsc::Sender::clone).collect();
+
+        // Fan-out bridge: CC events → all backends.
+        tokio::spawn(async move {
+            while let Some(event) = cc_event_rx.recv().await {
+                for tx in &cc_backend_txs {
+                    if tx.send(event.clone()).await.is_err() {
+                        warn!("CC event fan-out: backend channel closed");
+                    }
+                }
+            }
+        });
+
+        let (service, cmd_tx, registry) = ClaudeService::new(projects_dir, cc_event_tx);
+        cc_cmd_tx = Some(cmd_tx);
+        cc_registry = Some(registry);
+
+        let shutdown_rx_cc = shutdown_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = service.run(shutdown_rx_cc).await {
+                error!(error = %e, "Claude Code service failed");
+            }
+        });
+    }
+
+    // ── Message router ──────────────────────────────────────────
+    //
+    // Routes incoming messages from backends to either:
+    // - Claude Code service (if session_id is a CC session)
+    // - Pi session manager (otherwise)
+
+    let (pi_incoming_tx, pi_incoming_rx) = mpsc::channel::<IncomingMessage>(64);
+
+    {
+        let cc_cmd = cc_cmd_tx.clone();
+        let cc_reg = cc_registry.clone();
+
+        tokio::spawn(async move {
+            let mut incoming_rx = incoming_rx;
+            while let Some(msg) = incoming_rx.recv().await {
+                let is_cc = cc_reg
+                    .as_ref()
+                    .and_then(|r| r.read().ok())
+                    .is_some_and(|set| set.contains(&msg.session_id));
+
+                if is_cc {
+                    if let Some(cc_tx) = &cc_cmd {
+                        if msg.is_cancel {
+                            let _ = cc_tx
+                                .send(ClaudeCommand::Cancel {
+                                    session_id: msg.session_id,
+                                })
+                                .await;
+                        } else {
+                            // Skip pi-specific slash commands that shouldn't
+                            // be injected into the Claude Code TUI.
+                            let text = msg.text.trim();
+                            if text.starts_with("/name")
+                                || text.starts_with("/compact")
+                                || text.starts_with("/new")
+                                || text.starts_with("/exit")
+                            {
+                                info!(
+                                    session_id = msg.session_id,
+                                    text,
+                                    "skipping pi slash command for Claude Code session"
+                                );
+                            } else {
+                                let (reply_tx, mut reply_rx) = mpsc::channel(1);
+                                let _ = cc_tx
+                                    .send(ClaudeCommand::InjectMessage {
+                                        session_id: msg.session_id.clone(),
+                                        text: msg.text,
+                                        reply: reply_tx,
+                                    })
+                                    .await;
+
+                                // Check result asynchronously.
+                                let sid = msg.session_id;
+                                tokio::spawn(async move {
+                                    if let Some(result) = reply_rx.recv().await {
+                                        if let Err(e) = result {
+                                            warn!(
+                                                session_id = sid,
+                                                error = e,
+                                                "Claude Code injection failed"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                    }
+                } else {
+                    if pi_incoming_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Start session manager (pi sessions) ─────────────────────
+
+    let session_manager = SessionManager::new(socket_dir, backend_txs, pi_incoming_rx);
 
     session_manager.run(shutdown_rx).await?;
 
