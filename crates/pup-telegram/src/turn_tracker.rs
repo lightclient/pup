@@ -131,6 +131,11 @@ struct TurnState {
     tool_output_lines: ToolOutputLines,
     /// Tracked tool calls in order.
     tools: Vec<TrackedTool>,
+    /// Length of the display text at the last flush (for change detection).
+    last_display_len: usize,
+    /// Whether the streaming message is complete (show full text, not
+    /// just complete paragraphs).
+    streaming_complete: bool,
 }
 
 impl TurnState {
@@ -152,6 +157,26 @@ impl TurnState {
                     self.send_rx = Some(rx);
                 }
             }
+        }
+    }
+
+    /// Return the streaming text to display, snapped to paragraph boundaries.
+    ///
+    /// During active streaming, only text up to (and including) the last
+    /// `\n\n` is returned so that Telegram edits don't cut off mid-sentence.
+    /// If no paragraph break exists yet the full text is returned so the
+    /// first paragraph streams naturally.
+    ///
+    /// Once the streaming message is complete (`streaming_complete` is set),
+    /// the full text is always returned.
+    fn display_text(&self) -> &str {
+        if self.streaming_complete {
+            return &self.streaming_text;
+        }
+        if let Some(pos) = self.streaming_text.rfind("\n\n") {
+            &self.streaming_text[..pos + 2]
+        } else {
+            &self.streaming_text
         }
     }
 
@@ -221,10 +246,15 @@ impl TurnState {
         }
 
         // Streaming text (only during the turn, not at finalization).
+        // Uses display_text() to snap to paragraph boundaries so edits
+        // don't cut off mid-sentence.
         if include_text && !self.streaming_text.is_empty() {
-            let html = to_telegram_html(&self.streaming_text);
-            if !html.is_empty() {
-                parts.push(html);
+            let display = self.display_text();
+            if !display.is_empty() {
+                let html = to_telegram_html(display);
+                if !html.is_empty() {
+                    parts.push(html);
+                }
             }
         }
 
@@ -406,6 +436,8 @@ impl TurnTracker {
                 tool_call_limit: self.tool_call_limit,
                 tool_output_lines: self.tool_output_lines,
                 tools: Vec::new(),
+                last_display_len: 0,
+                streaming_complete: false,
             },
         );
     }
@@ -578,7 +610,14 @@ impl TurnTracker {
         state.streaming_text.push_str(text);
 
         if state.verbose {
-            state.dirty = true;
+            // Only mark dirty when the displayable text (snapped to
+            // paragraph boundaries) has actually changed, avoiding
+            // wasted edits while a paragraph is still being written.
+            let new_display_len = state.display_text().len();
+            if new_display_len != state.last_display_len {
+                state.last_display_len = new_display_len;
+                state.dirty = true;
+            }
             state.flush(outbox, self.edit_interval_ms);
         }
     }
@@ -615,6 +654,10 @@ impl TurnTracker {
         if !content.is_empty() {
             content.clone_into(&mut state.streaming_text);
         }
+
+        // The message is complete — show the full text (not just complete
+        // paragraphs) from now on.
+        state.streaming_complete = true;
 
         if state.verbose {
             state.dirty = true;
@@ -871,6 +914,8 @@ mod tests {
                 is_error: false,
                 done: true,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         let rendered = state.render_parts(true);
@@ -907,6 +952,8 @@ mod tests {
                 is_error: false,
                 done: true,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         let rendered = state.render_parts(true);
@@ -939,6 +986,8 @@ mod tests {
                 is_error: false,
                 done: false,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         let rendered = state.render_parts(true);
@@ -973,6 +1022,8 @@ mod tests {
                 is_error: false,
                 done: true,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         let rendered = state.render_parts(true);
@@ -1006,6 +1057,8 @@ mod tests {
                 is_error: false,
                 done: true,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         let rendered = state.render_parts(true);
@@ -1042,6 +1095,8 @@ mod tests {
             tool_call_limit: ToolCallLimit::All,
             tool_output_lines: ToolOutputLines::First(10),
             tools: Vec::new(),
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         // Must not panic.
@@ -1079,10 +1134,109 @@ mod tests {
                 is_error: false,
                 done: false,
             }],
+            last_display_len: 0,
+            streaming_complete: false,
         };
 
         // Must not panic.
         let rendered = state.render_parts(true);
         assert!(rendered.contains("<b>Bash</b>"));
+    }
+
+    // ── display_text paragraph buffering ────────────────────────
+
+    fn make_text_state(text: &str, complete: bool) -> TurnState {
+        TurnState {
+            chat_id: 1,
+            thread_id: None,
+            session_id: "s1".to_owned(),
+            telegram_message_id: None,
+            send_pending: false,
+            send_rx: None,
+            streaming_text: text.to_owned(),
+            thinking: false,
+            thinking_text: String::new(),
+            last_edit: Instant::now(),
+            dirty: false,
+            typing_stop: None,
+            verbose: true,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            tools: Vec::new(),
+            last_display_len: 0,
+            streaming_complete: complete,
+        }
+    }
+
+    #[test]
+    fn display_text_no_paragraph_break_shows_all() {
+        let state = make_text_state("Hello world, still writing", false);
+        assert_eq!(state.display_text(), "Hello world, still writing");
+    }
+
+    #[test]
+    fn display_text_with_paragraph_break_snaps_to_boundary() {
+        let state = make_text_state(
+            "First paragraph.\n\nSecond paragraph being wri",
+            false,
+        );
+        assert_eq!(state.display_text(), "First paragraph.\n\n");
+    }
+
+    #[test]
+    fn display_text_multiple_paragraphs_shows_all_complete() {
+        let state = make_text_state(
+            "Para 1.\n\nPara 2.\n\nPara 3 still writing",
+            false,
+        );
+        assert_eq!(state.display_text(), "Para 1.\n\nPara 2.\n\n");
+    }
+
+    #[test]
+    fn display_text_text_ending_with_break_shows_all() {
+        let state = make_text_state("Complete paragraph.\n\n", false);
+        assert_eq!(state.display_text(), "Complete paragraph.\n\n");
+    }
+
+    #[test]
+    fn display_text_streaming_complete_shows_everything() {
+        let state = make_text_state(
+            "First paragraph.\n\nSecond paragraph still wri",
+            true,
+        );
+        assert_eq!(
+            state.display_text(),
+            "First paragraph.\n\nSecond paragraph still wri"
+        );
+    }
+
+    #[test]
+    fn display_text_empty() {
+        let state = make_text_state("", false);
+        assert_eq!(state.display_text(), "");
+    }
+
+    #[test]
+    fn render_uses_display_text_not_full_streaming_text() {
+        let state = make_text_state(
+            "Done paragraph.\n\nPartial next",
+            false,
+        );
+        let rendered = state.render_parts(true);
+        // Should contain the complete first paragraph.
+        assert!(rendered.contains("Done paragraph."));
+        // Should NOT contain the partial second paragraph.
+        assert!(!rendered.contains("Partial next"));
+    }
+
+    #[test]
+    fn render_complete_shows_full_text() {
+        let state = make_text_state(
+            "Done paragraph.\n\nPartial next",
+            true,
+        );
+        let rendered = state.render_parts(true);
+        assert!(rendered.contains("Done paragraph."));
+        assert!(rendered.contains("Partial next"));
     }
 }
