@@ -65,10 +65,8 @@ pub fn to_telegram_html(input: &str) -> String {
                 } else if count == 1 {
                     // Inline code
                     out.push_str("<code>");
-                    let mut found_close = false;
                     for c in chars.by_ref() {
                         if c == '`' {
-                            found_close = true;
                             break;
                         }
                         match c {
@@ -78,19 +76,17 @@ pub fn to_telegram_html(input: &str) -> String {
                             _ => out.push(c),
                         }
                     }
-                    if found_close {
-                        out.push_str("</code>");
-                    }
+                    // Always close the tag — during streaming the closing
+                    // backtick may not have arrived yet.
+                    out.push_str("</code>");
                 } else {
                     // Double backtick or other — treat as inline code
                     out.push_str("<code>");
                     let mut close_count = 0;
-                    let mut found = false;
                     for c in chars.by_ref() {
                         if c == '`' {
                             close_count += 1;
                             if close_count == count {
-                                found = true;
                                 break;
                             }
                         } else {
@@ -106,21 +102,19 @@ pub fn to_telegram_html(input: &str) -> String {
                             }
                         }
                     }
-                    if found {
-                        out.push_str("</code>");
-                    }
+                    // Always close — streaming may truncate the closing
+                    // delimiter.
+                    out.push_str("</code>");
                 }
             }
             // Bold: **text**
             '*' if chars.peek() == Some(&'*') => {
                 chars.next(); // consume second *
                 out.push_str("<b>");
-                let mut found = false;
                 while let Some(c) = chars.next() {
                     if c == '*' {
                         if chars.peek() == Some(&'*') {
                             chars.next();
-                            found = true;
                             break;
                         }
                         out.push('*');
@@ -128,9 +122,8 @@ pub fn to_telegram_html(input: &str) -> String {
                         push_escaped(&mut out, c);
                     }
                 }
-                if found {
-                    out.push_str("</b>");
-                }
+                // Always close — streaming may truncate the closing **.
+                out.push_str("</b>");
             }
             // Headers: # → bold
             '#' if out.is_empty() || out.ends_with('\n') => {
@@ -141,12 +134,18 @@ pub fn to_telegram_html(input: &str) -> String {
                     chars.next();
                 }
                 out.push_str("<b>");
+                let mut closed = false;
                 for c in chars.by_ref() {
                     if c == '\n' {
                         out.push_str("</b>\n");
+                        closed = true;
                         break;
                     }
                     push_escaped(&mut out, c);
+                }
+                // Close if input ended without a newline (e.g. streaming).
+                if !closed {
+                    out.push_str("</b>");
                 }
             }
             // Links: [text](url)
@@ -275,10 +274,13 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let mut remaining = text;
     let mut chunk_num = 1;
+    // Tags that were open at the end of the previous chunk and need to
+    // be reopened at the start of the next one.
+    let mut reopen_prefix = String::new();
 
     while !remaining.is_empty() {
-        if remaining.len() <= max_chars {
-            let mut chunk = remaining.to_owned();
+        if remaining.len() + reopen_prefix.len() <= max_chars {
+            let mut chunk = format!("{reopen_prefix}{remaining}");
             if !chunks.is_empty() {
                 chunk = format!("<i>(continued {}/{})</i>\n{}", chunk_num, "?", chunk);
             }
@@ -288,7 +290,7 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
 
         // Find a good split point (snap to char boundary to avoid
         // panicking on multi-byte characters).
-        let safe_max = remaining.floor_char_boundary(max_chars);
+        let safe_max = remaining.floor_char_boundary(max_chars.saturating_sub(reopen_prefix.len()));
         let search_area = &remaining[..safe_max];
 
         // Prefer paragraph boundary
@@ -300,12 +302,29 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
 
         let (chunk_text, rest) = remaining.split_at(split_at);
 
-        // Check if we're inside a <pre> block and close it
-        let open_pre = chunk_text.matches("<pre>").count();
-        let close_pre = chunk_text.matches("</pre>").count();
-        let in_pre = open_pre > close_pre;
+        // Build the full chunk content including any reopened tags.
+        let full_chunk_text = format!("{reopen_prefix}{chunk_text}");
 
-        let mut chunk = chunk_text.to_owned();
+        // Check for unclosed tags and close them at the split point.
+        // We track each tag type independently.
+        let in_pre =
+            full_chunk_text.matches("<pre>").count() > full_chunk_text.matches("</pre>").count();
+        let in_b = full_chunk_text.matches("<b>").count() > full_chunk_text.matches("</b>").count();
+        let in_i = full_chunk_text.matches("<i>").count() > full_chunk_text.matches("</i>").count();
+        let in_code =
+            full_chunk_text.matches("<code>").count() > full_chunk_text.matches("</code>").count();
+
+        let mut chunk = full_chunk_text;
+        // Close tags in reverse nesting order.
+        if in_code {
+            chunk.push_str("</code>");
+        }
+        if in_b {
+            chunk.push_str("</b>");
+        }
+        if in_i {
+            chunk.push_str("</i>");
+        }
         if in_pre {
             chunk.push_str("</pre>");
         }
@@ -320,10 +339,19 @@ pub fn split_message(text: &str, max_chars: usize) -> Vec<String> {
         // Skip the split delimiter
         remaining = rest.trim_start_matches('\n');
 
-        // Reopen pre block if needed
-        if in_pre && !remaining.is_empty() {
-            // The next chunk will be wrapped with <pre> if needed via content
-            // We'll prepend <pre> in the next iteration implicitly via the content
+        // Build reopen prefix for the next chunk.
+        reopen_prefix.clear();
+        if in_pre {
+            reopen_prefix.push_str("<pre>");
+        }
+        if in_i {
+            reopen_prefix.push_str("<i>");
+        }
+        if in_b {
+            reopen_prefix.push_str("<b>");
+        }
+        if in_code {
+            reopen_prefix.push_str("<code>");
         }
     }
 
@@ -443,6 +471,68 @@ mod tests {
         assert_eq!(
             format_user_message("hello <world>"),
             "👤 <i>hello &lt;world&gt;</i>"
+        );
+    }
+
+    // ── Streaming edge cases: unclosed markdown produces valid HTML ──
+
+    #[test]
+    fn test_unclosed_bold_streaming() {
+        // During streaming, closing ** may not have arrived yet.
+        assert_eq!(to_telegram_html("**hello"), "<b>hello</b>");
+    }
+
+    #[test]
+    fn test_unclosed_inline_code_streaming() {
+        assert_eq!(to_telegram_html("`code"), "<code>code</code>");
+    }
+
+    #[test]
+    fn test_unclosed_code_block_streaming() {
+        assert_eq!(
+            to_telegram_html("```rust\nfn main()"),
+            "<pre>fn main()</pre>"
+        );
+    }
+
+    #[test]
+    fn test_header_no_trailing_newline() {
+        // Header at end of input without newline.
+        assert_eq!(to_telegram_html("## Title"), "<b>Title</b>");
+    }
+
+    #[test]
+    fn test_unclosed_double_backtick() {
+        assert_eq!(to_telegram_html("``code"), "<code>code</code>");
+    }
+
+    // ── split_message tag balancing ──
+
+    #[test]
+    fn test_split_closes_bold_tags() {
+        let text = "<b>".to_owned() + &"x".repeat(100) + "</b>";
+        let chunks = split_message(&text, 60);
+        assert!(chunks.len() > 1);
+        // First chunk should have a closing </b>
+        assert!(
+            chunks[0].contains("</b>"),
+            "first chunk missing </b>: {}",
+            chunks[0]
+        );
+        // Last chunk should have reopened <b> and closed it
+        let last = chunks.last().expect("chunks should not be empty");
+        assert!(last.contains("<b>"), "last chunk missing <b>: {last}");
+    }
+
+    #[test]
+    fn test_split_closes_code_tags() {
+        let text = "<code>".to_owned() + &"x".repeat(100) + "</code>";
+        let chunks = split_message(&text, 60);
+        assert!(chunks.len() > 1);
+        assert!(
+            chunks[0].contains("</code>"),
+            "first chunk missing </code>: {}",
+            chunks[0]
         );
     }
 }
