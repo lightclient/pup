@@ -25,6 +25,12 @@ pub enum DmCommand {
     Verbose {
         toggle: Option<bool>,
     },
+    Thinking {
+        toggle: Option<bool>,
+    },
+    Tools {
+        toggle: Option<bool>,
+    },
     Help,
     /// Not a command — a plain message to forward to the attached session.
     Message {
@@ -61,6 +67,22 @@ pub fn parse_command(text: &str) -> DmCommand {
                     _ => None,
                 };
                 DmCommand::Verbose { toggle }
+            }
+            "/thinking" => {
+                let toggle = match args {
+                    "on" | "true" | "1" => Some(true),
+                    "off" | "false" | "0" => Some(false),
+                    _ => None,
+                };
+                DmCommand::Thinking { toggle }
+            }
+            "/tools" => {
+                let toggle = match args {
+                    "on" | "true" | "1" => Some(true),
+                    "off" | "false" | "0" => Some(false),
+                    _ => None,
+                };
+                DmCommand::Tools { toggle }
             }
             "/help" | "/start" => DmCommand::Help,
             _ => DmCommand::Message {
@@ -176,6 +198,8 @@ impl DmState {
             "/cancel — Abort the current agent operation",
             "/status — Show session status (model, context usage)",
             "/verbose [on|off] — Toggle verbose mode (thinking + tools)",
+            "/thinking [on|off] — Toggle thinking/reasoning display",
+            "/tools [on|off] — Toggle tool call display",
             "/help — Show this help",
             "",
             "<b>Messaging:</b>",

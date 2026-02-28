@@ -35,8 +35,15 @@ impl Default for PupConfig {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct DisplayConfig {
+    /// Legacy: sets both `thinking` and `tools` if they are not set.
     #[serde(default)]
     pub verbose: bool,
+    /// Show thinking/reasoning content.
+    #[serde(default)]
+    pub thinking: Option<bool>,
+    /// Show tool call details.
+    #[serde(default)]
+    pub tools: Option<bool>,
     #[serde(default = "default_history_turns")]
     pub history_turns: usize,
     /// How many tool calls to keep in the rendered message.
@@ -55,10 +62,26 @@ impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
             verbose: false,
+            thinking: None,
+            tools: None,
             history_turns: 5,
             tool_calls: default_tool_calls(),
             tool_output_lines: default_tool_output_lines(),
         }
+    }
+}
+
+impl DisplayConfig {
+    /// Effective thinking setting: explicit `thinking` key takes
+    /// precedence, then falls back to `verbose`.
+    pub(crate) fn effective_thinking(&self) -> bool {
+        self.thinking.unwrap_or(self.verbose)
+    }
+
+    /// Effective tools setting: explicit `tools` key takes precedence,
+    /// then falls back to `verbose`.
+    pub(crate) fn effective_tools(&self) -> bool {
+        self.tools.unwrap_or(self.verbose)
     }
 }
 
@@ -356,7 +379,8 @@ impl Config {
             topic_icon,
             max_message_length,
             edit_interval_ms: self.streaming.edit_interval_ms,
-            verbose: self.display.verbose,
+            thinking: self.display.effective_thinking(),
+            tools: self.display.effective_tools(),
             history_turns: self.display.history_turns,
             topics_state_path: socket_dir.join("topics_state.json"),
             socket_dir,
@@ -412,7 +436,9 @@ allowed_user_ids = [12345678]
 socket_dir = "~/.pi/pup"
 
 [display]
-verbose = false
+# thinking = false     # show thinking/reasoning (overrides verbose)
+# tools = false        # show tool call details  (overrides verbose)
+verbose = false        # legacy shorthand: sets both thinking & tools
 history_turns = 5
 
 [streaming]

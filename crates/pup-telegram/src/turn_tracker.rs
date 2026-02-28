@@ -161,8 +161,10 @@ struct TurnState {
     last_edit: Instant,
     /// Whether content has changed since the last edit.
     dirty: bool,
+    /// Whether to show thinking/reasoning content.
+    show_thinking: bool,
     /// Whether to show tool call details.
-    verbose: bool,
+    show_tools: bool,
     /// How many tool calls to keep in the rendered message.
     tool_call_limit: ToolCallLimit,
     /// How many lines of tool output to show per tool call.
@@ -205,8 +207,8 @@ impl TurnState {
     fn render_parts(&self, include_text: bool) -> String {
         let mut parts = Vec::new();
 
-        // Verbose tool call summaries (limited to the configured window).
-        if self.verbose {
+        // Tool call summaries (limited to the configured window).
+        if self.show_tools {
             let tools: &[TrackedTool] = match self.tool_call_limit {
                 ToolCallLimit::All => &self.tools,
                 ToolCallLimit::Last(n) => {
@@ -242,7 +244,7 @@ impl TurnState {
         }
 
         // Thinking content (shown while model is reasoning, before response text).
-        if self.thinking && self.streaming_text.is_empty() {
+        if self.show_thinking && self.thinking && self.streaming_text.is_empty() {
             if self.thinking_text.is_empty() {
                 parts.push("<i>Thinking…</i>".to_owned());
             } else {
@@ -336,10 +338,14 @@ pub struct TurnTracker {
     turns: HashMap<String, TurnState>,
     /// Minimum interval between edits.
     edit_interval_ms: u64,
-    /// Default verbose for sessions without an explicit override.
-    default_verbose: bool,
-    /// Per-session verbose overrides (persists across turns).
-    session_verbose: HashMap<String, bool>,
+    /// Default thinking display for sessions without an override.
+    default_thinking: bool,
+    /// Default tools display for sessions without an override.
+    default_tools: bool,
+    /// Per-session thinking overrides (persists across turns).
+    session_thinking: HashMap<String, bool>,
+    /// Per-session tools overrides (persists across turns).
+    session_tools: HashMap<String, bool>,
     /// How many tool calls to keep in the rendered message.
     tool_call_limit: ToolCallLimit,
     /// How many lines of tool output to show per tool call.
@@ -351,8 +357,10 @@ impl TurnTracker {
         Self {
             turns: HashMap::new(),
             edit_interval_ms,
-            default_verbose: false,
-            session_verbose: HashMap::new(),
+            default_thinking: false,
+            default_tools: false,
+            session_thinking: HashMap::new(),
+            session_tools: HashMap::new(),
             tool_call_limit: ToolCallLimit::default(),
             tool_output_lines: ToolOutputLines::default(),
         }
@@ -374,29 +382,64 @@ impl TurnTracker {
         }
     }
 
-    /// Set the default verbose mode for sessions without an explicit override.
-    pub fn set_default_verbose(&mut self, verbose: bool) {
-        self.default_verbose = verbose;
+    /// Set the default thinking display for sessions without an override.
+    pub fn set_default_thinking(&mut self, on: bool) {
+        self.default_thinking = on;
     }
 
-    /// Enable or disable verbose mode for a specific session.
-    ///
-    /// Persists across turns so the setting sticks until changed again.
-    /// Also updates the currently active turn (if any) so the change
-    /// takes effect immediately.
-    pub fn set_verbose(&mut self, session_id: &str, verbose: bool) {
-        self.session_verbose.insert(session_id.to_owned(), verbose);
+    /// Set the default tools display for sessions without an override.
+    pub fn set_default_tools(&mut self, on: bool) {
+        self.default_tools = on;
+    }
+
+    /// Set both thinking and tools defaults at once.
+    pub fn set_default_verbose(&mut self, on: bool) {
+        self.default_thinking = on;
+        self.default_tools = on;
+    }
+
+    /// Enable or disable thinking display for a specific session.
+    pub fn set_thinking(&mut self, session_id: &str, on: bool) {
+        self.session_thinking.insert(session_id.to_owned(), on);
         if let Some(state) = self.turns.get_mut(session_id) {
-            state.verbose = verbose;
+            state.show_thinking = on;
         }
     }
 
-    /// Get the effective verbose setting for a session.
-    pub fn is_verbose(&self, session_id: &str) -> bool {
-        self.session_verbose
+    /// Enable or disable tools display for a specific session.
+    pub fn set_tools(&mut self, session_id: &str, on: bool) {
+        self.session_tools.insert(session_id.to_owned(), on);
+        if let Some(state) = self.turns.get_mut(session_id) {
+            state.show_tools = on;
+        }
+    }
+
+    /// Enable or disable both thinking and tools for a session.
+    pub fn set_verbose(&mut self, session_id: &str, on: bool) {
+        self.set_thinking(session_id, on);
+        self.set_tools(session_id, on);
+    }
+
+    /// Get the effective thinking setting for a session.
+    pub fn is_thinking(&self, session_id: &str) -> bool {
+        self.session_thinking
             .get(session_id)
             .copied()
-            .unwrap_or(self.default_verbose)
+            .unwrap_or(self.default_thinking)
+    }
+
+    /// Get the effective tools setting for a session.
+    pub fn is_tools(&self, session_id: &str) -> bool {
+        self.session_tools
+            .get(session_id)
+            .copied()
+            .unwrap_or(self.default_tools)
+    }
+
+    /// Whether either thinking or tools is enabled (i.e. the turn
+    /// tracker needs to create and update a Telegram message).
+    pub fn is_verbose(&self, session_id: &str) -> bool {
+        self.is_thinking(session_id) || self.is_tools(session_id)
     }
 
     /// Check if a turn is being tracked for the given session.
@@ -460,7 +503,8 @@ impl TurnTracker {
                 thinking_text: String::new(),
                 last_edit: Instant::now(),
                 dirty: false,
-                verbose: self.is_verbose(session_id),
+                show_thinking: self.is_thinking(session_id),
+                show_tools: self.is_tools(session_id),
                 tool_call_limit: self.tool_call_limit,
                 tool_output_lines: self.tool_output_lines,
                 tools: Vec::new(),
@@ -590,8 +634,8 @@ impl TurnTracker {
         args: &serde_json::Value,
         outbox: &mut Outbox,
     ) {
-        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
-        if !verbose {
+        let show_tools = self.turns.get(session_id).is_some_and(|s| s.show_tools);
+        if !show_tools {
             return;
         }
         if let Some(state) = self.turns.get_mut(session_id) {
@@ -619,7 +663,7 @@ impl TurnTracker {
         outbox: &mut Outbox,
     ) {
         if let Some(state) = self.turns.get_mut(session_id)
-            && state.verbose
+            && state.show_tools
         {
             // Find the last matching in-progress tool and append content.
             for tool in state.tools.iter_mut().rev() {
@@ -643,7 +687,7 @@ impl TurnTracker {
         outbox: &mut Outbox,
     ) {
         if let Some(state) = self.turns.get_mut(session_id)
-            && state.verbose
+            && state.show_tools
         {
             // Find the last matching tool and mark it done.
             for tool in state.tools.iter_mut().rev() {
@@ -665,12 +709,12 @@ impl TurnTracker {
 
     /// Note that thinking/reasoning content is streaming.
     pub fn thinking_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
-        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
+        let show_thinking = self.turns.get(session_id).is_some_and(|s| s.show_thinking);
         if let Some(state) = self.turns.get_mut(session_id) {
             state.thinking = true;
             state.thinking_text.push_str(text);
         }
-        if verbose {
+        if show_thinking {
             self.ensure_message(session_id, "<i>Thinking…</i>", outbox);
             if let Some(state) = self.turns.get_mut(session_id) {
                 state.dirty = true;
@@ -681,7 +725,10 @@ impl TurnTracker {
 
     /// Accumulate a streaming text delta.
     pub fn message_delta(&mut self, session_id: &str, text: &str, outbox: &mut Outbox) {
-        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
+        let verbose = self
+            .turns
+            .get(session_id)
+            .is_some_and(|s| s.show_thinking || s.show_tools);
 
         if verbose {
             // If no message sent yet, send with the first chunk of text.
@@ -723,7 +770,7 @@ impl TurnTracker {
         state.thinking = false;
         state.streaming_text.push_str(text);
 
-        if state.verbose {
+        if state.show_thinking || state.show_tools {
             // Only mark dirty when the displayable text (snapped to
             // paragraph boundaries) has actually changed, avoiding
             // wasted edits while a paragraph is still being written.
@@ -745,7 +792,10 @@ impl TurnTracker {
         content: &str,
         outbox: &mut Outbox,
     ) {
-        let verbose = self.turns.get(session_id).is_some_and(|s| s.verbose);
+        let verbose = self
+            .turns
+            .get(session_id)
+            .is_some_and(|s| s.show_thinking || s.show_tools);
 
         if verbose {
             // If no deltas were received (e.g. very short response with extended
@@ -773,7 +823,7 @@ impl TurnTracker {
         // paragraphs) from now on.
         state.streaming_complete = true;
 
-        if state.verbose {
+        if state.show_thinking || state.show_tools {
             state.dirty = true;
             // Force an immediate edit (bypass throttle) so the final content
             // is shown promptly.
@@ -806,8 +856,8 @@ impl TurnTracker {
             dest.try_resolve_message_id();
         }
 
-        let has_verbose_content =
-            state.verbose && (!state.tools.is_empty() || !state.thinking_text.is_empty());
+        let has_verbose_content = (state.show_tools && !state.tools.is_empty())
+            || (state.show_thinking && !state.thinking_text.is_empty());
         let has_text = !state.streaming_text.is_empty();
 
         // Pre-render content (shared across all destinations).
@@ -1034,9 +1084,10 @@ mod tests {
 
     // ── Helper to build a TurnState for rendering tests ─────────
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
     fn make_render_state(
-        verbose: bool,
+        show_thinking: bool,
+        show_tools: bool,
         tools: Vec<TrackedTool>,
         streaming_text: &str,
         thinking: bool,
@@ -1060,7 +1111,8 @@ mod tests {
             thinking_text: thinking_text.to_owned(),
             last_edit: Instant::now(),
             dirty: false,
-            verbose,
+            show_thinking,
+            show_tools,
             tool_call_limit,
             tool_output_lines,
             tools,
@@ -1074,6 +1126,7 @@ mod tests {
     #[test]
     fn render_tool_with_output() {
         let state = make_render_state(
+            false,
             true,
             vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
@@ -1102,6 +1155,7 @@ mod tests {
     #[test]
     fn render_tool_with_output_all_lines() {
         let state = make_render_state(
+            false,
             true,
             vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
@@ -1126,6 +1180,7 @@ mod tests {
     #[test]
     fn render_tool_no_output() {
         let state = make_render_state(
+            false,
             true,
             vec![TrackedTool {
                 tool_name: "Read".to_owned(),
@@ -1153,6 +1208,7 @@ mod tests {
     fn render_nonverbose_hides_tool_output() {
         let state = make_render_state(
             false,
+            false,
             vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "echo hi"}),
@@ -1177,6 +1233,7 @@ mod tests {
     #[test]
     fn render_tool_output_html_escaped() {
         let state = make_render_state(
+            false,
             true,
             vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
@@ -1201,6 +1258,7 @@ mod tests {
 
     #[test]
     fn render_thinking_with_multibyte_chars_does_not_panic() {
+        // show_thinking=true to exercise the thinking rendering path.
         // Build thinking text >2000 bytes using multi-byte chars (─ is 3 bytes).
         // This is the exact scenario that caused the panic: the truncation
         // point lands inside a multi-byte character.
@@ -1212,6 +1270,7 @@ mod tests {
 
         let state = make_render_state(
             true,
+            false,
             Vec::new(),
             "",
             true,
@@ -1234,6 +1293,7 @@ mod tests {
         assert!(cmd.len() > 200);
 
         let state = make_render_state(
+            false,
             true,
             vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
@@ -1259,6 +1319,7 @@ mod tests {
 
     fn make_text_state(text: &str, complete: bool) -> TurnState {
         make_render_state(
+            true,
             true,
             Vec::new(),
             text,
