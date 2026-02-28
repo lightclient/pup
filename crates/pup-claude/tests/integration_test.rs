@@ -6,6 +6,14 @@
 //!
 //! Run with: `cargo test --package pup-claude --test integration_test -- --ignored`
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::print_stdout,
+    clippy::uninlined_format_args,
+    clippy::map_unwrap_or,
+    clippy::redundant_closure_for_method_calls
+)]
+
 use std::path::PathBuf;
 
 use pup_claude::transcript::{self, TranscriptWatcher};
@@ -16,12 +24,7 @@ fn find_recent_transcript() -> Option<PathBuf> {
     let mut entries: Vec<_> = std::fs::read_dir(&projects_dir)
         .ok()?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.path()
-                .extension()
-                .and_then(|x| x.to_str())
-                == Some("jsonl")
-        })
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("jsonl"))
         .collect();
 
     entries.sort_by_key(|e| {
@@ -106,12 +109,7 @@ fn test_parse_real_transcript() {
 #[ignore = "requires real transcript files"]
 fn test_watcher_history() {
     let path = find_recent_transcript().expect("no transcript files found");
-    let session_id = path
-        .file_stem()
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .to_owned();
+    let session_id = path.file_stem().unwrap().to_str().unwrap().to_owned();
 
     println!("Session: {session_id}");
     println!("Path: {}", path.display());
@@ -133,7 +131,10 @@ fn test_watcher_history() {
             .as_ref()
             .map(|m| &m.content[..m.content.len().min(40)])
             .unwrap_or("(none)");
-        println!("  Turn {i}: user={user} | assistant={assistant} | tools={}", turn.tool_calls.len());
+        println!(
+            "  Turn {i}: user={user} | assistant={assistant} | tools={}",
+            turn.tool_calls.len()
+        );
     }
 
     assert!(!turns.is_empty(), "no turns parsed from history");
@@ -181,7 +182,9 @@ async fn test_inspector_connect_and_inject() {
         for line in content.lines().rev() {
             if let Ok(entry) = transcript::parse_line(line) {
                 match entry {
-                    transcript::TranscriptEntry::Assistant { text_blocks, .. } if saw_our_question => {
+                    transcript::TranscriptEntry::Assistant { text_blocks, .. }
+                        if saw_our_question =>
+                    {
                         let text = text_blocks.join(" ");
                         if text.contains('6') {
                             println!("Claude responded: {text}");
@@ -206,6 +209,8 @@ async fn test_inspector_connect_and_inject() {
 
     // Don't fail the test if Claude is busy — the injection itself succeeded.
     if !found_response {
-        println!("Note: Claude didn't respond in time (may be busy with another turn). Injection was successful.");
+        println!(
+            "Note: Claude didn't respond in time (may be busy with another turn). Injection was successful."
+        );
     }
 }

@@ -67,19 +67,16 @@ pub struct ToolUseBlock {
 pub fn parse_line(line: &str) -> Result<TranscriptEntry> {
     let v: Value = serde_json::from_str(line).context("invalid JSON")?;
 
-    let entry_type = v
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let entry_type = v.get("type").and_then(Value::as_str).unwrap_or("");
 
     match entry_type {
-        "user" => parse_user_entry(&v),
-        "assistant" => parse_assistant_entry(&v),
+        "user" => Ok(parse_user_entry(&v)),
+        "assistant" => Ok(parse_assistant_entry(&v)),
         _ => Ok(TranscriptEntry::Ignored),
     }
 }
 
-fn parse_user_entry(v: &Value) -> Result<TranscriptEntry> {
+fn parse_user_entry(v: &Value) -> TranscriptEntry {
     let uuid = str_field(v, "uuid");
     let session_id = str_field(v, "sessionId");
     let timestamp = str_field(v, "timestamp");
@@ -88,12 +85,12 @@ fn parse_user_entry(v: &Value) -> Result<TranscriptEntry> {
 
     // Content can be a string (user text) or an array (tool results).
     if let Some(text) = content.as_str() {
-        return Ok(TranscriptEntry::UserText {
+        return TranscriptEntry::UserText {
             uuid,
             session_id,
             timestamp,
             content: text.to_owned(),
-        });
+        };
     }
 
     if let Some(blocks) = content.as_array() {
@@ -117,13 +114,13 @@ fn parse_user_entry(v: &Value) -> Result<TranscriptEntry> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
 
-                return Ok(TranscriptEntry::ToolResult {
+                return TranscriptEntry::ToolResult {
                     uuid,
                     session_id,
                     tool_use_id,
                     content: result_content,
                     is_error,
-                });
+                };
             }
         }
 
@@ -131,35 +128,35 @@ fn parse_user_entry(v: &Value) -> Result<TranscriptEntry> {
         // Extract text content.
         let mut text = String::new();
         for block in blocks {
-            if block.get("type").and_then(Value::as_str) == Some("text") {
-                if let Some(t) = block.get("text").and_then(Value::as_str) {
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(t);
+            if block.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(t) = block.get("text").and_then(Value::as_str)
+            {
+                if !text.is_empty() {
+                    text.push('\n');
                 }
+                text.push_str(t);
             }
         }
         if !text.is_empty() {
-            return Ok(TranscriptEntry::UserText {
+            return TranscriptEntry::UserText {
                 uuid,
                 session_id,
                 timestamp,
                 content: text,
-            });
+            };
         }
     }
 
     // Fallback: stringified content.
-    Ok(TranscriptEntry::UserText {
+    TranscriptEntry::UserText {
         uuid,
         session_id,
         timestamp,
         content: content.to_string(),
-    })
+    }
 }
 
-fn parse_assistant_entry(v: &Value) -> Result<TranscriptEntry> {
+fn parse_assistant_entry(v: &Value) -> TranscriptEntry {
     let uuid = str_field(v, "uuid");
     let session_id = str_field(v, "sessionId");
     let timestamp = str_field(v, "timestamp");
@@ -176,9 +173,7 @@ fn parse_assistant_entry(v: &Value) -> Result<TranscriptEntry> {
         .unwrap_or("")
         .to_owned();
 
-    let content_blocks = message
-        .get("content")
-        .and_then(Value::as_array);
+    let content_blocks = message.get("content").and_then(Value::as_array);
 
     let mut text_blocks = Vec::new();
     let mut thinking_blocks = Vec::new();
@@ -216,7 +211,7 @@ fn parse_assistant_entry(v: &Value) -> Result<TranscriptEntry> {
         }
     }
 
-    Ok(TranscriptEntry::Assistant {
+    TranscriptEntry::Assistant {
         uuid,
         session_id,
         timestamp,
@@ -225,7 +220,7 @@ fn parse_assistant_entry(v: &Value) -> Result<TranscriptEntry> {
         text_blocks,
         thinking_blocks,
         tool_uses,
-    })
+    }
 }
 
 fn str_field(v: &Value, field: &str) -> String {
@@ -268,9 +263,7 @@ impl TranscriptWatcher {
     /// Create a new watcher. Starts at the current end of the file (only watches
     /// new content). Use `new_from_beginning` to parse history.
     pub fn new(session_id: String, path: PathBuf) -> Result<Self> {
-        let offset = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let offset = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         Ok(Self {
             session_id,
@@ -314,8 +307,7 @@ impl TranscriptWatcher {
             return Ok(self.maybe_flush_stale());
         }
 
-        let file = std::fs::File::open(&self.path)
-            .context("failed to open transcript file")?;
+        let file = std::fs::File::open(&self.path).context("failed to open transcript file")?;
         let mut reader = BufReader::new(file);
         reader
             .seek(SeekFrom::Start(self.offset))
@@ -408,15 +400,13 @@ impl TranscriptWatcher {
                 thinking_blocks,
                 tool_uses,
                 ..
-            } => {
-                self.process_assistant(
-                    api_message_id,
-                    model,
-                    text_blocks,
-                    thinking_blocks,
-                    tool_uses,
-                )
-            }
+            } => self.process_assistant(
+                api_message_id,
+                model,
+                &text_blocks,
+                &thinking_blocks,
+                &tool_uses,
+            ),
             TranscriptEntry::Ignored => vec![],
         }
     }
@@ -426,9 +416,9 @@ impl TranscriptWatcher {
         &mut self,
         api_message_id: String,
         model: String,
-        text_blocks: Vec<String>,
-        thinking_blocks: Vec<String>,
-        tool_uses: Vec<ToolUseBlock>,
+        text_blocks: &[String],
+        thinking_blocks: &[String],
+        tool_uses: &[ToolUseBlock],
     ) -> Vec<SessionEvent> {
         let mut events = Vec::new();
 
@@ -455,7 +445,7 @@ impl TranscriptWatcher {
         }
 
         // Emit ToolStart for any new tool_use blocks.
-        for tool in &tool_uses {
+        for tool in tool_uses {
             if self.seen_tool_starts.insert(tool.id.clone()) {
                 events.push(SessionEvent::ToolStart {
                     session_id: self.session_id.clone(),
@@ -473,8 +463,8 @@ impl TranscriptWatcher {
         self.seen_messages
             .entry(api_message_id.clone())
             .and_modify(|state| {
-                state.text = joined_text.clone();
-                state.thinking = joined_thinking.clone();
+                state.text.clone_from(&joined_text);
+                state.thinking.clone_from(&joined_thinking);
                 state.tool_use_count = tool_uses.len();
                 if !model.is_empty() {
                     state.model.clone_from(&model);
@@ -497,19 +487,19 @@ impl TranscriptWatcher {
     fn flush_pending(&mut self) -> Vec<SessionEvent> {
         let mut events = Vec::new();
 
-        if let Some(msg_id) = self.pending_message_id.take() {
-            if let Some(state) = self.seen_messages.get(&msg_id) {
-                events.push(SessionEvent::MessageEnd {
-                    session_id: self.session_id.clone(),
-                    message_id: msg_id,
-                    text: state.text.clone(),
-                    thinking: if state.thinking.is_empty() {
-                        None
-                    } else {
-                        Some(state.thinking.clone())
-                    },
-                });
-            }
+        if let Some(msg_id) = self.pending_message_id.take()
+            && let Some(state) = self.seen_messages.get(&msg_id)
+        {
+            events.push(SessionEvent::MessageEnd {
+                session_id: self.session_id.clone(),
+                message_id: msg_id,
+                text: state.text.clone(),
+                thinking: if state.thinking.is_empty() {
+                    None
+                } else {
+                    Some(state.thinking.clone())
+                },
+            });
         }
 
         events
@@ -547,8 +537,8 @@ impl TranscriptWatcher {
     /// Parse existing transcript content for initial history.
     /// Returns the model name (if found) and a list of turns.
     pub fn parse_history(&mut self) -> Result<(Option<String>, Vec<pup_ipc::Turn>)> {
-        let file = std::fs::File::open(&self.path)
-            .context("failed to open transcript for history")?;
+        let file =
+            std::fs::File::open(&self.path).context("failed to open transcript for history")?;
         let reader = BufReader::new(file);
 
         let mut turns: Vec<pup_ipc::Turn> = Vec::new();
@@ -563,9 +553,8 @@ impl TranscriptWatcher {
                 continue;
             }
 
-            let entry = match parse_line(trimmed) {
-                Ok(e) => e,
-                Err(_) => continue,
+            let Ok(entry) = parse_line(trimmed) else {
+                continue;
             };
 
             match entry {
@@ -624,9 +613,8 @@ impl TranscriptWatcher {
 
                     // Add tool calls.
                     for tool in tool_uses {
-                        let (result_content, is_error) = tool_results
-                            .remove(&tool.id)
-                            .unwrap_or_default();
+                        let (result_content, is_error) =
+                            tool_results.remove(&tool.id).unwrap_or_default();
                         turn.tool_calls.push(pup_ipc::ToolCall {
                             tool_call_id: tool.id,
                             tool_name: tool.name,
@@ -646,9 +634,7 @@ impl TranscriptWatcher {
         }
 
         // Set offset to end of file so poll() only sees new content.
-        self.offset = std::fs::metadata(&self.path)
-            .map(|m| m.len())
-            .unwrap_or(0);
+        self.offset = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
 
         Ok((model, turns))
     }
@@ -674,9 +660,14 @@ mod tests {
     #[test]
     fn test_parse_user_text() {
         let line = r#"{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/root","sessionId":"abc","version":"2.1.34","type":"user","message":{"role":"user","content":"hello world"},"uuid":"u1","timestamp":"2026-02-22T16:15:46.051Z"}"#;
-        let entry = parse_line(line).unwrap();
+        let entry = parse_line(line).expect("failed to parse transcript line");
         match entry {
-            TranscriptEntry::UserText { content, uuid, session_id, .. } => {
+            TranscriptEntry::UserText {
+                content,
+                uuid,
+                session_id,
+                ..
+            } => {
                 assert_eq!(content, "hello world");
                 assert_eq!(uuid, "u1");
                 assert_eq!(session_id, "abc");
@@ -688,7 +679,7 @@ mod tests {
     #[test]
     fn test_parse_assistant() {
         let line = r#"{"parentUuid":"u1","sessionId":"abc","version":"2.1.34","message":{"model":"claude-opus-4-6","id":"msg_01X","type":"message","role":"assistant","content":[{"type":"thinking","thinking":"let me think"},{"type":"text","text":"Hello!"},{"type":"tool_use","id":"toolu_01","name":"Bash","input":{"command":"ls"}}],"stop_reason":null},"type":"assistant","uuid":"a1","timestamp":"2026-02-22T16:15:48.044Z"}"#;
-        let entry = parse_line(line).unwrap();
+        let entry = parse_line(line).expect("failed to parse transcript line");
         match entry {
             TranscriptEntry::Assistant {
                 api_message_id,
@@ -713,9 +704,14 @@ mod tests {
     #[test]
     fn test_parse_tool_result() {
         let line = r#"{"sessionId":"abc","type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01","content":"file.txt","is_error":false}]},"uuid":"u2","timestamp":"2026-02-22T16:16:00.000Z"}"#;
-        let entry = parse_line(line).unwrap();
+        let entry = parse_line(line).expect("failed to parse transcript line");
         match entry {
-            TranscriptEntry::ToolResult { tool_use_id, content, is_error, .. } => {
+            TranscriptEntry::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => {
                 assert_eq!(tool_use_id, "toolu_01");
                 assert_eq!(content, "file.txt");
                 assert!(!is_error);
@@ -727,7 +723,7 @@ mod tests {
     #[test]
     fn test_parse_snapshot_ignored() {
         let line = r#"{"type":"file-history-snapshot","messageId":"x","snapshot":{}}"#;
-        let entry = parse_line(line).unwrap();
+        let entry = parse_line(line).expect("failed to parse transcript line");
         assert!(matches!(entry, TranscriptEntry::Ignored));
     }
 }

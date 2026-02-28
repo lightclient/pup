@@ -30,9 +30,7 @@ pub enum ClaudeCommand {
         reply: mpsc::Sender<Result<(), String>>,
     },
     /// Cancel/abort the current turn (sends Escape to the TUI).
-    Cancel {
-        session_id: String,
-    },
+    Cancel { session_id: String },
 }
 
 /// Shared registry of Claude Code session IDs, used by the message router
@@ -150,10 +148,13 @@ impl ClaudeService {
             }
 
             // Emit disconnect for all sessions.
-            for (session_id, _) in &self.sessions {
-                let _ = self.event_tx.send(pup_core::types::SessionEvent::Disconnected {
-                    session_id: session_id.clone(),
-                }).await;
+            for session_id in self.sessions.keys() {
+                let _ = self
+                    .event_tx
+                    .send(pup_core::types::SessionEvent::Disconnected {
+                        session_id: session_id.clone(),
+                    })
+                    .await;
             }
 
             info!("Claude service stopped");
@@ -178,7 +179,12 @@ impl ClaudeService {
                 pid,
             } => {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
-                    info!(session_id, url = inspector_url, pid, "late inspector discovery — connecting");
+                    info!(
+                        session_id,
+                        url = inspector_url,
+                        pid,
+                        "late inspector discovery — connecting"
+                    );
                     session.pid = Some(pid);
                     session.set_inspector_url(inspector_url);
                     if session.connect_inspector().await {
@@ -199,10 +205,10 @@ impl ClaudeService {
     async fn connect_session(&mut self, discovered: DiscoveredSession) {
         if self.sessions.contains_key(&discovered.session_id) {
             // Already tracking. But maybe update inspector URL.
-            if let Some(url) = &discovered.inspector_url {
-                if let Some(session) = self.sessions.get_mut(&discovered.session_id) {
-                    session.set_inspector_url(url.clone());
-                }
+            if let Some(url) = &discovered.inspector_url
+                && let Some(session) = self.sessions.get_mut(&discovered.session_id)
+            {
+                session.set_inspector_url(url.clone());
             }
             return;
         }
@@ -255,7 +261,12 @@ impl ClaudeService {
             partial_text: None,
         };
 
-        if self.event_tx.send(pup_core::types::SessionEvent::Connected { info }).await.is_err() {
+        if self
+            .event_tx
+            .send(pup_core::types::SessionEvent::Connected { info })
+            .await
+            .is_err()
+        {
             warn!(session_id, "event channel closed");
             return;
         }
@@ -264,22 +275,32 @@ impl ClaudeService {
         // will prompt for tool-use confirmations in the TUI which pup cannot
         // answer, so we warn the user.
         if discovered.pid.is_some() && !discovered.dangerously_skip_permissions {
-            warn!(session_id, "Claude Code was not started with --dangerously-skip-permissions");
-            let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
-                session_id: session_id.clone(),
-                text: "⚠️ Claude Code was not started with --dangerously-skip-permissions. \
+            warn!(
+                session_id,
+                "Claude Code was not started with --dangerously-skip-permissions"
+            );
+            let _ = self
+                .event_tx
+                .send(pup_core::types::SessionEvent::Notification {
+                    session_id: session_id.clone(),
+                    text: "⚠️ Claude Code was not started with --dangerously-skip-permissions. \
                        Permission prompts cannot be handled remotely — messages sent from \
                        here may get stuck. Restart Claude Code with \
-                       --dangerously-skip-permissions to enable full remote control.".into(),
-            }).await;
+                       --dangerously-skip-permissions to enable full remote control."
+                        .into(),
+                })
+                .await;
         }
 
         // Notify about injection capability.
         if can_inject {
-            let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
-                session_id: session_id.clone(),
-                text: "🔗 Connected to Claude Code session (bidirectional)".into(),
-            }).await;
+            let _ = self
+                .event_tx
+                .send(pup_core::types::SessionEvent::Notification {
+                    session_id: session_id.clone(),
+                    text: "🔗 Connected to Claude Code session (bidirectional)".into(),
+                })
+                .await;
         } else {
             let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
                 session_id: session_id.clone(),
@@ -342,10 +363,10 @@ impl ClaudeService {
                 let _ = reply.send(result).await;
             }
             ClaudeCommand::Cancel { session_id } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    if let Err(e) = session.inject_escape().await {
-                        warn!(session_id, error = %e, "failed to inject Escape for cancel");
-                    }
+                if let Some(session) = self.sessions.get_mut(&session_id)
+                    && let Err(e) = session.inject_escape().await
+                {
+                    warn!(session_id, error = %e, "failed to inject Escape for cancel");
                 }
             }
         }
@@ -382,14 +403,18 @@ impl ClaudeService {
     /// Retry inspector connections for sessions in `Lost` state.
     async fn retry_inspector_connections(&mut self) {
         for session in self.sessions.values_mut() {
-            if matches!(&session.inspector, InspectorState::Lost { .. } | InspectorState::Discovered { .. })
+            if matches!(
+                &session.inspector,
+                InspectorState::Lost { .. } | InspectorState::Discovered { .. }
+            ) && session.connect_inspector().await
             {
-                if session.connect_inspector().await {
-                    let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
+                let _ = self
+                    .event_tx
+                    .send(pup_core::types::SessionEvent::Notification {
                         session_id: session.session_id.clone(),
                         text: "🔗 Inspector connected — bidirectional mode enabled".into(),
-                    }).await;
-                }
+                    })
+                    .await;
             }
         }
     }
@@ -446,7 +471,7 @@ impl ClaudeService {
                 session_id,
                 message_id,
                 text,
-                thinking: _,
+                ..
             } => pup_core::types::SessionEvent::MessageEnd {
                 session_id,
                 message_id,

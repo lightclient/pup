@@ -403,11 +403,10 @@ impl Outbox {
         }
 
         // Try pending edits (coalesced, cooldown + budget checked inside).
-        if let Some(op) = self.pending_edits.pop_eligible(
-            &self.last_edit,
-            self.edit_cooldown,
-            &self.chat_budget,
-        ) {
+        if let Some(op) =
+            self.pending_edits
+                .pop_eligible(&self.last_edit, self.edit_cooldown, &self.chat_budget)
+        {
             let span = debug_span!("outbox_flush", pending_edits = self.pending_edits.len());
             return async {
                 self.last_send = Some(Instant::now());
@@ -612,9 +611,7 @@ mod tests {
         // FIFO order: msg 1 first, then msg 2.
         let empty = HashMap::new();
         let budget = ChatBudget::new();
-        let op1 = map
-            .pop_eligible(&empty, Duration::ZERO, &budget)
-            .unwrap();
+        let op1 = map.pop_eligible(&empty, Duration::ZERO, &budget).unwrap();
         if let OutboxOp::Edit {
             message_id, text, ..
         } = op1
@@ -625,9 +622,7 @@ mod tests {
             panic!("expected Edit");
         }
 
-        let op2 = map
-            .pop_eligible(&empty, Duration::ZERO, &budget)
-            .unwrap();
+        let op2 = map.pop_eligible(&empty, Duration::ZERO, &budget).unwrap();
         if let OutboxOp::Edit {
             message_id, text, ..
         } = op2

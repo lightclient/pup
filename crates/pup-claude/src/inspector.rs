@@ -113,7 +113,10 @@ impl InspectorClient {
             if let Some(error) = response.get("error") {
                 bail!(
                     "inspector error: {}",
-                    error.get("message").and_then(Value::as_str).unwrap_or("unknown")
+                    error
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
                 );
             }
 
@@ -153,7 +156,11 @@ impl InspectorClient {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Step 2: Push the message text (hex-encoded to avoid escaping issues).
-        let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
+        let hex = text.bytes().fold(String::new(), |mut acc, b| {
+            use std::fmt::Write;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
         let expression = format!("process.stdin.push(Buffer.from('{hex}', 'hex'))");
         self.evaluate(&expression)
             .await

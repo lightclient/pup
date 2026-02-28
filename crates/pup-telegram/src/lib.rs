@@ -679,7 +679,14 @@ impl TelegramBackend {
 
                 if let Some(sid) = self.dm.attached.clone() {
                     // Start typing immediately.
-                    spawn_typing_loop(&mut self.pre_turn_typing, &self.bot, &self.outbox.chat_budget(), &sid, chat_id, None);
+                    spawn_typing_loop(
+                        &mut self.pre_turn_typing,
+                        &self.bot,
+                        &self.outbox.chat_budget(),
+                        &sid,
+                        chat_id,
+                        None,
+                    );
 
                     // Check for pending prompt completion.
                     if !text.starts_with('/')

@@ -24,18 +24,11 @@ use crate::transcript::TranscriptWatcher;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     /// User sent a message (from TUI or injected).
-    UserMessage {
-        session_id: String,
-        content: String,
-    },
+    UserMessage { session_id: String, content: String },
     /// Agent started processing.
-    AgentStart {
-        session_id: String,
-    },
+    AgentStart { session_id: String },
     /// Agent finished processing.
-    AgentEnd {
-        session_id: String,
-    },
+    AgentEnd { session_id: String },
     /// New assistant message started.
     MessageStart {
         session_id: String,
@@ -97,11 +90,7 @@ pub struct ClaudeSession {
 
 impl ClaudeSession {
     /// Create a new session from a discovered transcript file.
-    pub fn new(
-        session_id: String,
-        transcript_path: PathBuf,
-        cwd: String,
-    ) -> Result<Self> {
+    pub fn new(session_id: String, transcript_path: PathBuf, cwd: String) -> Result<Self> {
         let watcher = TranscriptWatcher::new(session_id.clone(), transcript_path.clone())?;
 
         Ok(Self {
@@ -134,7 +123,11 @@ impl ClaudeSession {
     pub async fn connect_inspector(&mut self) -> bool {
         let url = match &self.inspector {
             InspectorState::Discovered { url } => url.clone(),
-            InspectorState::Lost { url, last_attempt, backoff } => {
+            InspectorState::Lost {
+                url,
+                last_attempt,
+                backoff,
+            } => {
                 if last_attempt.elapsed() < *backoff {
                     return false; // Still in backoff.
                 }
@@ -173,7 +166,9 @@ impl ClaudeSession {
         let client = match &mut self.inspector {
             InspectorState::Connected { client } => client,
             InspectorState::Unavailable => {
-                anyhow::bail!("no inspector available for this session (was Claude Code launched with BUN_INSPECT?)");
+                anyhow::bail!(
+                    "no inspector available for this session (was Claude Code launched with BUN_INSPECT?)"
+                );
             }
             _ => {
                 anyhow::bail!("inspector not connected");

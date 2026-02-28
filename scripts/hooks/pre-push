@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "🔍 Running pre-push checks (matching CI)..."
+echo ""
+
+# Format check — CI uses nightly rustfmt
+echo "── cargo fmt (nightly) ──"
+if ! cargo +nightly fmt --all --check; then
+    echo ""
+    echo "❌ Format check failed. Run 'cargo +nightly fmt --all' to fix."
+    exit 1
+fi
+echo "✅ Format OK"
+echo ""
+
+# Clippy — CI uses stable with -D warnings
+echo "── cargo clippy ──"
+if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo ""
+    echo "❌ Clippy check failed. Fix the warnings above."
+    exit 1
+fi
+echo "✅ Clippy OK"
+echo ""
+
+echo "🎉 All pre-push checks passed!"

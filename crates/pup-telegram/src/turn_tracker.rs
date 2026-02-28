@@ -362,8 +362,7 @@ impl TurnTracker {
     /// Also updates the currently active turn (if any) so the change
     /// takes effect immediately.
     pub fn set_verbose(&mut self, session_id: &str, verbose: bool) {
-        self.session_verbose
-            .insert(session_id.to_owned(), verbose);
+        self.session_verbose.insert(session_id.to_owned(), verbose);
         if let Some(state) = self.turns.get_mut(session_id) {
             state.verbose = verbose;
         }
@@ -389,6 +388,7 @@ impl TurnTracker {
     /// Otherwise a fresh background typing indicator loop is spawned.
     /// Does NOT send a content message yet — that happens on the first
     /// tool/delta event.
+    #[allow(clippy::too_many_arguments)]
     pub fn start_turn(
         &mut self,
         session_id: &str,
@@ -408,10 +408,10 @@ impl TurnTracker {
             tokio::spawn(async move {
                 loop {
                     // Only send if the shared per-chat budget allows it.
-                    if budget.try_consume(chat_id) {
-                        if let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await {
-                            debug!(error = %e, "typing indicator failed");
-                        }
+                    if budget.try_consume(chat_id)
+                        && let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await
+                    {
+                        debug!(error = %e, "typing indicator failed");
                     }
                     tokio::select! {
                         _ = stop_rx.changed() => break,
@@ -1181,19 +1181,13 @@ mod tests {
 
     #[test]
     fn display_text_with_paragraph_break_snaps_to_boundary() {
-        let state = make_text_state(
-            "First paragraph.\n\nSecond paragraph being wri",
-            false,
-        );
+        let state = make_text_state("First paragraph.\n\nSecond paragraph being wri", false);
         assert_eq!(state.display_text(), "First paragraph.\n\n");
     }
 
     #[test]
     fn display_text_multiple_paragraphs_shows_all_complete() {
-        let state = make_text_state(
-            "Para 1.\n\nPara 2.\n\nPara 3 still writing",
-            false,
-        );
+        let state = make_text_state("Para 1.\n\nPara 2.\n\nPara 3 still writing", false);
         assert_eq!(state.display_text(), "Para 1.\n\nPara 2.\n\n");
     }
 
@@ -1205,10 +1199,7 @@ mod tests {
 
     #[test]
     fn display_text_streaming_complete_shows_everything() {
-        let state = make_text_state(
-            "First paragraph.\n\nSecond paragraph still wri",
-            true,
-        );
+        let state = make_text_state("First paragraph.\n\nSecond paragraph still wri", true);
         assert_eq!(
             state.display_text(),
             "First paragraph.\n\nSecond paragraph still wri"
@@ -1223,10 +1214,7 @@ mod tests {
 
     #[test]
     fn render_uses_display_text_not_full_streaming_text() {
-        let state = make_text_state(
-            "Done paragraph.\n\nPartial next",
-            false,
-        );
+        let state = make_text_state("Done paragraph.\n\nPartial next", false);
         let rendered = state.render_parts(true);
         // Should contain the complete first paragraph.
         assert!(rendered.contains("Done paragraph."));
@@ -1236,10 +1224,7 @@ mod tests {
 
     #[test]
     fn render_complete_shows_full_text() {
-        let state = make_text_state(
-            "Done paragraph.\n\nPartial next",
-            true,
-        );
+        let state = make_text_state("Done paragraph.\n\nPartial next", true);
         let rendered = state.render_parts(true);
         assert!(rendered.contains("Done paragraph."));
         assert!(rendered.contains("Partial next"));

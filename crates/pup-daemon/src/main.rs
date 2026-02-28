@@ -28,6 +28,7 @@ enum Commands {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -207,8 +208,7 @@ async fn main() -> Result<()> {
                             {
                                 info!(
                                     session_id = msg.session_id,
-                                    text,
-                                    "skipping pi slash command for Claude Code session"
+                                    text, "skipping pi slash command for Claude Code session"
                                 );
                             } else {
                                 let (reply_tx, mut reply_rx) = mpsc::channel(1);
@@ -223,23 +223,19 @@ async fn main() -> Result<()> {
                                 // Check result asynchronously.
                                 let sid = msg.session_id;
                                 tokio::spawn(async move {
-                                    if let Some(result) = reply_rx.recv().await {
-                                        if let Err(e) = result {
-                                            warn!(
-                                                session_id = sid,
-                                                error = e,
-                                                "Claude Code injection failed"
-                                            );
-                                        }
+                                    if let Some(Err(e)) = reply_rx.recv().await {
+                                        warn!(
+                                            session_id = sid,
+                                            error = e,
+                                            "Claude Code injection failed"
+                                        );
                                     }
                                 });
                             }
                         }
                     }
-                } else {
-                    if pi_incoming_tx.send(msg).await.is_err() {
-                        break;
-                    }
+                } else if pi_incoming_tx.send(msg).await.is_err() {
+                    break;
                 }
             }
         });

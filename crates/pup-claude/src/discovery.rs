@@ -103,6 +103,7 @@ impl ClaudeDiscovery {
     }
 
     /// Perform one discovery scan.
+    #[allow(clippy::too_many_lines)]
     async fn scan(&mut self) -> Result<()> {
         // 0. Clean up stale entries from the recently_gone set (after 10 min).
         let gone_ttl = Duration::from_secs(600);
@@ -122,6 +123,7 @@ impl ClaudeDiscovery {
         // modified transcript per process to avoid duplicate injections.
         let mut seen_ids = std::collections::HashSet::new();
 
+        #[allow(clippy::items_after_statements)]
         // First pass: match transcripts to processes and pick the best per PID.
         struct Candidate {
             session_id: String,
@@ -156,8 +158,7 @@ impl ClaudeDiscovery {
                 // /root/pup/cc-test → /root/pup/cc/test) so we also
                 // compare the process CWD converted to a slug against
                 // the raw directory name.
-                let cwd_matches = proc.cwd == *cwd_from_dir
-                    || path_to_slug(&proc.cwd) == *dir_slug;
+                let cwd_matches = proc.cwd == *cwd_from_dir || path_to_slug(&proc.cwd) == *dir_slug;
                 if cwd_matches || proc.session_ids.contains(session_id) {
                     inspector_url.clone_from(&proc.inspector_url);
                     pid = Some(proc.pid);
@@ -209,9 +210,7 @@ impl ClaudeDiscovery {
                 let stale: Vec<String> = self
                     .known
                     .iter()
-                    .filter(|(sid, ks)| {
-                        *sid != &c.session_id && ks.pid == Some(pid)
-                    })
+                    .filter(|(sid, ks)| *sid != &c.session_id && ks.pid == Some(pid))
                     .map(|(sid, _)| sid.clone())
                     .collect();
 
@@ -226,7 +225,9 @@ impl ClaudeDiscovery {
                     seen_ids.remove(&stale_sid);
                     let _ = self
                         .tx
-                        .send(DiscoveryEvent::SessionGone { session_id: stale_sid })
+                        .send(DiscoveryEvent::SessionGone {
+                            session_id: stale_sid,
+                        })
                         .await;
                 }
             }
@@ -242,32 +243,28 @@ impl ClaudeDiscovery {
                 let pid_changed = c.pid.is_some() && c.pid != known.pid;
                 let inspector_newly_found = c.inspector_url.is_some() && pid_changed;
 
-                if changed || pid_changed {
-                    if let Some(k) = self.known.get_mut(&c.session_id) {
-                        k.last_modified = c.modified;
-                        if pid_changed {
-                            k.pid = c.pid;
-                        }
+                if (changed || pid_changed)
+                    && let Some(k) = self.known.get_mut(&c.session_id)
+                {
+                    k.last_modified = c.modified;
+                    if pid_changed {
+                        k.pid = c.pid;
                     }
                 }
 
-                if inspector_newly_found {
-                    if let (Some(url), Some(pid)) = (&c.inspector_url, c.pid) {
-                        info!(
-                            session_id = c.session_id,
-                            url,
+                if inspector_newly_found && let (Some(url), Some(pid)) = (&c.inspector_url, c.pid) {
+                    info!(
+                        session_id = c.session_id,
+                        url, pid, "inspector URL discovered for existing session"
+                    );
+                    let _ = self
+                        .tx
+                        .send(DiscoveryEvent::InspectorDiscovered {
+                            session_id: c.session_id.clone(),
+                            inspector_url: url.clone(),
                             pid,
-                            "inspector URL discovered for existing session"
-                        );
-                        let _ = self
-                            .tx
-                            .send(DiscoveryEvent::InspectorDiscovered {
-                                session_id: c.session_id.clone(),
-                                inspector_url: url.clone(),
-                                pid,
-                            })
-                            .await;
-                    }
+                        })
+                        .await;
                 }
 
                 continue;
@@ -314,13 +311,13 @@ impl ClaudeDiscovery {
             }
 
             // Check if the transcript has been inactive too long.
-            if let Ok(elapsed) = now.duration_since(known.last_modified) {
-                if elapsed > self.inactive_timeout {
-                    // Also check if the process is still running.
-                    let proc_alive = known.pid.is_some_and(|p| process_alive(p));
-                    if !proc_alive {
-                        gone.push(session_id.clone());
-                    }
+            if let Ok(elapsed) = now.duration_since(known.last_modified)
+                && elapsed > self.inactive_timeout
+            {
+                // Also check if the process is still running.
+                let proc_alive = known.pid.is_some_and(process_alive);
+                if !proc_alive {
+                    gone.push(session_id.clone());
                 }
             }
         }
@@ -332,9 +329,7 @@ impl ClaudeDiscovery {
                 .insert(session_id.clone(), std::time::Instant::now());
             let _ = self
                 .tx
-                .send(DiscoveryEvent::SessionGone {
-                    session_id,
-                })
+                .send(DiscoveryEvent::SessionGone { session_id })
                 .await;
         }
 
@@ -388,8 +383,7 @@ async fn find_claude_processes() -> Vec<ClaudeProcess> {
             continue;
         }
 
-        let dangerously_skip_permissions =
-            cmdline_str.contains("--dangerously-skip-permissions");
+        let dangerously_skip_permissions = cmdline_str.contains("--dangerously-skip-permissions");
 
         // Read environment variables.
         let environ_path = format!("/proc/{pid}/environ");
@@ -412,10 +406,10 @@ async fn find_claude_processes() -> Vec<ClaudeProcess> {
         }
 
         // Try to get CWD from /proc/<pid>/cwd symlink.
-        if cwd.is_empty() {
-            if let Ok(link) = tokio::fs::read_link(format!("/proc/{pid}/cwd")).await {
-                cwd = link.to_string_lossy().into_owned();
-            }
+        if cwd.is_empty()
+            && let Ok(link) = tokio::fs::read_link(format!("/proc/{pid}/cwd")).await
+        {
+            cwd = link.to_string_lossy().into_owned();
         }
 
         result.push(ClaudeProcess {
@@ -492,7 +486,13 @@ async fn find_recent_transcripts(
                 continue;
             }
 
-            result.push((session_id, file_path, modified, cwd.clone(), dir_name.to_owned()));
+            result.push((
+                session_id,
+                file_path,
+                modified,
+                cwd.clone(),
+                dir_name.to_owned(),
+            ));
         }
     }
 
