@@ -69,38 +69,41 @@ fn format_topics_help() -> String {
     .join("\n")
 }
 
-/// Spawn a background typing indicator loop for a session, running until
-/// the returned [`tokio::sync::watch::Sender`] is dropped.  Does nothing
-/// if a loop is already running for the given session.
-fn spawn_typing_loop(
-    pre_turn_typing: &mut HashMap<String, tokio::sync::watch::Sender<bool>>,
+/// Spawn background typing indicator loops for a session, one per
+/// destination.  Running until the stored senders are dropped.  Does
+/// nothing if loops are already running for the given session.
+fn spawn_typing_loops(
+    pre_turn_typing: &mut HashMap<String, Vec<tokio::sync::watch::Sender<bool>>>,
     bot: &BotClient,
     chat_budget: &ChatBudget,
     session_id: &str,
-    chat_id: i64,
-    thread_id: Option<i64>,
+    destinations: &[(i64, Option<i64>)],
 ) {
-    if pre_turn_typing.contains_key(session_id) {
+    if pre_turn_typing.contains_key(session_id) || destinations.is_empty() {
         return;
     }
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
-    let bot = bot.clone();
-    let budget = chat_budget.clone();
-    let sid = session_id.to_owned();
-    tokio::spawn(async move {
-        loop {
-            // Only send if the shared per-chat budget allows it.
-            if budget.try_consume(chat_id) {
-                let _ = bot.send_chat_action(chat_id, "typing", thread_id).await;
+    let mut senders = Vec::with_capacity(destinations.len());
+    for &(chat_id, thread_id) in destinations {
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let bot = bot.clone();
+        let budget = chat_budget.clone();
+        let sid = session_id.to_owned();
+        tokio::spawn(async move {
+            loop {
+                // Only send if the shared per-chat budget allows it.
+                if budget.try_consume(chat_id) {
+                    let _ = bot.send_chat_action(chat_id, "typing", thread_id).await;
+                }
+                tokio::select! {
+                    () = async { let _ = stop_rx.changed().await; } => break,
+                    () = tokio::time::sleep(std::time::Duration::from_secs(4)) => {}
+                }
             }
-            tokio::select! {
-                () = async { let _ = stop_rx.changed().await; } => break,
-                () = tokio::time::sleep(std::time::Duration::from_secs(4)) => {}
-            }
-        }
-        debug!(session_id = %sid, "pre-turn typing indicator stopped");
-    });
-    pre_turn_typing.insert(session_id.to_owned(), stop_tx);
+            debug!(session_id = %sid, "pre-turn typing indicator stopped");
+        });
+        senders.push(stop_tx);
+    }
+    pre_turn_typing.insert(session_id.to_owned(), senders);
 }
 
 /// Configuration for the Telegram backend.
@@ -161,7 +164,7 @@ pub struct TelegramBackend {
     /// Pre-turn typing indicators, keyed by session ID.
     /// Active from message receipt until AgentStart (where the turn
     /// tracker starts its own typing loop).
-    pre_turn_typing: HashMap<String, tokio::sync::watch::Sender<bool>>,
+    pre_turn_typing: HashMap<String, Vec<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl TelegramBackend {
@@ -436,14 +439,21 @@ impl TelegramBackend {
 
             // Start typing immediately so the user sees activity
             // while we parse, transcribe, or wait for the agent.
-            spawn_typing_loop(
-                &mut self.pre_turn_typing,
-                &self.bot,
-                &self.outbox.chat_budget(),
-                &session_id,
-                topics.chat_id(),
-                Some(thread_id),
-            );
+            {
+                let mut dests = vec![(topics.chat_id(), Some(thread_id))];
+                if self.dm.attached.as_deref() == Some(&session_id)
+                    && let Some(dm_cid) = self.dm_chat_id
+                {
+                    dests.push((dm_cid, None));
+                }
+                spawn_typing_loops(
+                    &mut self.pre_turn_typing,
+                    &self.bot,
+                    &self.outbox.chat_budget(),
+                    &session_id,
+                    &dests,
+                );
+            }
 
             // If the user sent a non-command and there's a pending
             // prompt, treat their reply as the argument.
@@ -519,6 +529,14 @@ impl TelegramBackend {
                 (cleaned_text, SendMode::Steer)
             };
 
+            // Echo user message to the DM so both channels show
+            // the full conversation.
+            if self.dm.attached.as_deref() == Some(session_id.as_str())
+                && let Some(dm_cid) = self.dm_chat_id
+            {
+                self.send_dm(dm_cid, &format_user_message(&msg_text));
+            }
+
             let _ = self
                 .incoming_tx
                 .send(IncomingMessage {
@@ -582,6 +600,21 @@ impl TelegramBackend {
                             &format!("Attached to <b>{}</b>", escape_html(name)),
                         );
                         info!(session_id = %sid, "DM attached");
+
+                        // If the session has an active turn, add the DM
+                        // as a destination so the user sees live updates
+                        // immediately (not just from the next turn).
+                        if self.turn_tracker.has_turn(&sid) {
+                            let budget = self.outbox.chat_budget();
+                            self.turn_tracker.add_destination(
+                                &sid,
+                                chat_id,
+                                None,
+                                &self.bot,
+                                &budget,
+                                &mut self.outbox,
+                            );
+                        }
                     }
                     ResolveResult::Ambiguous(matches) => {
                         let names: Vec<String> = matches
@@ -678,15 +711,22 @@ impl TelegramBackend {
                 }
 
                 if let Some(sid) = self.dm.attached.clone() {
-                    // Start typing immediately.
-                    spawn_typing_loop(
-                        &mut self.pre_turn_typing,
-                        &self.bot,
-                        &self.outbox.chat_budget(),
-                        &sid,
-                        chat_id,
-                        None,
-                    );
+                    // Start typing immediately in all destinations.
+                    {
+                        let mut dests = vec![(chat_id, None)];
+                        if let Some(ref topics) = self.topics
+                            && let Some(thread_id) = topics.thread_for_session(&sid)
+                        {
+                            dests.push((topics.chat_id(), Some(thread_id)));
+                        }
+                        spawn_typing_loops(
+                            &mut self.pre_turn_typing,
+                            &self.bot,
+                            &self.outbox.chat_budget(),
+                            &sid,
+                            &dests,
+                        );
+                    }
 
                     // Check for pending prompt completion.
                     if !text.starts_with('/')
@@ -738,6 +778,10 @@ impl TelegramBackend {
                         }
                     }
 
+                    // Echo user message to the topic so both channels
+                    // show the full conversation.
+                    self.send_to_topic(&sid, &format_user_message(&text));
+
                     let _ = self
                         .incoming_tx
                         .send(IncomingMessage {
@@ -763,32 +807,32 @@ impl TelegramBackend {
         if self.turn_tracker.has_turn(session_id) {
             return;
         }
-        if let Some(ref topics) = self.topics {
-            if let Some(thread_id) = topics.thread_for_session(session_id) {
-                debug!(session_id, "auto-creating turn state (missed AgentStart)");
-                let existing = self.pre_turn_typing.remove(session_id);
-                let budget = self.outbox.chat_budget();
-                self.turn_tracker.start_turn(
-                    session_id,
-                    topics.chat_id(),
-                    Some(thread_id),
-                    &self.bot,
-                    &budget,
-                    existing,
-                );
-            }
-        } else if self.dm.attached.as_deref() == Some(session_id)
+
+        let mut destinations = Vec::new();
+        if let Some(ref topics) = self.topics
+            && let Some(thread_id) = topics.thread_for_session(session_id)
+        {
+            destinations.push((topics.chat_id(), Some(thread_id)));
+        }
+        if self.dm.attached.as_deref() == Some(session_id)
             && let Some(chat_id) = self.dm_chat_id
         {
-            debug!(
-                session_id,
-                "auto-creating turn state for DM (missed AgentStart)"
-            );
-            let existing = self.pre_turn_typing.remove(session_id);
-            let budget = self.outbox.chat_budget();
-            self.turn_tracker
-                .start_turn(session_id, chat_id, None, &self.bot, &budget, existing);
+            destinations.push((chat_id, None));
         }
+
+        if destinations.is_empty() {
+            return;
+        }
+
+        debug!(
+            session_id,
+            dests = destinations.len(),
+            "auto-creating turn state (missed AgentStart)"
+        );
+        self.pre_turn_typing.remove(session_id);
+        let budget = self.outbox.chat_budget();
+        self.turn_tracker
+            .start_turn(session_id, &destinations, &self.bot, &budget);
     }
 
     fn send_dm(&mut self, chat_id: i64, text: &str) {
@@ -819,6 +863,7 @@ impl TelegramBackend {
     }
 
     /// Handle a voice message: download, transcribe, and forward as text.
+    #[allow(clippy::too_many_lines)]
     async fn handle_voice_message(
         &mut self,
         chat_id: i64,
@@ -840,14 +885,28 @@ impl TelegramBackend {
         };
 
         // Start typing immediately — covers download + transcription time.
-        spawn_typing_loop(
-            &mut self.pre_turn_typing,
-            &self.bot,
-            &self.outbox.chat_budget(),
-            &session_id,
-            chat_id,
-            thread_id,
-        );
+        {
+            let mut dests = vec![(chat_id, thread_id)];
+            if let Some(ref topics) = self.topics
+                && let Some(tid) = topics.thread_for_session(&session_id)
+                && thread_id != Some(tid)
+            {
+                dests.push((topics.chat_id(), Some(tid)));
+            }
+            if self.dm.attached.as_deref() == Some(&session_id)
+                && let Some(dm_cid) = self.dm_chat_id
+                && thread_id.is_some()
+            {
+                dests.push((dm_cid, None));
+            }
+            spawn_typing_loops(
+                &mut self.pre_turn_typing,
+                &self.bot,
+                &self.outbox.chat_budget(),
+                &session_id,
+                &dests,
+            );
+        }
 
         // Macro-like helper: reply to the right place.
         macro_rules! reply {
@@ -910,12 +969,13 @@ impl TelegramBackend {
 
         info!(session_id, chars = text.len(), "voice message transcribed");
 
-        // Show the transcribed text to the user.
+        // Show the transcribed text in all destinations.
         let preview = format!("🎙️ <i>{}</i>", escape_html(&text));
-        if thread_id.is_some() {
-            self.send_to_topic(&session_id, &preview);
-        } else {
-            self.send_dm(chat_id, &preview);
+        self.send_to_topic(&session_id, &preview);
+        if self.dm.attached.as_deref() == Some(session_id.as_str())
+            && let Some(dm_cid) = self.dm_chat_id
+        {
+            self.send_dm(dm_cid, &preview);
         }
 
         // Forward the transcribed text to the session.
@@ -1341,37 +1401,29 @@ impl ChatBackend for TelegramBackend {
             SessionEvent::AgentStart { ref session_id } => {
                 debug!(session_id, "agent started");
 
-                // Transfer the pre-turn typing loop (if any) to the turn
-                // tracker so it keeps running seamlessly.  If there is no
-                // pre-turn loop (e.g. the turn was triggered from the TUI),
-                // the tracker spawns a fresh one.
-                let existing_typing = self.pre_turn_typing.remove(session_id);
+                // Drop the pre-turn typing loop — the turn tracker will
+                // spawn fresh typing loops for all destinations.
+                self.pre_turn_typing.remove(session_id);
+
+                // Collect all destinations for this session (topic + DM).
+                let mut destinations = Vec::new();
+                if let Some(ref topics) = self.topics
+                    && let Some(thread_id) = topics.thread_for_session(session_id)
+                {
+                    destinations.push((topics.chat_id(), Some(thread_id)));
+                }
+                if self.dm.attached.as_deref() == Some(session_id.as_str())
+                    && let Some(chat_id) = self.dm_chat_id
+                {
+                    destinations.push((chat_id, None));
+                }
 
                 // Start a new turn — the tracker will send the first
                 // Telegram message lazily on the first tool/delta event.
-                let budget = self.outbox.chat_budget();
-                if let Some(ref topics) = self.topics {
-                    if let Some(thread_id) = topics.thread_for_session(session_id) {
-                        self.turn_tracker.start_turn(
-                            session_id,
-                            topics.chat_id(),
-                            Some(thread_id),
-                            &self.bot,
-                            &budget,
-                            existing_typing,
-                        );
-                    }
-                } else if self.dm.attached.as_deref() == Some(session_id.as_str())
-                    && let Some(chat_id) = self.dm_chat_id
-                {
-                    self.turn_tracker.start_turn(
-                        session_id,
-                        chat_id,
-                        None,
-                        &self.bot,
-                        &budget,
-                        existing_typing,
-                    );
+                if !destinations.is_empty() {
+                    let budget = self.outbox.chat_budget();
+                    self.turn_tracker
+                        .start_turn(session_id, &destinations, &self.bot, &budget);
                 }
             }
             SessionEvent::AgentEnd { ref session_id } => {

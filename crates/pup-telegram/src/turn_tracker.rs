@@ -95,50 +95,30 @@ struct TrackedTool {
     done: bool,
 }
 
-/// State for one agent turn in one session.
+// ── Multi-destination support ─────────────────────────────────
+
+/// A single Telegram chat destination for a turn's messages.
+///
+/// A turn can target multiple destinations simultaneously (e.g. a forum
+/// topic AND a DM chat).  Each destination has its own Telegram message
+/// and typing indicator.
 #[derive(Debug)]
-#[allow(clippy::struct_excessive_bools)]
-struct TurnState {
-    /// Chat ID where this message lives.
+struct Destination {
+    /// Chat ID where messages are sent.
     chat_id: i64,
-    /// Thread ID for topic mode (None for DMs).
+    /// Thread ID for topic mode (`None` for DMs).
     thread_id: Option<i64>,
-    /// Session ID (for cancel button).
-    session_id: String,
-    /// Telegram message ID of our single status message (set after send).
+    /// Telegram message ID of our status message (set after send).
     telegram_message_id: Option<i64>,
     /// Whether the initial send is still in flight.
     send_pending: bool,
     /// Channel to receive the sent message ID.
     send_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<crate::bot::SentMessage>>>,
-    /// Accumulated streaming text for the current assistant message.
-    streaming_text: String,
-    /// Whether the model is currently in a thinking/reasoning phase.
-    thinking: bool,
-    /// Accumulated thinking/chain-of-thought text.
-    thinking_text: String,
-    /// Last time we sent an edit to Telegram.
-    last_edit: Instant,
-    /// Whether content has changed since the last edit.
-    dirty: bool,
     /// Sender to stop the typing indicator loop (dropped on turn end).
     typing_stop: Option<tokio::sync::watch::Sender<bool>>,
-    /// Whether to show tool call details.
-    verbose: bool,
-    /// How many tool calls to keep in the rendered message.
-    tool_call_limit: ToolCallLimit,
-    /// How many lines of tool output to show per tool call.
-    tool_output_lines: ToolOutputLines,
-    /// Tracked tool calls in order.
-    tools: Vec<TrackedTool>,
-    /// Length of the display text at the last flush (for change detection).
-    last_display_len: usize,
-    /// Whether the streaming message is complete (show full text, not
-    /// just complete paragraphs).
-    streaming_complete: bool,
 }
 
-impl TurnState {
+impl Destination {
     /// Try to resolve the sent message ID if the send is still pending.
     fn try_resolve_message_id(&mut self) {
         if !self.send_pending {
@@ -159,7 +139,44 @@ impl TurnState {
             }
         }
     }
+}
 
+// ── Turn state ────────────────────────────────────────────────
+
+/// State for one agent turn in one session.
+#[derive(Debug)]
+#[allow(clippy::struct_excessive_bools)]
+struct TurnState {
+    /// Session ID (for cancel button).
+    session_id: String,
+    /// Destinations to send messages to (topic, DM, or both).
+    destinations: Vec<Destination>,
+    /// Accumulated streaming text for the current assistant message.
+    streaming_text: String,
+    /// Whether the model is currently in a thinking/reasoning phase.
+    thinking: bool,
+    /// Accumulated thinking/chain-of-thought text.
+    thinking_text: String,
+    /// Last time we sent an edit to Telegram.
+    last_edit: Instant,
+    /// Whether content has changed since the last edit.
+    dirty: bool,
+    /// Whether to show tool call details.
+    verbose: bool,
+    /// How many tool calls to keep in the rendered message.
+    tool_call_limit: ToolCallLimit,
+    /// How many lines of tool output to show per tool call.
+    tool_output_lines: ToolOutputLines,
+    /// Tracked tool calls in order.
+    tools: Vec<TrackedTool>,
+    /// Length of the display text at the last flush (for change detection).
+    last_display_len: usize,
+    /// Whether the streaming message is complete (show full text, not
+    /// just complete paragraphs).
+    streaming_complete: bool,
+}
+
+impl TurnState {
     /// Return the streaming text to display, snapped to paragraph boundaries.
     ///
     /// During active streaming, only text up to (and including) the last
@@ -271,6 +288,9 @@ impl TurnState {
     }
 
     /// Enqueue an edit (or initial send) for the current state.
+    ///
+    /// Iterates all destinations and enqueues an edit for each one that
+    /// has a resolved Telegram message ID.
     fn flush(&mut self, outbox: &mut Outbox, edit_interval_ms: u64) {
         if !self.dirty {
             return;
@@ -283,23 +303,26 @@ impl TurnState {
             return;
         }
 
-        self.try_resolve_message_id();
-
-        let Some(tg_msg_id) = self.telegram_message_id else {
-            return;
-        };
-
         let rendered = self.render();
         let chunks = split_message(&rendered, MAX_BODY_CHARS);
         let display = chunks.first().cloned().unwrap_or_else(|| "…".to_owned());
+        let keyboard = cancel_keyboard(&self.session_id);
 
-        outbox.enqueue(OutboxOp::Edit {
-            chat_id: self.chat_id,
-            message_id: tg_msg_id,
-            text: display,
-            parse_mode: Some("HTML".to_owned()),
-            reply_markup: Some(cancel_keyboard(&self.session_id)),
-        });
+        for dest in &mut self.destinations {
+            dest.try_resolve_message_id();
+
+            let Some(tg_msg_id) = dest.telegram_message_id else {
+                continue;
+            };
+
+            outbox.enqueue(OutboxOp::Edit {
+                chat_id: dest.chat_id,
+                message_id: tg_msg_id,
+                text: display.clone(),
+                parse_mode: Some("HTML".to_owned()),
+                reply_markup: Some(keyboard.clone()),
+            });
+        }
 
         self.last_edit = Instant::now();
         self.dirty = false;
@@ -381,33 +404,109 @@ impl TurnTracker {
         self.turns.contains_key(session_id)
     }
 
-    /// Start tracking a new agent turn.
+    /// Start tracking a new agent turn with one or more destinations.
     ///
-    /// If `existing_typing` is provided (e.g. a pre-turn typing loop that
-    /// was already running), it is reused instead of spawning a new one.
-    /// Otherwise a fresh background typing indicator loop is spawned.
+    /// Each destination gets its own Telegram message and typing indicator.
+    /// The `destinations` slice contains `(chat_id, thread_id)` pairs.
+    ///
     /// Does NOT send a content message yet — that happens on the first
     /// tool/delta event.
-    #[allow(clippy::too_many_arguments)]
     pub fn start_turn(
+        &mut self,
+        session_id: &str,
+        destinations: &[(i64, Option<i64>)],
+        bot: &BotClient,
+        chat_budget: &ChatBudget,
+    ) {
+        let dests: Vec<Destination> = destinations
+            .iter()
+            .map(|&(chat_id, thread_id)| {
+                // Spawn typing indicator loop. Dropping the tx end stops it.
+                let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+                let bot = bot.clone();
+                let budget = chat_budget.clone();
+                tokio::spawn(async move {
+                    loop {
+                        if budget.try_consume(chat_id)
+                            && let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await
+                        {
+                            debug!(error = %e, "typing indicator failed");
+                        }
+                        tokio::select! {
+                            _ = stop_rx.changed() => break,
+                            () = tokio::time::sleep(Duration::from_secs(4)) => {}
+                        }
+                    }
+                });
+
+                Destination {
+                    chat_id,
+                    thread_id,
+                    telegram_message_id: None,
+                    send_pending: false,
+                    send_rx: None,
+                    typing_stop: Some(stop_tx),
+                }
+            })
+            .collect();
+
+        self.turns.insert(
+            session_id.to_owned(),
+            TurnState {
+                session_id: session_id.to_owned(),
+                destinations: dests,
+                streaming_text: String::new(),
+                thinking: false,
+                thinking_text: String::new(),
+                last_edit: Instant::now(),
+                dirty: false,
+                verbose: self.is_verbose(session_id),
+                tool_call_limit: self.tool_call_limit,
+                tool_output_lines: self.tool_output_lines,
+                tools: Vec::new(),
+                last_display_len: 0,
+                streaming_complete: false,
+            },
+        );
+    }
+
+    /// Add a destination to an existing turn (e.g. when the user does
+    /// `/attach` mid-turn).
+    ///
+    /// Spawns a typing loop and sends the current turn content as the
+    /// initial message so the new destination catches up immediately.
+    /// No-op if the session has no active turn or the destination already
+    /// exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_destination(
         &mut self,
         session_id: &str,
         chat_id: i64,
         thread_id: Option<i64>,
         bot: &BotClient,
         chat_budget: &ChatBudget,
-        existing_typing: Option<tokio::sync::watch::Sender<bool>>,
+        outbox: &mut Outbox,
     ) {
-        let stop_tx = if let Some(tx) = existing_typing {
-            tx
-        } else {
-            // Spawn typing indicator loop. Dropping the tx end stops it.
-            let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        let Some(state) = self.turns.get_mut(session_id) else {
+            return;
+        };
+
+        // Don't add duplicates.
+        if state
+            .destinations
+            .iter()
+            .any(|d| d.chat_id == chat_id && d.thread_id == thread_id)
+        {
+            return;
+        }
+
+        // Spawn typing loop.
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        {
             let bot = bot.clone();
             let budget = chat_budget.clone();
             tokio::spawn(async move {
                 loop {
-                    // Only send if the shared per-chat budget allows it.
                     if budget.try_consume(chat_id)
                         && let Err(e) = bot.send_chat_action(chat_id, "typing", thread_id).await
                     {
@@ -419,59 +518,68 @@ impl TurnTracker {
                     }
                 }
             });
-            stop_tx
-        };
+        }
 
-        self.turns.insert(
-            session_id.to_owned(),
-            TurnState {
-                chat_id,
-                thread_id,
-                session_id: session_id.to_owned(),
-                telegram_message_id: None,
-                send_pending: false,
-                send_rx: None,
-                streaming_text: String::new(),
-                thinking: false,
-                thinking_text: String::new(),
-                last_edit: Instant::now(),
-                dirty: false,
-                typing_stop: Some(stop_tx),
-                verbose: self.is_verbose(session_id),
-                tool_call_limit: self.tool_call_limit,
-                tool_output_lines: self.tool_output_lines,
-                tools: Vec::new(),
-                last_display_len: 0,
-                streaming_complete: false,
-            },
-        );
+        // Send current turn content as the initial message so the
+        // new destination catches up.
+        let rendered = state.render();
+        let keyboard = cancel_keyboard(&state.session_id);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        outbox.enqueue(OutboxOp::Send {
+            chat_id,
+            text: rendered,
+            parse_mode: Some("HTML".to_owned()),
+            reply_markup: Some(keyboard),
+            message_thread_id: thread_id,
+            result_tx: Some(tx),
+        });
+
+        state.destinations.push(Destination {
+            chat_id,
+            thread_id,
+            telegram_message_id: None,
+            send_pending: true,
+            send_rx: Some(rx),
+            typing_stop: Some(stop_tx),
+        });
     }
 
-    /// Ensure the turn's Telegram message exists; send it if not.
+    /// Ensure the turn's Telegram message exists in all destinations;
+    /// send it if not.
     fn ensure_message(&mut self, session_id: &str, initial_text: &str, outbox: &mut Outbox) {
         let Some(state) = self.turns.get_mut(session_id) else {
             return;
         };
 
-        // Already sent or pending.
-        if state.telegram_message_id.is_some() || state.send_pending {
-            return;
+        let keyboard = cancel_keyboard(&state.session_id);
+        let mut sent_any = false;
+
+        for dest in &mut state.destinations {
+            // Already sent or pending.
+            if dest.telegram_message_id.is_some() || dest.send_pending {
+                continue;
+            }
+
+            let (tx, rx) = tokio::sync::oneshot::channel();
+
+            outbox.enqueue(OutboxOp::Send {
+                chat_id: dest.chat_id,
+                text: initial_text.to_owned(),
+                parse_mode: Some("HTML".to_owned()),
+                reply_markup: Some(keyboard.clone()),
+                message_thread_id: dest.thread_id,
+                result_tx: Some(tx),
+            });
+
+            dest.send_pending = true;
+            dest.send_rx = Some(rx);
+            sent_any = true;
         }
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        outbox.enqueue(OutboxOp::Send {
-            chat_id: state.chat_id,
-            text: initial_text.to_owned(),
-            parse_mode: Some("HTML".to_owned()),
-            reply_markup: Some(cancel_keyboard(&state.session_id)),
-            message_thread_id: state.thread_id,
-            result_tx: Some(tx),
-        });
-
-        state.send_pending = true;
-        state.send_rx = Some(rx);
-        state.last_edit = Instant::now();
+        if sent_any {
+            state.last_edit = Instant::now();
+        }
     }
 
     /// Note that a tool started. Ensures the Telegram message exists.
@@ -579,10 +687,11 @@ impl TurnTracker {
             // If no message sent yet, send with the first chunk of text.
             #[allow(clippy::if_then_some_else_none)]
             let initial = {
-                let needs_send = self
-                    .turns
-                    .get(session_id)
-                    .is_some_and(|s| s.telegram_message_id.is_none() && !s.send_pending);
+                let needs_send = self.turns.get(session_id).is_some_and(|s| {
+                    s.destinations
+                        .iter()
+                        .any(|d| d.telegram_message_id.is_none() && !d.send_pending)
+                });
                 if needs_send {
                     let state = self.turns.get(session_id).expect("session must exist");
                     let mut preview = state.render();
@@ -678,105 +787,136 @@ impl TurnTracker {
     /// tools/thinking summary (with the cancel keyboard removed).
     /// The final assistant text is sent as a **separate** message so
     /// the user can scroll back to the tool trace independently.
+    ///
+    /// All destinations are finalized independently — each gets its own
+    /// edit/send operations.
+    #[allow(clippy::too_many_lines)]
     pub fn end_turn(&mut self, session_id: &str, outbox: &mut Outbox) {
         let Some(mut state) = self.turns.remove(session_id) else {
             return;
         };
 
-        // Stop the typing indicator (dropping the sender closes the channel).
-        state.typing_stop.take();
+        // Stop all typing indicators (dropping the senders closes channels).
+        for dest in &mut state.destinations {
+            dest.typing_stop.take();
+        }
 
-        // Resolve message ID if still pending.
-        state.try_resolve_message_id();
+        // Resolve pending message IDs.
+        for dest in &mut state.destinations {
+            dest.try_resolve_message_id();
+        }
 
         let has_verbose_content =
             state.verbose && (!state.tools.is_empty() || !state.thinking_text.is_empty());
         let has_text = !state.streaming_text.is_empty();
 
-        if let Some(tg_msg_id) = state.telegram_message_id {
-            if has_verbose_content && has_text {
-                // Edit the existing message to show only tools/thinking
-                // (strip the streaming text that was shown during the turn).
-                let summary = state.render_parts(false);
-                let summary_chunks = split_message(&summary, MAX_BODY_CHARS);
-                if let Some(first) = summary_chunks.first() {
-                    outbox.enqueue(OutboxOp::Edit {
-                        chat_id: state.chat_id,
-                        message_id: tg_msg_id,
-                        text: first.clone(),
-                        parse_mode: Some("HTML".to_owned()),
-                        reply_markup: Some(empty_keyboard()),
-                    });
-                }
+        // Pre-render content (shared across all destinations).
+        #[allow(clippy::if_then_some_else_none)]
+        let summary_chunks =
+            has_verbose_content.then(|| split_message(&state.render_parts(false), MAX_BODY_CHARS));
 
-                // Send final assistant text as a separate message.
-                let text_html = to_telegram_html(&state.streaming_text);
-                if !text_html.is_empty() {
-                    let text_chunks = split_message(&text_html, MAX_BODY_CHARS);
-                    for chunk in &text_chunks {
-                        outbox.enqueue(OutboxOp::Send {
-                            chat_id: state.chat_id,
-                            text: chunk.clone(),
+        let text_chunks = if has_text {
+            let html = to_telegram_html(&state.streaming_text);
+            if html.is_empty() {
+                None
+            } else {
+                Some(split_message(&html, MAX_BODY_CHARS))
+            }
+        } else {
+            None
+        };
+
+        #[allow(clippy::if_then_some_else_none)]
+        let rendered_chunks = (has_text && !has_verbose_content)
+            .then(|| split_message(&state.render(), MAX_BODY_CHARS));
+
+        #[allow(clippy::if_not_else, clippy::if_then_some_else_none)]
+        let no_text_chunks =
+            (!has_text).then(|| split_message(&state.render_parts(false), MAX_BODY_CHARS));
+
+        for dest in &state.destinations {
+            if let Some(tg_msg_id) = dest.telegram_message_id {
+                if has_verbose_content && has_text {
+                    // Edit the existing message to show only tools/thinking
+                    // (strip the streaming text that was shown during the turn).
+                    if let Some(ref chunks) = summary_chunks
+                        && let Some(first) = chunks.first()
+                    {
+                        outbox.enqueue(OutboxOp::Edit {
+                            chat_id: dest.chat_id,
+                            message_id: tg_msg_id,
+                            text: first.clone(),
                             parse_mode: Some("HTML".to_owned()),
-                            reply_markup: None,
-                            message_thread_id: state.thread_id,
-                            result_tx: None,
+                            reply_markup: Some(empty_keyboard()),
+                        });
+                    }
+
+                    // Send final assistant text as a separate message.
+                    if let Some(ref chunks) = text_chunks {
+                        for chunk in chunks {
+                            outbox.enqueue(OutboxOp::Send {
+                                chat_id: dest.chat_id,
+                                text: chunk.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: dest.thread_id,
+                                result_tx: None,
+                            });
+                        }
+                    }
+                } else if has_text {
+                    // Non-verbose or no tool/thinking content: the existing
+                    // message already has the text — just remove the keyboard.
+                    if let Some(ref chunks) = rendered_chunks {
+                        if let Some(first) = chunks.first() {
+                            outbox.enqueue(OutboxOp::Edit {
+                                chat_id: dest.chat_id,
+                                message_id: tg_msg_id,
+                                text: first.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: Some(empty_keyboard()),
+                            });
+                        }
+                        for chunk in chunks.iter().skip(1) {
+                            outbox.enqueue(OutboxOp::Send {
+                                chat_id: dest.chat_id,
+                                text: chunk.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: dest.thread_id,
+                                result_tx: None,
+                            });
+                        }
+                    }
+                } else {
+                    // No text at all (tools-only turn) — just remove the keyboard.
+                    if let Some(ref chunks) = no_text_chunks
+                        && let Some(first) = chunks.first()
+                    {
+                        outbox.enqueue(OutboxOp::Edit {
+                            chat_id: dest.chat_id,
+                            message_id: tg_msg_id,
+                            text: first.clone(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: Some(empty_keyboard()),
                         });
                     }
                 }
             } else if has_text {
-                // Non-verbose or no tool/thinking content: the existing
-                // message already has the text — just remove the keyboard.
-                let rendered = state.render();
-                let chunks = split_message(&rendered, MAX_BODY_CHARS);
-                if let Some(first) = chunks.first() {
-                    outbox.enqueue(OutboxOp::Edit {
-                        chat_id: state.chat_id,
-                        message_id: tg_msg_id,
-                        text: first.clone(),
-                        parse_mode: Some("HTML".to_owned()),
-                        reply_markup: Some(empty_keyboard()),
-                    });
-                }
-                for chunk in chunks.iter().skip(1) {
+                // No Telegram message was ever created (e.g. no deltas arrived,
+                // or the send is still in flight). Send the final content as a
+                // new message.
+                let chunks = text_chunks.as_deref().unwrap_or(&[]);
+                for chunk in chunks {
                     outbox.enqueue(OutboxOp::Send {
-                        chat_id: state.chat_id,
+                        chat_id: dest.chat_id,
                         text: chunk.clone(),
                         parse_mode: Some("HTML".to_owned()),
                         reply_markup: None,
-                        message_thread_id: state.thread_id,
+                        message_thread_id: dest.thread_id,
                         result_tx: None,
                     });
                 }
-            } else {
-                // No text at all (tools-only turn) — just remove the keyboard.
-                let rendered = state.render_parts(false);
-                let chunks = split_message(&rendered, MAX_BODY_CHARS);
-                if let Some(first) = chunks.first() {
-                    outbox.enqueue(OutboxOp::Edit {
-                        chat_id: state.chat_id,
-                        message_id: tg_msg_id,
-                        text: first.clone(),
-                        parse_mode: Some("HTML".to_owned()),
-                        reply_markup: Some(empty_keyboard()),
-                    });
-                }
-            }
-        } else if has_text {
-            // No Telegram message was ever created (e.g. no deltas arrived,
-            // or the send is still in flight). Send the final content as a
-            // new message.
-            let text_html = to_telegram_html(&state.streaming_text);
-            let chunks = split_message(&text_html, MAX_BODY_CHARS);
-            for chunk in &chunks {
-                outbox.enqueue(OutboxOp::Send {
-                    chat_id: state.chat_id,
-                    text: chunk.clone(),
-                    parse_mode: Some("HTML".to_owned()),
-                    reply_markup: None,
-                    message_thread_id: state.thread_id,
-                    result_tx: None,
-                });
             }
         }
     }
@@ -892,36 +1032,63 @@ mod tests {
         assert_eq!(ToolOutputLines::default(), ToolOutputLines::First(10));
     }
 
+    // ── Helper to build a TurnState for rendering tests ─────────
+
+    #[allow(clippy::too_many_arguments)]
+    fn make_render_state(
+        verbose: bool,
+        tools: Vec<TrackedTool>,
+        streaming_text: &str,
+        thinking: bool,
+        thinking_text: &str,
+        tool_call_limit: ToolCallLimit,
+        tool_output_lines: ToolOutputLines,
+        streaming_complete: bool,
+    ) -> TurnState {
+        TurnState {
+            session_id: "s1".to_owned(),
+            destinations: vec![Destination {
+                chat_id: 1,
+                thread_id: None,
+                telegram_message_id: None,
+                send_pending: false,
+                send_rx: None,
+                typing_stop: None,
+            }],
+            streaming_text: streaming_text.to_owned(),
+            thinking,
+            thinking_text: thinking_text.to_owned(),
+            last_edit: Instant::now(),
+            dirty: false,
+            verbose,
+            tool_call_limit,
+            tool_output_lines,
+            tools,
+            last_display_len: 0,
+            streaming_complete,
+        }
+    }
+
     // ── TurnTracker tool output rendering ──────────────────────
 
     #[test]
     fn render_tool_with_output() {
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(3),
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            true,
+            vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls -la"}),
                 content: "file1.txt\nfile2.txt\nfile3.txt\nfile4.txt\nfile5.txt".to_owned(),
                 is_error: false,
                 done: true,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::First(3),
+            false,
+        );
 
         let rendered = state.render_parts(true);
         assert!(rendered.contains("<b>Bash</b>"));
@@ -934,32 +1101,22 @@ mod tests {
 
     #[test]
     fn render_tool_with_output_all_lines() {
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::All,
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            true,
+            vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls"}),
                 content: "a\nb\nc\nd\ne".to_owned(),
                 is_error: false,
                 done: true,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::All,
+            false,
+        );
 
         let rendered = state.render_parts(true);
         assert!(rendered.contains("a\nb\nc\nd\ne"));
@@ -968,32 +1125,22 @@ mod tests {
 
     #[test]
     fn render_tool_no_output() {
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(10),
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            true,
+            vec![TrackedTool {
                 tool_name: "Read".to_owned(),
                 args: serde_json::json!({"path": "/tmp/foo.txt"}),
                 content: String::new(),
                 is_error: false,
                 done: false,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
 
         let rendered = state.render_parts(true);
         assert!(rendered.contains("<b>Read</b>"));
@@ -1004,32 +1151,22 @@ mod tests {
 
     #[test]
     fn render_nonverbose_hides_tool_output() {
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: "hello".to_owned(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: false,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(10),
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            false,
+            vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "echo hi"}),
                 content: "hi".to_owned(),
                 is_error: false,
                 done: true,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "hello",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
 
         let rendered = state.render_parts(true);
         // Non-verbose: no tool header or output, just the streaming text.
@@ -1039,32 +1176,22 @@ mod tests {
 
     #[test]
     fn render_tool_output_html_escaped() {
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::All,
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            true,
+            vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "echo '<html>'"}),
                 content: "<html>&amp;".to_owned(),
                 is_error: false,
                 done: true,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::All,
+            false,
+        );
 
         let rendered = state.render_parts(true);
         assert!(rendered.contains("&lt;html&gt;&amp;amp;"));
@@ -1083,26 +1210,16 @@ mod tests {
             thinking.push_str(line);
         }
 
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: true,
-            thinking_text: thinking,
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(10),
-            tools: Vec::new(),
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+        let state = make_render_state(
+            true,
+            Vec::new(),
+            "",
+            true,
+            &thinking,
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
 
         // Must not panic.
         let rendered = state.render_parts(true);
@@ -1116,32 +1233,22 @@ mod tests {
         let cmd: String = "日本語テスト".repeat(50); // 6 chars × 3 bytes × 50 = 900 bytes
         assert!(cmd.len() > 200);
 
-        let state = TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: String::new(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(10),
-            tools: vec![TrackedTool {
+        let state = make_render_state(
+            true,
+            vec![TrackedTool {
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": cmd}),
                 content: String::new(),
                 is_error: false,
                 done: false,
             }],
-            last_display_len: 0,
-            streaming_complete: false,
-        };
+            "",
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
 
         // Must not panic.
         let rendered = state.render_parts(true);
@@ -1151,26 +1258,16 @@ mod tests {
     // ── display_text paragraph buffering ────────────────────────
 
     fn make_text_state(text: &str, complete: bool) -> TurnState {
-        TurnState {
-            chat_id: 1,
-            thread_id: None,
-            session_id: "s1".to_owned(),
-            telegram_message_id: None,
-            send_pending: false,
-            send_rx: None,
-            streaming_text: text.to_owned(),
-            thinking: false,
-            thinking_text: String::new(),
-            last_edit: Instant::now(),
-            dirty: false,
-            typing_stop: None,
-            verbose: true,
-            tool_call_limit: ToolCallLimit::All,
-            tool_output_lines: ToolOutputLines::First(10),
-            tools: Vec::new(),
-            last_display_len: 0,
-            streaming_complete: complete,
-        }
+        make_render_state(
+            true,
+            Vec::new(),
+            text,
+            false,
+            "",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            complete,
+        )
     }
 
     #[test]
