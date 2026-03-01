@@ -16,7 +16,6 @@ clap = { workspace = true }
 dirs = { workspace = true }
 pup-claude = { path = "../pup-claude" }
 pup-core = { path = "../pup-core" }
-pup-ipc = { path = "../pup-ipc" }
 pup-telegram = { path = "../pup-telegram" }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -18,7 +18,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use tracing::debug;
 
-use crate::session::SessionEvent;
+use pup_core::types::{MessageSource, SessionEvent};
 
 // ── Transcript entry types ──────────────────────────────────────────────────
 
@@ -373,6 +373,8 @@ impl TranscriptWatcher {
                 events.push(SessionEvent::UserMessage {
                     session_id: self.session_id.clone(),
                     content,
+                    echo: false,
+                    source: MessageSource::Interactive,
                 });
                 events
             }
@@ -387,7 +389,8 @@ impl TranscriptWatcher {
                 events.extend(self.flush_pending());
                 events.push(SessionEvent::ToolEnd {
                     session_id: self.session_id.clone(),
-                    tool_use_id,
+                    tool_call_id: tool_use_id,
+                    tool_name: String::new(),
                     content,
                     is_error,
                 });
@@ -449,9 +452,9 @@ impl TranscriptWatcher {
             if self.seen_tool_starts.insert(tool.id.clone()) {
                 events.push(SessionEvent::ToolStart {
                     session_id: self.session_id.clone(),
-                    tool_use_id: tool.id.clone(),
+                    tool_call_id: tool.id.clone(),
                     tool_name: tool.name.clone(),
-                    input: tool.input.clone(),
+                    args: tool.input.clone(),
                 });
             }
         }
@@ -493,12 +496,7 @@ impl TranscriptWatcher {
             events.push(SessionEvent::MessageEnd {
                 session_id: self.session_id.clone(),
                 message_id: msg_id,
-                text: state.text.clone(),
-                thinking: if state.thinking.is_empty() {
-                    None
-                } else {
-                    Some(state.thinking.clone())
-                },
+                content: state.text.clone(),
             });
         }
 

@@ -1,4 +1,4 @@
-//! Claude Code session state machine and event types.
+//! Claude Code session state machine.
 //!
 //! Each Claude Code session has:
 //! - A transcript watcher (read path — always available)
@@ -11,51 +11,11 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use serde_json::Value;
+use pup_core::types::SessionEvent;
 use tracing::{info, warn};
 
 use crate::inspector::InspectorClient;
 use crate::transcript::TranscriptWatcher;
-
-// ── Session events (internal to pup-claude) ─────────────────────────────────
-
-/// Events emitted by the transcript watcher, mapped to `pup_core::SessionEvent`
-/// at the integration boundary.
-#[derive(Debug, Clone)]
-pub enum SessionEvent {
-    /// User sent a message (from TUI or injected).
-    UserMessage { session_id: String, content: String },
-    /// Agent started processing.
-    AgentStart { session_id: String },
-    /// Agent finished processing.
-    AgentEnd { session_id: String },
-    /// New assistant message started.
-    MessageStart {
-        session_id: String,
-        message_id: String,
-    },
-    /// Assistant message completed (full text, no streaming deltas).
-    MessageEnd {
-        session_id: String,
-        message_id: String,
-        text: String,
-        thinking: Option<String>,
-    },
-    /// Tool execution started.
-    ToolStart {
-        session_id: String,
-        tool_use_id: String,
-        tool_name: String,
-        input: Value,
-    },
-    /// Tool execution completed.
-    ToolEnd {
-        session_id: String,
-        tool_use_id: String,
-        content: String,
-        is_error: bool,
-    },
-}
 
 // ── Session state ───────────────────────────────────────────────────────────
 
@@ -199,6 +159,10 @@ impl ClaudeSession {
     }
 
     /// Poll the transcript watcher for new events.
+    ///
+    /// Returns core `SessionEvent`s directly. `UserMessage` events have
+    /// `echo: false` — the caller should check for injected-message echoes
+    /// and patch them before forwarding.
     pub fn poll_transcript(&mut self) -> Result<Vec<SessionEvent>> {
         self.watcher.poll()
     }

@@ -1,95 +1,79 @@
 //! High-level service that manages all Claude Code sessions and bridges them
 //! to `pup_core::SessionEvent`s.
 //!
-//! This is the main entry point for the pup daemon. It:
+//! This is the Claude Code agent backend. It:
 //! - Runs discovery to find Claude Code sessions
 //! - Manages inspector connections for message injection
 //! - Polls transcript watchers for conversation events
-//! - Converts internal events to `pup_core` types for backend fan-out
+//! - Publishes core `SessionEvent`s to the event bus
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::Result;
+use pup_core::router::SessionRegistry;
+use pup_core::types::{IncomingMessage, MessageSource, SessionEvent};
 use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::discovery::{ClaudeDiscovery, DiscoveredSession, DiscoveryEvent};
 use crate::session::{ClaudeSession, InspectorState};
 
-/// Messages from pup-daemon to the Claude service.
-#[derive(Debug)]
-pub enum ClaudeCommand {
-    /// Inject a user message into a Claude Code session.
-    InjectMessage {
-        session_id: String,
-        text: String,
-        /// Reply channel for success/error.
-        reply: mpsc::Sender<Result<(), String>>,
-    },
-    /// Cancel/abort the current turn (sends Escape to the TUI).
-    Cancel { session_id: String },
-}
-
-/// Shared registry of Claude Code session IDs, used by the message router
-/// to determine whether an incoming message should go to the Claude service
-/// or the pi session manager.
-pub type SessionRegistry = Arc<RwLock<HashSet<String>>>;
-
 /// The Claude Code integration service.
 ///
-/// Runs as a tokio task alongside the main session manager.
+/// Runs as a tokio task alongside the pi session manager. Implements the
+/// agent backend pattern: it publishes `SessionEvent`s to the event bus
+/// and consumes `IncomingMessage`s from the message router.
 #[derive(Debug)]
 pub struct ClaudeService {
     /// Path to `~/.claude/projects/`.
     projects_dir: PathBuf,
     /// Active sessions.
     sessions: HashMap<String, ClaudeSession>,
-    /// Shared registry of active CC session IDs.
+    /// Shared registry of active CC session IDs (for the message router).
     registry: SessionRegistry,
-    /// Channel to push `pup_core::SessionEvent`s to backends.
-    event_tx: mpsc::Sender<pup_core::types::SessionEvent>,
-    /// Channel to receive commands from the daemon.
-    command_rx: mpsc::Receiver<ClaudeCommand>,
+    /// Channel to push `SessionEvent`s to the event bus.
+    event_tx: mpsc::Sender<SessionEvent>,
+    /// Channel to receive messages from the message router.
+    message_rx: mpsc::Receiver<IncomingMessage>,
     /// Discovery event receiver.
     discovery_rx: mpsc::Receiver<DiscoveryEvent>,
     /// Discovery event sender (passed to the discovery task).
     discovery_tx: mpsc::Sender<DiscoveryEvent>,
     /// Recently injected messages per session, used to detect echoes.
-    /// When a message is injected via `InjectMessage`, its text is pushed
-    /// here. When the transcript watcher reports a matching `UserMessage`,
-    /// it is marked as an echo so backends don't redisplay it.
+    /// When a message is injected, its text is pushed here. When the
+    /// transcript watcher reports a matching `UserMessage`, it is marked
+    /// as an echo so chat channels don't redisplay it.
     injected_messages: HashMap<String, VecDeque<String>>,
 }
 
 impl ClaudeService {
     /// Create a new Claude Code service.
     ///
-    /// Returns `(service, command_sender, session_registry)`.
-    /// - `command_sender`: used by the daemon to send injection/cancel commands
-    /// - `session_registry`: shared set of CC session IDs for message routing
+    /// Returns `(service, message_sender, session_registry)`.
+    /// - `message_sender`: used by the message router to send messages to CC sessions
+    /// - `session_registry`: shared set of CC session IDs for routing
     pub fn new(
         projects_dir: PathBuf,
-        event_tx: mpsc::Sender<pup_core::types::SessionEvent>,
-    ) -> (Self, mpsc::Sender<ClaudeCommand>, SessionRegistry) {
-        let (command_tx, command_rx) = mpsc::channel(64);
+        event_tx: mpsc::Sender<SessionEvent>,
+    ) -> (Self, mpsc::Sender<IncomingMessage>, SessionRegistry) {
+        let (message_tx, message_rx) = mpsc::channel(64);
         let (discovery_tx, discovery_rx) = mpsc::channel(64);
-        let registry = Arc::new(RwLock::new(HashSet::new()));
+        let registry = pup_core::new_registry();
 
         let service = Self {
             projects_dir,
             sessions: HashMap::new(),
-            registry: Arc::clone(&registry),
+            registry: SessionRegistry::clone(&registry),
             event_tx,
-            command_rx,
+            message_rx,
             discovery_rx,
             discovery_tx,
             injected_messages: HashMap::new(),
         };
 
-        (service, command_tx, registry)
+        (service, message_tx, registry)
     }
 
     /// Run the service. This is the main loop.
@@ -130,9 +114,9 @@ impl ClaudeService {
                         self.handle_discovery(event).await;
                     }
 
-                    // Commands from session manager.
-                    Some(cmd) = self.command_rx.recv() => {
-                        self.handle_command(cmd).await;
+                    // Messages from chat channels (via the message router).
+                    Some(msg) = self.message_rx.recv() => {
+                        self.handle_message(msg).await;
                     }
 
                     // Poll transcripts.
@@ -151,7 +135,7 @@ impl ClaudeService {
             for session_id in self.sessions.keys() {
                 let _ = self
                     .event_tx
-                    .send(pup_core::types::SessionEvent::Disconnected {
+                    .send(SessionEvent::Disconnected {
                         session_id: session_id.clone(),
                     })
                     .await;
@@ -190,7 +174,7 @@ impl ClaudeService {
                     if session.connect_inspector().await {
                         let _ = self
                             .event_tx
-                            .send(pup_core::types::SessionEvent::Notification {
+                            .send(SessionEvent::Notification {
                                 session_id: session_id.clone(),
                                 text: "🔗 Inspector connected — bidirectional mode enabled".into(),
                             })
@@ -263,7 +247,7 @@ impl ClaudeService {
 
         if self
             .event_tx
-            .send(pup_core::types::SessionEvent::Connected { info })
+            .send(SessionEvent::Connected { info })
             .await
             .is_err()
         {
@@ -271,9 +255,7 @@ impl ClaudeService {
             return;
         }
 
-        // Check for --dangerously-skip-permissions. Without it, Claude Code
-        // will prompt for tool-use confirmations in the TUI which pup cannot
-        // answer, so we warn the user.
+        // Check for --dangerously-skip-permissions.
         if discovered.pid.is_some() && !discovered.dangerously_skip_permissions {
             warn!(
                 session_id,
@@ -281,7 +263,7 @@ impl ClaudeService {
             );
             let _ = self
                 .event_tx
-                .send(pup_core::types::SessionEvent::Notification {
+                .send(SessionEvent::Notification {
                     session_id: session_id.clone(),
                     text: "⚠️ Claude Code was not started with --dangerously-skip-permissions. \
                        Permission prompts cannot be handled remotely — messages sent from \
@@ -296,13 +278,13 @@ impl ClaudeService {
         if can_inject {
             let _ = self
                 .event_tx
-                .send(pup_core::types::SessionEvent::Notification {
+                .send(SessionEvent::Notification {
                     session_id: session_id.clone(),
                     text: "🔗 Connected to Claude Code session (bidirectional)".into(),
                 })
                 .await;
         } else {
-            let _ = self.event_tx.send(pup_core::types::SessionEvent::Notification {
+            let _ = self.event_tx.send(SessionEvent::Notification {
                 session_id: session_id.clone(),
                 text: "👁 Connected to Claude Code session (read-only — launch with BUN_INSPECT for bidirectional)".into(),
             }).await;
@@ -324,49 +306,72 @@ impl ClaudeService {
             info!(session_id, "Claude Code session disconnected");
             let _ = self
                 .event_tx
-                .send(pup_core::types::SessionEvent::Disconnected {
+                .send(SessionEvent::Disconnected {
                     session_id: session_id.to_owned(),
                 })
                 .await;
         }
     }
 
-    /// Handle a command from the daemon.
-    async fn handle_command(&mut self, cmd: ClaudeCommand) {
-        match cmd {
-            ClaudeCommand::InjectMessage {
-                session_id,
-                text,
-                reply,
+    /// Handle an incoming message from a chat channel.
+    async fn handle_message(&mut self, msg: IncomingMessage) {
+        match msg {
+            IncomingMessage::Cancel { ref session_id } => {
+                if let Some(session) = self.sessions.get_mut(session_id)
+                    && let Err(e) = session.inject_escape().await
+                {
+                    warn!(session_id, error = %e, "failed to inject Escape for cancel");
+                }
+            }
+            IncomingMessage::Send {
+                ref session_id,
+                ref text,
+                ..
             } => {
-                let result = match self.sessions.get_mut(&session_id) {
-                    Some(session) => match session.inject_message(&text).await {
+                // Skip pi-specific slash commands that don't apply to Claude Code.
+                let trimmed = text.trim();
+                if trimmed.starts_with("/name")
+                    || trimmed.starts_with("/compact")
+                    || trimmed.starts_with("/new")
+                    || trimmed.starts_with("/exit")
+                    || trimmed.starts_with("/quit")
+                {
+                    info!(
+                        session_id,
+                        text = trimmed,
+                        "skipping pi slash command for Claude Code session"
+                    );
+                    return;
+                }
+
+                match self.sessions.get_mut(session_id) {
+                    Some(session) => match session.inject_message(text).await {
                         Ok(()) => {
-                            // Remember the injected text so we can mark the
-                            // corresponding transcript entry as an echo.
+                            // Remember the injected text for echo detection.
                             let queue = self
                                 .injected_messages
                                 .entry(session_id.clone())
                                 .or_default();
-                            queue.push_back(text);
-                            // Cap the queue to avoid unbounded growth if the
-                            // transcript watcher falls behind.
+                            queue.push_back(text.clone());
+                            // Cap the queue to avoid unbounded growth.
                             while queue.len() > 32 {
                                 queue.pop_front();
                             }
-                            Ok(())
                         }
-                        Err(e) => Err(e.to_string()),
+                        Err(e) => {
+                            warn!(session_id, error = %e, "Claude Code injection failed");
+                            let _ = self
+                                .event_tx
+                                .send(SessionEvent::Notification {
+                                    session_id: session_id.clone(),
+                                    text: format!("⚠️ Failed to send message: {e}"),
+                                })
+                                .await;
+                        }
                     },
-                    None => Err(format!("no Claude Code session with id {session_id}")),
-                };
-                let _ = reply.send(result).await;
-            }
-            ClaudeCommand::Cancel { session_id } => {
-                if let Some(session) = self.sessions.get_mut(&session_id)
-                    && let Err(e) = session.inject_escape().await
-                {
-                    warn!(session_id, error = %e, "failed to inject Escape for cancel");
+                    None => {
+                        warn!(session_id, "no Claude Code session found");
+                    }
                 }
             }
         }
@@ -391,8 +396,8 @@ impl ClaudeService {
             };
 
             for event in events {
-                let core_event = self.convert_event(event);
-                if self.event_tx.send(core_event).await.is_err() {
+                let event = self.patch_echo(event);
+                if self.event_tx.send(event).await.is_err() {
                     warn!("event channel closed");
                     return;
                 }
@@ -410,7 +415,7 @@ impl ClaudeService {
             {
                 let _ = self
                     .event_tx
-                    .send(pup_core::types::SessionEvent::Notification {
+                    .send(SessionEvent::Notification {
                         session_id: session.session_id.clone(),
                         text: "🔗 Inspector connected — bidirectional mode enabled".into(),
                     })
@@ -419,19 +424,15 @@ impl ClaudeService {
         }
     }
 
-    /// Convert a `pup_claude::SessionEvent` to a `pup_core::SessionEvent`,
-    /// detecting echoed messages that were injected from a backend.
-    fn convert_event(
-        &mut self,
-        event: crate::session::SessionEvent,
-    ) -> pup_core::types::SessionEvent {
+    /// Check if a `UserMessage` event was caused by our injection and patch
+    /// the `echo` / `source` fields accordingly.
+    fn patch_echo(&mut self, event: SessionEvent) -> SessionEvent {
         match event {
-            crate::session::SessionEvent::UserMessage {
+            SessionEvent::UserMessage {
                 session_id,
                 content,
+                ..
             } => {
-                // Check if this message was injected by us (from a backend).
-                // If so, mark it as an echo so the backend doesn't redisplay it.
                 let echo = self
                     .injected_messages
                     .get_mut(&session_id)
@@ -443,63 +444,18 @@ impl ClaudeService {
                     })
                     .is_some();
 
-                pup_core::types::SessionEvent::UserMessage {
+                SessionEvent::UserMessage {
                     session_id,
                     content,
                     echo,
                     source: if echo {
-                        pup_core::types::MessageSource::Extension
+                        MessageSource::Extension
                     } else {
-                        pup_core::types::MessageSource::Interactive
+                        MessageSource::Interactive
                     },
                 }
             }
-            crate::session::SessionEvent::AgentStart { session_id } => {
-                pup_core::types::SessionEvent::AgentStart { session_id }
-            }
-            crate::session::SessionEvent::AgentEnd { session_id } => {
-                pup_core::types::SessionEvent::AgentEnd { session_id }
-            }
-            crate::session::SessionEvent::MessageStart {
-                session_id,
-                message_id,
-            } => pup_core::types::SessionEvent::MessageStart {
-                session_id,
-                message_id,
-            },
-            crate::session::SessionEvent::MessageEnd {
-                session_id,
-                message_id,
-                text,
-                ..
-            } => pup_core::types::SessionEvent::MessageEnd {
-                session_id,
-                message_id,
-                content: text,
-            },
-            crate::session::SessionEvent::ToolStart {
-                session_id,
-                tool_use_id,
-                tool_name,
-                input,
-            } => pup_core::types::SessionEvent::ToolStart {
-                session_id,
-                tool_call_id: tool_use_id,
-                tool_name,
-                args: input,
-            },
-            crate::session::SessionEvent::ToolEnd {
-                session_id,
-                tool_use_id,
-                content,
-                is_error,
-            } => pup_core::types::SessionEvent::ToolEnd {
-                session_id,
-                tool_call_id: tool_use_id,
-                tool_name: String::new(), // Not available from transcript tool_result entries.
-                content,
-                is_error,
-            },
+            other => other,
         }
     }
 }

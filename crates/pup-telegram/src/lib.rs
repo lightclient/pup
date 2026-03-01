@@ -11,8 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use pup_core::ChatBackend;
+use pup_core::ChatChannel;
 use pup_core::types::{IncomingMessage, MessageSource, SessionEvent, SessionInfo};
 use pup_ipc::SendMode;
 use tokio::sync::mpsc;
@@ -305,11 +304,8 @@ impl TelegramBackend {
                 // before the abort arrives if we wait.
                 let _ = self
                     .incoming_tx
-                    .send(IncomingMessage {
+                    .send(IncomingMessage::Cancel {
                         session_id: session_id.to_owned(),
-                        text: String::new(),
-                        mode: SendMode::Steer,
-                        is_cancel: true,
                     })
                     .await;
                 // Answer the callback query in the background so we don't
@@ -376,12 +372,7 @@ impl TelegramBackend {
                 self.pending_prompts.remove(&session_id);
                 let _ = self
                     .incoming_tx
-                    .send(IncomingMessage {
-                        session_id,
-                        text: String::new(),
-                        mode: SendMode::Steer,
-                        is_cancel: true,
-                    })
+                    .send(IncomingMessage::Cancel { session_id })
                     .await;
                 return;
             }
@@ -514,11 +505,10 @@ impl TelegramBackend {
                     let full_cmd = format!("/{} {}", prompt.command, trimmed);
                     let _ = self
                         .incoming_tx
-                        .send(IncomingMessage {
+                        .send(IncomingMessage::Send {
                             session_id,
                             text: full_cmd,
                             mode: SendMode::Steer,
-                            is_cancel: false,
                         })
                         .await;
                 }
@@ -572,11 +562,10 @@ impl TelegramBackend {
 
             let _ = self
                 .incoming_tx
-                .send(IncomingMessage {
+                .send(IncomingMessage::Send {
                     session_id,
                     text: msg_text,
                     mode,
-                    is_cancel: false,
                 })
                 .await;
             return;
@@ -689,11 +678,8 @@ impl TelegramBackend {
                 if let Some(ref sid) = self.dm.attached {
                     let _ = self
                         .incoming_tx
-                        .send(IncomingMessage {
+                        .send(IncomingMessage::Cancel {
                             session_id: sid.clone(),
-                            text: String::new(),
-                            mode: SendMode::Steer,
-                            is_cancel: true,
                         })
                         .await;
                     self.send_dm(chat_id, "Cancelling…");
@@ -802,11 +788,10 @@ impl TelegramBackend {
                             let full_cmd = format!("/{} {}", prompt.command, text);
                             let _ = self
                                 .incoming_tx
-                                .send(IncomingMessage {
+                                .send(IncomingMessage::Send {
                                     session_id: sid,
                                     text: full_cmd,
                                     mode: SendMode::Steer,
-                                    is_cancel: false,
                                 })
                                 .await;
                         }
@@ -842,11 +827,10 @@ impl TelegramBackend {
 
                     let _ = self
                         .incoming_tx
-                        .send(IncomingMessage {
+                        .send(IncomingMessage::Send {
                             session_id: sid,
                             text,
                             mode,
-                            is_cancel: false,
                         })
                         .await;
                 } else {
@@ -1039,11 +1023,10 @@ impl TelegramBackend {
         // Forward the transcribed text to the session.
         let _ = self
             .incoming_tx
-            .send(IncomingMessage {
+            .send(IncomingMessage::Send {
                 session_id,
                 text,
                 mode: SendMode::Steer,
-                is_cancel: false,
             })
             .await;
     }
@@ -1156,13 +1139,23 @@ async fn scan_live_sessions(socket_dir: &Path) -> HashSet<String> {
     live
 }
 
-#[allow(clippy::too_many_lines)]
-#[async_trait]
-impl ChatBackend for TelegramBackend {
+impl ChatChannel for TelegramBackend {
     fn name(&self) -> &'static str {
         "telegram"
     }
 
+    async fn run(
+        self,
+        event_rx: mpsc::Receiver<SessionEvent>,
+        message_tx: mpsc::Sender<IncomingMessage>,
+        shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        self.run_inner(event_rx, message_tx, shutdown_rx).await;
+    }
+}
+
+impl TelegramBackend {
+    #[allow(clippy::too_many_lines)]
     async fn init(&mut self) -> Result<()> {
         let span = info_span!("telegram_init");
         async {
@@ -1285,16 +1278,9 @@ impl ChatBackend for TelegramBackend {
         .await
     }
 
-    async fn handle_event(&mut self, event: SessionEvent) -> Result<()> {
-        self.check_pending_deletions().await;
-        self.process_event(event).await?;
-        while self.outbox.flush_one().await {}
-        Ok(())
-    }
-
+    /// Legacy polling path — kept for tests only.
+    #[cfg(test)]
     async fn recv_incoming(&mut self) -> Result<Option<IncomingMessage>> {
-        // Legacy polling path — kept for the trait but unused when
-        // `run()` is used.  See `run()` for the concurrent version.
         loop {
             self.check_pending_deletions().await;
 
@@ -1323,10 +1309,6 @@ impl ChatBackend for TelegramBackend {
                 }
             }
         }
-    }
-
-    async fn shutdown(&mut self) -> Result<()> {
-        self.shutdown_inner().await
     }
 }
 
@@ -1363,11 +1345,10 @@ impl TelegramBackend {
                                 );
                                 let _ = self
                                     .incoming_tx
-                                    .send(IncomingMessage {
+                                    .send(IncomingMessage::Send {
                                         session_id: info.session_id.clone(),
                                         text: format!("/name {name}"),
                                         mode: SendMode::Steer,
-                                        is_cancel: false,
                                     })
                                     .await;
                             }
@@ -1391,11 +1372,10 @@ impl TelegramBackend {
                             );
                             let _ = self
                                 .incoming_tx
-                                .send(IncomingMessage {
+                                .send(IncomingMessage::Send {
                                     session_id: info.session_id.clone(),
                                     text: format!("/name {name}"),
                                     mode: SendMode::Steer,
-                                    is_cancel: false,
                                 })
                                 .await;
                         }
@@ -1573,27 +1553,32 @@ impl TelegramBackend {
             }
             SessionEvent::ToolStart {
                 ref session_id,
+                ref tool_call_id,
                 ref tool_name,
                 ref args,
-                ..
             } => {
                 self.ensure_turn(session_id);
-                self.turn_tracker
-                    .tool_start(session_id, tool_name, args, &mut self.outbox);
+                self.turn_tracker.tool_start(
+                    session_id,
+                    tool_call_id,
+                    tool_name,
+                    args,
+                    &mut self.outbox,
+                );
             }
             SessionEvent::ToolUpdate {
                 ref session_id,
-                ref tool_name,
+                ref tool_call_id,
                 ref content,
                 ..
             } => {
                 self.ensure_turn(session_id);
                 self.turn_tracker
-                    .tool_update(session_id, tool_name, content, &mut self.outbox);
+                    .tool_update(session_id, tool_call_id, content, &mut self.outbox);
             }
             SessionEvent::ToolEnd {
                 ref session_id,
-                ref tool_name,
+                ref tool_call_id,
                 ref content,
                 is_error,
                 ..
@@ -1601,7 +1586,7 @@ impl TelegramBackend {
                 self.ensure_turn(session_id);
                 self.turn_tracker.tool_end(
                     session_id,
-                    tool_name,
+                    tool_call_id,
                     content,
                     is_error,
                     &mut self.outbox,
@@ -1653,18 +1638,8 @@ impl TelegramBackend {
         Ok(())
     }
 
-    /// Run the Telegram backend with internal concurrency.
-    ///
-    /// Replaces the `ChatBackend` trait's alternating `handle_event` /
-    /// `recv_incoming` model with a single `select!` loop where:
-    ///
-    ///   - A dedicated task long-polls Telegram for updates (non-blocking)
-    ///   - Session events are processed immediately when available
-    ///   - The outbox flushes on a timer instead of blocking after events
-    ///   - Incoming user messages are forwarded continuously
-    ///
-    /// This method takes ownership; the backend runs until shutdown.
-    pub async fn run(
+    /// Internal run loop with full concurrency.
+    async fn run_inner(
         mut self,
         mut event_rx: mpsc::Receiver<SessionEvent>,
         incoming_tx: mpsc::Sender<IncomingMessage>,
@@ -2116,8 +2091,11 @@ mod tests {
             .expect("recv_incoming should not error")
             .expect("should return an IncomingMessage, not None");
 
-        assert!(msg.is_cancel, "expected is_cancel=true");
-        assert_eq!(msg.session_id, session_id);
+        assert!(
+            matches!(msg, IncomingMessage::Cancel { .. }),
+            "expected Cancel variant"
+        );
+        assert_eq!(msg.session_id(), session_id);
         assert!(
             elapsed < Duration::from_millis(500),
             "abort took {elapsed:?} — should be near-instant, not blocked by answerCallbackQuery"

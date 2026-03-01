@@ -90,6 +90,7 @@ pub fn truncate_tool_output(output: &str, limit: ToolOutputLines) -> String {
 /// A tracked tool call for verbose rendering.
 #[derive(Debug)]
 struct TrackedTool {
+    tool_call_id: String,
     tool_name: String,
     args: serde_json::Value,
     /// Accumulated tool output (from `tool_update` deltas and/or `tool_end`).
@@ -790,6 +791,7 @@ impl TurnTracker {
     pub fn tool_start(
         &mut self,
         session_id: &str,
+        tool_call_id: &str,
         tool_name: &str,
         args: &serde_json::Value,
         outbox: &mut Outbox,
@@ -800,6 +802,7 @@ impl TurnTracker {
         }
         if let Some(state) = self.turns.get_mut(session_id) {
             state.tools.push(TrackedTool {
+                tool_call_id: tool_call_id.to_owned(),
                 tool_name: tool_name.to_owned(),
                 args: args.clone(),
                 content: String::new(),
@@ -818,7 +821,7 @@ impl TurnTracker {
     pub fn tool_update(
         &mut self,
         session_id: &str,
-        tool_name: &str,
+        tool_call_id: &str,
         content: &str,
         outbox: &mut Outbox,
     ) {
@@ -826,7 +829,7 @@ impl TurnTracker {
             && state.show_tools
         {
             for tool in state.tools.iter_mut().rev() {
-                if tool.tool_name == tool_name && !tool.done {
+                if tool.tool_call_id == tool_call_id && !tool.done {
                     tool.content.push_str(content);
                     break;
                 }
@@ -840,7 +843,7 @@ impl TurnTracker {
     pub fn tool_end(
         &mut self,
         session_id: &str,
-        tool_name: &str,
+        tool_call_id: &str,
         content: &str,
         is_error: bool,
         outbox: &mut Outbox,
@@ -849,7 +852,7 @@ impl TurnTracker {
             && state.show_tools
         {
             for tool in state.tools.iter_mut().rev() {
-                if tool.tool_name == tool_name && !tool.done {
+                if tool.tool_call_id == tool_call_id && !tool.done {
                     tool.done = true;
                     tool.is_error = is_error;
                     if tool.content.is_empty() && !content.is_empty() {
@@ -1267,6 +1270,7 @@ mod tests {
             false,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls -la"}),
                 content: "file1.txt\nfile2.txt\nfile3.txt\nfile4.txt\nfile5.txt".to_owned(),
@@ -1296,6 +1300,7 @@ mod tests {
             false,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls"}),
                 content: "a\nb\nc\nd\ne".to_owned(),
@@ -1321,6 +1326,7 @@ mod tests {
             false,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Read".to_owned(),
                 args: serde_json::json!({"path": "/tmp/foo.txt"}),
                 content: String::new(),
@@ -1347,6 +1353,7 @@ mod tests {
             false,
             false,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "echo hi"}),
                 content: "hi".to_owned(),
@@ -1372,6 +1379,7 @@ mod tests {
             false,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "echo '<html>'"}),
                 content: "<html>&amp;".to_owned(),
@@ -1426,6 +1434,7 @@ mod tests {
             false,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": cmd}),
                 content: String::new(),
@@ -1581,6 +1590,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Bash".to_owned(),
                     args: serde_json::json!({"command": "ls"}),
                     content: String::new(),
@@ -1588,6 +1598,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Bash".to_owned(),
                     args: serde_json::json!({"command": "false"}),
                     content: String::new(),
@@ -1595,6 +1606,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Read".to_owned(),
                     args: serde_json::json!({"path": "/tmp/f"}),
                     content: String::new(),
@@ -1627,6 +1639,7 @@ mod tests {
             true,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls"}),
                 content: String::new(),
@@ -1657,6 +1670,7 @@ mod tests {
             true,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls"}),
                 content: String::new(),
@@ -1686,6 +1700,7 @@ mod tests {
             true,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "Bash".to_owned(),
                 args: serde_json::json!({"command": "ls"}),
                 content: "files".to_owned(),
@@ -1714,6 +1729,7 @@ mod tests {
             true,
             true,
             vec![TrackedTool {
+                tool_call_id: String::new(),
                 tool_name: "A".to_owned(),
                 args: serde_json::json!({}),
                 content: String::new(),
@@ -1742,6 +1758,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "A".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1749,6 +1766,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "B".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1781,6 +1799,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Bash".to_owned(),
                     args: serde_json::json!({"command": "ls"}),
                     content: "old".to_owned(),
@@ -1788,6 +1807,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Read".to_owned(),
                     args: serde_json::json!({"path": "/new"}),
                     content: String::new(),
@@ -1819,6 +1839,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "A".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1826,6 +1847,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "B".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1833,6 +1855,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "C".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1858,6 +1881,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "A".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1865,6 +1889,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "B".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1872,6 +1897,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "C".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1897,6 +1923,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "A".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1904,6 +1931,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "B".to_owned(),
                     args: serde_json::json!({}),
                     content: String::new(),
@@ -1929,6 +1957,7 @@ mod tests {
             true,
             vec![
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "First".to_owned(),
                     args: serde_json::json!({"command": "a"}),
                     content: "out-a".to_owned(),
@@ -1936,6 +1965,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Second".to_owned(),
                     args: serde_json::json!({"command": "b"}),
                     content: "out-b".to_owned(),
@@ -1943,6 +1973,7 @@ mod tests {
                     done: true,
                 },
                 TrackedTool {
+                    tool_call_id: String::new(),
                     tool_name: "Third".to_owned(),
                     args: serde_json::json!({"command": "c"}),
                     content: "out-c".to_owned(),

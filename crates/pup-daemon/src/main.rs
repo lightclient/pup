@@ -4,11 +4,12 @@ mod tracing_setup;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use pup_claude::injector::{ClaudeCommand, ClaudeService, SessionRegistry};
-use pup_core::{IncomingMessage, SessionEvent, SessionManager};
+use pup_core::{
+    AgentHandle, EventBus, IncomingMessage, MessageRouter, SessionManager, new_registry,
+};
 use pup_telegram::TelegramBackend;
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 #[derive(Parser, Debug)]
 #[command(name = "pup", about = "Pickup your pi sessions on the go")]
@@ -28,7 +29,6 @@ enum Commands {
 }
 
 #[tokio::main]
-#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -63,63 +63,42 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    // Set up backend channels.
-    // Incoming messages from backends go through a router that dispatches to
-    // either the pi session manager or the Claude Code service.
-    let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingMessage>(64);
-    let mut backend_txs: Vec<mpsc::Sender<SessionEvent>> = Vec::new();
+    // ── Event bus: agent backends → chat channels ───────────────
 
-    // ── Initialize Telegram backend ─────────────────────────────
+    let mut event_bus = EventBus::new();
 
-    if let Some(tg_config) = config.telegram_config() {
-        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(256);
-        backend_txs.push(event_tx);
+    // ── Message router: chat channels → agent backends ──────────
 
-        let incoming_tx_clone = incoming_tx.clone();
-        let shutdown_rx_clone = shutdown_rx.clone();
+    let mut router = MessageRouter::new();
+    let (message_tx, message_rx) = mpsc::channel::<IncomingMessage>(64);
 
-        tokio::spawn(async move {
-            let backend = TelegramBackend::new(tg_config);
-            backend
-                .run(event_rx, incoming_tx_clone, shutdown_rx_clone)
-                .await;
-        });
-    } else {
-        info!("no telegram backend configured");
-    }
+    // ── Initialize pi session manager ───────────────────────────
 
-    // Drop the original incoming_tx so channels close when all backends exit.
-    drop(incoming_tx);
+    let pi_registry = new_registry();
+    let (pi_msg_tx, pi_msg_rx) = mpsc::channel::<IncomingMessage>(64);
+
+    router.add_agent(AgentHandle {
+        name: "pi",
+        message_tx: pi_msg_tx,
+        registry: pup_core::SessionRegistry::clone(&pi_registry),
+        is_default: true, // pi is the fallback for unknown sessions
+    });
 
     // ── Initialize Claude Code service ──────────────────────────
-
-    let mut cc_cmd_tx: Option<mpsc::Sender<ClaudeCommand>> = None;
-    let mut cc_registry: Option<SessionRegistry> = None;
 
     if config.claude_code.enabled {
         let projects_dir = config.claude_projects_dir();
         info!(projects_dir = %projects_dir.display(), "starting Claude Code service");
 
-        // Create an event channel for the CC service. A bridge task fans out
-        // CC events to all backend channels.
-        let (cc_event_tx, mut cc_event_rx) = mpsc::channel::<SessionEvent>(256);
-        let cc_backend_txs: Vec<mpsc::Sender<SessionEvent>> =
-            backend_txs.iter().map(mpsc::Sender::clone).collect();
+        let (service, cc_msg_tx, cc_registry) =
+            pup_claude::ClaudeService::new(projects_dir, event_bus.sender());
 
-        // Fan-out bridge: CC events → all backends.
-        tokio::spawn(async move {
-            while let Some(event) = cc_event_rx.recv().await {
-                for tx in &cc_backend_txs {
-                    if tx.send(event.clone()).await.is_err() {
-                        warn!("CC event fan-out: backend channel closed");
-                    }
-                }
-            }
+        router.add_agent(AgentHandle {
+            name: "claude",
+            message_tx: cc_msg_tx,
+            registry: cc_registry,
+            is_default: false,
         });
-
-        let (service, cmd_tx, registry) = ClaudeService::new(projects_dir, cc_event_tx);
-        cc_cmd_tx = Some(cmd_tx);
-        cc_registry = Some(registry);
 
         let shutdown_rx_cc = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -129,81 +108,42 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Message router ──────────────────────────────────────────
-    //
-    // Routes incoming messages from backends to either:
-    // - Claude Code service (if session_id is a CC session)
-    // - Pi session manager (otherwise)
+    // ── Initialize Telegram chat channel ────────────────────────
 
-    let (pi_incoming_tx, pi_incoming_rx) = mpsc::channel::<IncomingMessage>(64);
-
-    {
-        let cc_cmd = cc_cmd_tx.clone();
-        let cc_reg = cc_registry.clone();
+    if let Some(tg_config) = config.telegram_config() {
+        let event_rx = event_bus.subscribe();
+        let message_tx_clone = message_tx.clone();
+        let shutdown_rx_clone = shutdown_rx.clone();
 
         tokio::spawn(async move {
-            let mut incoming_rx = incoming_rx;
-            while let Some(msg) = incoming_rx.recv().await {
-                let is_cc = cc_reg
-                    .as_ref()
-                    .and_then(|r| r.read().ok())
-                    .is_some_and(|set| set.contains(&msg.session_id));
-
-                if is_cc {
-                    if let Some(cc_tx) = &cc_cmd {
-                        if msg.is_cancel {
-                            let _ = cc_tx
-                                .send(ClaudeCommand::Cancel {
-                                    session_id: msg.session_id,
-                                })
-                                .await;
-                        } else {
-                            // Skip pi-specific slash commands that shouldn't
-                            // be injected into the Claude Code TUI.
-                            let text = msg.text.trim();
-                            if text.starts_with("/name")
-                                || text.starts_with("/compact")
-                                || text.starts_with("/new")
-                                || text.starts_with("/exit")
-                            {
-                                info!(
-                                    session_id = msg.session_id,
-                                    text, "skipping pi slash command for Claude Code session"
-                                );
-                            } else {
-                                let (reply_tx, mut reply_rx) = mpsc::channel(1);
-                                let _ = cc_tx
-                                    .send(ClaudeCommand::InjectMessage {
-                                        session_id: msg.session_id.clone(),
-                                        text: msg.text,
-                                        reply: reply_tx,
-                                    })
-                                    .await;
-
-                                // Check result asynchronously.
-                                let sid = msg.session_id;
-                                tokio::spawn(async move {
-                                    if let Some(Err(e)) = reply_rx.recv().await {
-                                        warn!(
-                                            session_id = sid,
-                                            error = e,
-                                            "Claude Code injection failed"
-                                        );
-                                    }
-                                });
-                            }
-                        }
-                    }
-                } else if pi_incoming_tx.send(msg).await.is_err() {
-                    break;
-                }
-            }
+            let backend = TelegramBackend::new(tg_config);
+            pup_core::ChatChannel::run(backend, event_rx, message_tx_clone, shutdown_rx_clone)
+                .await;
         });
+    } else {
+        info!("no telegram backend configured");
     }
 
-    // ── Start session manager (pi sessions) ─────────────────────
+    // Drop the original message_tx so the router stops when all channels exit.
+    drop(message_tx);
 
-    let session_manager = SessionManager::new(socket_dir, backend_txs, pi_incoming_rx);
+    // ── Start the event bus ─────────────────────────────────────
+
+    // Drop the bus sender from main so the bus stops when all agent backends exit.
+    let bus_sender = event_bus.sender();
+    tokio::spawn(async move {
+        event_bus.run().await;
+    });
+
+    // ── Start the message router ────────────────────────────────
+
+    tokio::spawn(async move {
+        router.run(message_rx).await;
+    });
+
+    // ── Start pi session manager ────────────────────────────────
+
+    let session_manager = SessionManager::new(socket_dir, bus_sender, pi_msg_rx, pi_registry);
 
     session_manager.run(shutdown_rx).await?;
 

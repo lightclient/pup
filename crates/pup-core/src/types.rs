@@ -106,14 +106,26 @@ pub struct SessionInfo {
     pub partial_text: Option<String>,
 }
 
-/// A message from a chat backend directed at a pi session.
+/// A message from a chat channel directed at an agent backend's session.
 #[derive(Debug, Clone)]
-pub struct IncomingMessage {
-    pub session_id: String,
-    pub text: String,
-    pub mode: SendMode,
-    /// If true, this is a cancel/abort request rather than a message.
-    pub is_cancel: bool,
+pub enum IncomingMessage {
+    /// Send a text message to the session.
+    Send {
+        session_id: String,
+        text: String,
+        mode: SendMode,
+    },
+    /// Cancel/abort the current operation in the session.
+    Cancel { session_id: String },
+}
+
+impl IncomingMessage {
+    /// Get the target session ID.
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Send { session_id, .. } | Self::Cancel { session_id, .. } => session_id,
+        }
+    }
 }
 
 /// Discovery events for the session manager.

@@ -7,6 +7,7 @@ use tokio::sync::mpsc;
 use tracing::{Instrument, debug, error, info, info_span, warn};
 
 use crate::discovery::Discovery;
+use crate::router::SessionRegistry;
 use crate::types::{DiscoveryEvent, IncomingMessage, MessageSource, SessionEvent, SessionInfo};
 
 /// Internal message from per-session IPC reader tasks.
@@ -29,18 +30,20 @@ struct SessionConnection {
     cmd_tx: mpsc::Sender<ClientMessage>,
 }
 
-/// The session manager is the hub that connects IPC sessions to backends.
+/// The session manager is the hub that connects IPC sessions to chat channels.
 ///
 /// It runs the discovery loop, owns all IPC connections, reads events from each,
-/// fans them out to all registered backends, and routes incoming messages from
-/// backends to the correct IPC connection.
+/// publishes them to the [`EventBus`](crate::router::EventBus), and routes
+/// incoming messages from chat channels to the correct IPC connection.
 #[derive(Debug)]
 pub struct SessionManager {
     socket_dir: PathBuf,
     sessions: HashMap<String, SessionConnection>,
-    /// Senders to push `SessionEvent`s to each backend.
-    backend_txs: Vec<mpsc::Sender<SessionEvent>>,
-    /// Receiver for incoming messages from all backends.
+    /// Registry of connected session IDs (shared with the message router).
+    registry: SessionRegistry,
+    /// Sender to push `SessionEvent`s to the event bus.
+    event_tx: mpsc::Sender<SessionEvent>,
+    /// Receiver for incoming messages routed to this backend.
     incoming_rx: mpsc::Receiver<IncomingMessage>,
     /// Receiver for IPC reader messages.
     ipc_rx: mpsc::Receiver<IpcReaderMsg>,
@@ -54,19 +57,22 @@ impl SessionManager {
     /// Create a new session manager.
     ///
     /// - `socket_dir`: path to `~/.pi/pup/`
-    /// - `backend_txs`: one sender per backend for fan-out
-    /// - `incoming_rx`: shared receiver for all backend incoming messages
+    /// - `event_tx`: sender to the event bus (fan-out to chat channels)
+    /// - `incoming_rx`: messages routed to this backend by the message router
+    /// - `registry`: shared session registry for the message router
     pub fn new(
         socket_dir: PathBuf,
-        backend_txs: Vec<mpsc::Sender<SessionEvent>>,
+        event_tx: mpsc::Sender<SessionEvent>,
         incoming_rx: mpsc::Receiver<IncomingMessage>,
+        registry: SessionRegistry,
     ) -> Self {
         let (ipc_tx, ipc_rx) = mpsc::channel(256);
         let (discovery_tx, discovery_rx) = mpsc::channel(64);
         Self {
             socket_dir,
             sessions: HashMap::new(),
-            backend_txs,
+            registry,
+            event_tx,
             incoming_rx,
             ipc_rx,
             ipc_tx,
@@ -126,7 +132,7 @@ impl SessionManager {
                         }
                     }
 
-                    // Incoming messages from backends.
+                    // Incoming messages from chat channels (via the router).
                     Some(msg) = self.incoming_rx.recv() => {
                         self.route_incoming(msg).await;
                     }
@@ -206,14 +212,10 @@ impl SessionManager {
         // Set up command channel for this session.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<ClientMessage>(32);
 
-        // Spawn IPC reader task.
-        let ipc_tx = self.ipc_tx.clone();
+        // Spawn IPC reader/writer task.
+        let ipc_tx_clone = self.ipc_tx.clone();
         let sid = session_id.to_owned();
         let reader = client;
-
-        // Actually, `IpcClient` owns both halves. We'll use a single task that
-        // multiplexes reads and command sends.
-        let ipc_tx_clone = ipc_tx.clone();
         tokio::spawn(async move {
             let mut client = reader;
             loop {
@@ -258,9 +260,13 @@ impl SessionManager {
             }
         });
 
-        // Emit Connected to all backends.
+        // Update registry and emit Connected.
+        if let Ok(mut reg) = self.registry.write() {
+            reg.insert(session_id.to_owned());
+        }
+
         let connected_event = SessionEvent::Connected { info: info.clone() };
-        self.fanout(connected_event).await;
+        self.publish(connected_event).await;
 
         self.sessions
             .insert(session_id.to_owned(), SessionConnection { info, cmd_tx });
@@ -271,8 +277,11 @@ impl SessionManager {
     /// Disconnect from a session.
     async fn disconnect_session(&mut self, session_id: &str, reason: &str) {
         if self.sessions.remove(session_id).is_some() {
+            if let Ok(mut reg) = self.registry.write() {
+                reg.remove(session_id);
+            }
             info!(session_id, reason, "session disconnected");
-            self.fanout(SessionEvent::Disconnected {
+            self.publish(SessionEvent::Disconnected {
                 session_id: session_id.to_owned(),
             })
             .await;
@@ -351,7 +360,7 @@ impl SessionManager {
                 if let Some(conn) = self.sessions.get_mut(session_id) {
                     conn.info.session_name = Some(name.clone());
                     let info = conn.info.clone();
-                    self.fanout(SessionEvent::InfoChanged { info }).await;
+                    self.publish(SessionEvent::InfoChanged { info }).await;
                 }
                 return;
             }
@@ -359,7 +368,7 @@ impl SessionManager {
                 if let Some(conn) = self.sessions.get_mut(session_id) {
                     conn.info.model = Some(model);
                     let info = conn.info.clone();
-                    self.fanout(SessionEvent::InfoChanged { info }).await;
+                    self.publish(SessionEvent::InfoChanged { info }).await;
                 }
                 return;
             }
@@ -402,38 +411,33 @@ impl SessionManager {
             | IpcEvent::Unknown { .. } => return,
         };
 
-        self.fanout(session_event).await;
+        self.publish(session_event).await;
     }
 
-    /// Fan out a session event to all backends.
-    ///
-    /// Uses `send().await` to apply backpressure rather than dropping events
-    /// when the backend is busy with slow API calls.
-    async fn fanout(&self, event: SessionEvent) {
-        for tx in &self.backend_txs {
-            if tx.send(event.clone()).await.is_err() {
-                warn!("backend channel closed, dropping event");
-            }
+    /// Publish a session event to the event bus.
+    async fn publish(&self, event: SessionEvent) {
+        if self.event_tx.send(event).await.is_err() {
+            warn!("event bus channel closed");
         }
     }
 
-    /// Route an incoming message from a backend to the correct session.
+    /// Route an incoming message to the correct session.
     async fn route_incoming(&self, msg: IncomingMessage) {
-        let span = info_span!("route_incoming", session_id = %msg.session_id, mode = ?msg.mode);
+        let session_id = msg.session_id().to_owned();
+        let span = info_span!("route_incoming", session_id = %session_id);
         async {
-            let Some(conn) = self.sessions.get(&msg.session_id) else {
+            let Some(conn) = self.sessions.get(&session_id) else {
                 warn!("no session found for incoming message");
                 return;
             };
 
-            let cmd = if msg.is_cancel {
-                ClientMessage::Abort { id: None }
-            } else {
-                ClientMessage::Send {
-                    message: msg.text,
-                    mode: Some(msg.mode),
+            let cmd = match msg {
+                IncomingMessage::Cancel { .. } => ClientMessage::Abort { id: None },
+                IncomingMessage::Send { text, mode, .. } => ClientMessage::Send {
+                    message: text,
+                    mode: Some(mode),
                     id: None,
-                }
+                },
             };
 
             if let Err(e) = conn.cmd_tx.send(cmd).await {
