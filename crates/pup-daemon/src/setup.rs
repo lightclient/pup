@@ -139,7 +139,6 @@ pub(crate) async fn run_setup() -> Result<()> {
         if let Some(sg) = supergroup_id {
             let _ = writeln!(config, "supergroup_id = {sg}");
         }
-        config.push_str("topic_icon = \"📎\"\n\n");
     }
 
     config.push_str("[backends.telegram.display]\nmax_message_length = 3500\n");

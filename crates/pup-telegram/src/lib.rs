@@ -117,7 +117,6 @@ pub struct TelegramConfig {
     pub dm_enabled: bool,
     pub topics_enabled: bool,
     pub supergroup_id: Option<i64>,
-    pub topic_icon: String,
     pub max_message_length: usize,
     pub edit_interval_ms: u64,
     pub thinking: bool,
@@ -183,13 +182,9 @@ impl TelegramBackend {
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
-            config.supergroup_id.map(|id| {
-                TopicsManager::new(
-                    id,
-                    config.topic_icon.clone(),
-                    config.topics_state_path.clone(),
-                )
-            })
+            config
+                .supergroup_id
+                .map(|id| TopicsManager::new(id, config.topics_state_path.clone()))
         } else {
             None
         };
@@ -1084,7 +1079,6 @@ impl TelegramBackend {
         bot: &BotClient,
         mut offset: i64,
         supergroup_id: i64,
-        topic_icon: &str,
         topics: &mut TopicsManager,
     ) -> i64 {
         let mut total_updates = 0u64;
@@ -1118,18 +1112,12 @@ impl TelegramBackend {
                     continue;
                 }
 
-                // Check for forum_topic_created service messages with our icon prefix.
-                // When no icon is configured, skip discovery — rely on persisted state.
-                if !topic_icon.is_empty()
-                    && let Some(ref ftc) = msg.forum_topic_created
-                    && ftc.name.starts_with(topic_icon)
+                // Record any forum_topic_created in our supergroup so we
+                // know about threads we created in previous runs.
+                if msg.forum_topic_created.is_some()
                     && let Some(thread_id) = msg.message_thread_id
                 {
-                    debug!(
-                        thread_id,
-                        topic_name = %ftc.name,
-                        "discovered topic from update scan"
-                    );
+                    debug!(thread_id, "discovered topic from update scan");
                     topics.record_discovered_thread(thread_id);
                     discovered += 1;
                 }
@@ -1243,15 +1231,13 @@ impl ChatBackend for TelegramBackend {
 
                 // Drain pending getUpdates from our checkpoint to discover
                 // topic creations we might have missed (crashes, pre-persistence
-                // era, etc.). Only records threads whose name matches our icon.
+                // era, etc.).
                 let scan_offset = topics.scan_checkpoint();
                 let supergroup_id = topics.chat_id();
-                let icon = topics.topic_icon().to_owned();
                 let new_offset = Self::scan_updates_for_topics(
                     &self.bot,
                     scan_offset,
                     supergroup_id,
-                    &icon,
                     topics,
                 )
                 .await;
@@ -1837,7 +1823,7 @@ mod tests {
             dm_enabled: true,
             topics_enabled: false,
             supergroup_id: None,
-            topic_icon: String::new(),
+
             max_message_length: 4096,
             edit_interval_ms: 100,
             thinking: false,

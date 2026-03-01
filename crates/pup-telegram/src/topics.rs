@@ -105,8 +105,6 @@ struct PersistedState {
 pub struct TopicsManager {
     /// Supergroup chat ID.
     chat_id: i64,
-    /// Topic icon prefix (e.g. "📎").
-    topic_icon: String,
     /// session_id → thread_id for currently active topics.
     session_topics: HashMap<String, i64>,
     /// thread_id → session_id reverse mapping.
@@ -127,7 +125,7 @@ pub struct TopicsManager {
 }
 
 impl TopicsManager {
-    pub fn new(chat_id: i64, topic_icon: String, state_path: PathBuf) -> Self {
+    pub fn new(chat_id: i64, state_path: PathBuf) -> Self {
         let state = Self::load_state(&state_path);
 
         let thread_sessions: HashMap<i64, String> = state
@@ -148,7 +146,6 @@ impl TopicsManager {
 
         Self {
             chat_id,
-            topic_icon,
             session_topics: state.topics,
             thread_sessions,
             known_threads: state.known_threads,
@@ -236,11 +233,6 @@ impl TopicsManager {
         if update_id >= self.scan_checkpoint {
             self.scan_checkpoint = update_id + 1;
         }
-    }
-
-    /// Return our topic icon prefix so callers can filter service messages.
-    pub fn topic_icon(&self) -> &str {
-        &self.topic_icon
     }
 
     // ── Cleanup ────────────────────────────────────────────────
@@ -345,19 +337,13 @@ impl TopicsManager {
             }
         };
 
-        let full_base = if self.topic_icon.is_empty() {
-            base.clone()
-        } else {
-            format!("{} {base}", self.topic_icon)
-        };
-
-        let count = self.topic_names.entry(base).or_insert(0);
+        let count = self.topic_names.entry(base.clone()).or_insert(0);
         *count += 1;
 
         if *count > 1 {
-            format!("{full_base} ({count})")
+            format!("{base} ({count})")
         } else {
-            full_base
+            base
         }
     }
 
@@ -650,7 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_with_session_name() {
-        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: Some("myproject".to_owned()),
@@ -665,7 +651,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_from_cwd() {
-        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: None,
@@ -680,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_collision() {
-        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path());
         let info1 = SessionInfo {
             session_id: "aaa".to_owned(),
             session_name: Some("myproject".to_owned()),
@@ -701,20 +687,5 @@ mod tests {
         };
         assert_eq!(mgr.topic_name(&info1).await, "myproject");
         assert_eq!(mgr.topic_name(&info2).await, "myproject (2)");
-    }
-
-    #[tokio::test]
-    async fn test_topic_name_with_icon_prefix() {
-        let mut mgr = TopicsManager::new(-1001234, "🤖".to_owned(), test_state_path());
-        let info = SessionInfo {
-            session_id: "abc123".to_owned(),
-            session_name: Some("myproject".to_owned()),
-            cwd: "/home/user/code".to_owned(),
-            model: None,
-            history: vec![],
-            streaming: false,
-            partial_text: None,
-        };
-        assert_eq!(mgr.topic_name(&info).await, "🤖 myproject");
     }
 }

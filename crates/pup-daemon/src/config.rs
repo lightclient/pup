@@ -244,8 +244,6 @@ pub(crate) struct TelegramTopicsConfig {
     #[serde(default)]
     pub enabled: bool,
     pub supergroup_id: Option<i64>,
-    #[serde(default = "default_topic_icon")]
-    pub topic_icon: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,10 +290,6 @@ fn default_edit_interval_ms() -> u64 {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_topic_icon() -> String {
-    String::new()
 }
 
 fn default_max_message_length() -> usize {
@@ -347,10 +341,6 @@ impl Config {
         let dm_enabled = tg.dm.as_ref().is_none_or(|d| d.enabled);
         let topics_enabled = tg.topics.as_ref().is_some_and(|t| t.enabled);
         let supergroup_id = tg.topics.as_ref().and_then(|t| t.supergroup_id);
-        let topic_icon = tg
-            .topics
-            .as_ref()
-            .map_or_else(default_topic_icon, |t| t.topic_icon.clone());
         let max_message_length = tg
             .display
             .as_ref()
@@ -376,7 +366,6 @@ impl Config {
             dm_enabled,
             topics_enabled,
             supergroup_id,
-            topic_icon,
             max_message_length,
             edit_interval_ms: self.streaming.edit_interval_ms,
             thinking: self.display.effective_thinking(),
@@ -455,7 +444,6 @@ enabled = true
 [backends.telegram.topics]
 enabled = true
 supergroup_id = -1001234567890
-# topic_icon = "📎"  # optional prefix for topic names (empty by default)
 
 [backends.telegram.display]
 max_message_length = 3500
