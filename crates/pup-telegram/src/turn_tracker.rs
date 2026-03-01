@@ -331,11 +331,17 @@ impl TurnState {
         // Tool call summaries for the current page.
         parts.extend(self.render_tools(self.current_page_tools()));
 
-        // Thinking content (shown while model is reasoning, before response text).
-        if self.show_thinking && self.thinking && self.streaming_text.is_empty() {
-            if self.thinking_text.is_empty() {
+        // Thinking content.
+        //
+        // Shown when `show_thinking` is on and either:
+        //   - The model is actively thinking (no text accumulated yet), or
+        //   - Thinking text exists (persists through tool calls until
+        //     response text starts streaming).
+        if self.show_thinking {
+            if self.thinking && self.thinking_text.is_empty() && self.streaming_text.is_empty() {
+                // Still waiting for the first thinking delta.
                 parts.push("<i>Thinking…</i>".to_owned());
-            } else {
+            } else if !self.thinking_text.is_empty() && self.streaming_text.is_empty() {
                 const MAX_THINKING_DISPLAY: usize = 2000;
                 let display = if self.thinking_text.len() > MAX_THINKING_DISPLAY {
                     let start = self.thinking_text.len() - MAX_THINKING_DISPLAY;
@@ -366,10 +372,28 @@ impl TurnState {
         }
     }
 
-    /// Render content for a frozen page (only the tools in the range).
+    /// Render content for a frozen page (tools in the range, plus
+    /// thinking text on the first page).
     fn render_frozen_page(&self, tool_range: std::ops::Range<usize>) -> String {
+        let mut parts = Vec::new();
+
+        // Include thinking text on the first page (page_start was 0
+        // when this page was live, so tool_range.start == 0).
+        if self.show_thinking && tool_range.start == 0 && !self.thinking_text.is_empty() {
+            const MAX_THINKING_DISPLAY: usize = 2000;
+            let display = if self.thinking_text.len() > MAX_THINKING_DISPLAY {
+                let start = self.thinking_text.len() - MAX_THINKING_DISPLAY;
+                let safe_start = self.thinking_text.ceil_char_boundary(start);
+                format!("…{}", &self.thinking_text[safe_start..])
+            } else {
+                self.thinking_text.clone()
+            };
+            parts.push(format!("<i>{}</i>", escape_html(&display)));
+        }
+
         let tools = &self.tools[tool_range];
-        let parts = self.render_tools(tools);
+        parts.extend(self.render_tools(tools));
+
         if parts.is_empty() {
             "…".to_owned()
         } else {
@@ -1586,6 +1610,162 @@ mod tests {
         assert!(rendered.contains("✓ <b>Bash</b>"));
         assert!(rendered.contains("✗ <b>Bash</b>"));
         assert!(rendered.contains("▸ <b>Read</b>"));
+    }
+
+    // ── Thinking persistence ────────────────────────────────────
+
+    #[test]
+    fn thinking_text_persists_through_tool_calls() {
+        // Thinking happened, then tools started — thinking flag is
+        // still true, streaming text is empty.  The thinking text
+        // should appear alongside the tools.
+        let state = make_render_state(
+            true,
+            true,
+            vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: String::new(),
+                is_error: false,
+                done: false,
+            }],
+            "",
+            true, // thinking flag still on
+            "Let me check the files",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
+
+        let rendered = state.render_parts(true);
+        assert!(
+            rendered.contains("Let me check the files"),
+            "thinking text must appear alongside tools: {rendered}"
+        );
+        assert!(rendered.contains("<b>Bash</b>"));
+    }
+
+    #[test]
+    fn thinking_text_persists_after_thinking_flag_cleared() {
+        // Thinking phase ended (thinking=false) but no response text
+        // yet — only tools running.  Thinking text should still show.
+        let state = make_render_state(
+            true,
+            true,
+            vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: String::new(),
+                is_error: false,
+                done: true,
+            }],
+            "",
+            false, // thinking flag off (phase ended)
+            "Let me check the files",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
+
+        let rendered = state.render_parts(true);
+        assert!(
+            rendered.contains("Let me check the files"),
+            "thinking text must persist after thinking phase ends: {rendered}"
+        );
+    }
+
+    #[test]
+    fn thinking_text_hidden_once_response_starts() {
+        // Response text started streaming — thinking text should
+        // disappear in favor of the response.
+        let state = make_render_state(
+            true,
+            true,
+            vec![TrackedTool {
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "files".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+            "Here are the results.",
+            false,
+            "Let me check the files",
+            ToolCallLimit::All,
+            ToolOutputLines::First(10),
+            false,
+        );
+
+        let rendered = state.render_parts(true);
+        assert!(
+            !rendered.contains("Let me check the files"),
+            "thinking text should be hidden once response starts: {rendered}"
+        );
+        assert!(rendered.contains("Here are the results."));
+    }
+
+    #[test]
+    fn frozen_first_page_includes_thinking() {
+        let state = make_render_state(
+            true,
+            true,
+            vec![TrackedTool {
+                tool_name: "A".to_owned(),
+                args: serde_json::json!({}),
+                content: String::new(),
+                is_error: false,
+                done: true,
+            }],
+            "",
+            true,
+            "My reasoning here",
+            ToolCallLimit::Last(1),
+            ToolOutputLines::First(10),
+            false,
+        );
+
+        let frozen = state.render_frozen_page(0..1);
+        assert!(
+            frozen.contains("My reasoning here"),
+            "frozen first page must include thinking: {frozen}"
+        );
+    }
+
+    #[test]
+    fn frozen_later_page_excludes_thinking() {
+        let mut state = make_render_state(
+            true,
+            true,
+            vec![
+                TrackedTool {
+                    tool_name: "A".to_owned(),
+                    args: serde_json::json!({}),
+                    content: String::new(),
+                    is_error: false,
+                    done: true,
+                },
+                TrackedTool {
+                    tool_name: "B".to_owned(),
+                    args: serde_json::json!({}),
+                    content: String::new(),
+                    is_error: false,
+                    done: true,
+                },
+            ],
+            "",
+            true,
+            "My reasoning here",
+            ToolCallLimit::Last(1),
+            ToolOutputLines::First(10),
+            false,
+        );
+
+        state.page_start = 1;
+        let frozen = state.render_frozen_page(1..2);
+        assert!(
+            !frozen.contains("My reasoning here"),
+            "frozen later page must not include thinking: {frozen}"
+        );
     }
 
     // ── Page rendering ──────────────────────────────────────────
