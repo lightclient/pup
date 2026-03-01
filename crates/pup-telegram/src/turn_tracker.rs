@@ -377,11 +377,18 @@ impl TurnState {
         self.dirty = false;
     }
 
-    /// Freeze the current live message and send a new one below it.
+    /// Freeze the current live message.
     ///
     /// The live message is edited to show only the tools on the current
-    /// page (no streaming text, no keyboard).  A new live message is
-    /// sent below it with an initial placeholder.
+    /// page (no streaming text, keyboard removed).  The page pointer is
+    /// advanced and the live message ID is cleared so the next event
+    /// that needs a message (tool_start, message_delta, etc.) will
+    /// create a fresh one below via `ensure_message`.
+    ///
+    /// This avoids the dual-cancel-button problem that would occur if
+    /// we sent a new message here: the outbox processes sends before
+    /// edits, so the new cancel button would appear before the old one
+    /// is removed.
     fn freeze_and_advance(&mut self, outbox: &mut Outbox) {
         let page_range = self.page_start..self.tools.len();
         let frozen_html = self.render_frozen_page(page_range);
@@ -394,7 +401,7 @@ impl TurnState {
         for dest in &mut self.destinations {
             dest.try_resolve_message_id();
 
-            // Freeze the current live message.
+            // Freeze the current live message (remove keyboard).
             if let Some(msg_id) = dest.live_message_id {
                 outbox.enqueue(OutboxOp::Edit {
                     chat_id: dest.chat_id,
@@ -405,20 +412,11 @@ impl TurnState {
                 });
             }
 
-            // Send a new live message below.
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            outbox.enqueue(OutboxOp::Send {
-                chat_id: dest.chat_id,
-                text: "…".to_owned(),
-                parse_mode: Some("HTML".to_owned()),
-                reply_markup: Some(cancel_keyboard(&self.session_id)),
-                message_thread_id: dest.thread_id,
-                result_tx: Some(tx),
-            });
-
+            // Clear the live message so ensure_message creates a new
+            // one on the next event.
             dest.live_message_id = None;
-            dest.send_pending = true;
-            dest.send_rx = Some(rx);
+            dest.send_pending = false;
+            dest.send_rx = None;
         }
 
         self.last_edit = Instant::now();
@@ -930,14 +928,16 @@ impl TurnTracker {
             dest.try_resolve_message_id();
         }
 
-        let has_verbose_content = (state.show_tools && !state.tools.is_empty())
+        // Check for verbose content on the *current page* only.
+        // Earlier pages were already frozen into their own messages.
+        let has_verbose_on_page = (state.show_tools && state.page_start < state.tools.len())
             || (state.show_thinking && !state.thinking_text.is_empty());
         let has_text = !state.streaming_text.is_empty();
 
         // Render the current page's tools/thinking (no streaming text).
         #[allow(clippy::if_then_some_else_none)]
         let summary_chunks =
-            has_verbose_content.then(|| split_message(&state.render_parts(false), MAX_BODY_CHARS));
+            has_verbose_on_page.then(|| split_message(&state.render_parts(false), MAX_BODY_CHARS));
 
         let text_chunks = if has_text {
             let html = to_telegram_html(&state.streaming_text);
@@ -951,7 +951,7 @@ impl TurnTracker {
         };
 
         #[allow(clippy::if_then_some_else_none)]
-        let rendered_chunks = (has_text && !has_verbose_content)
+        let rendered_chunks = (has_text && !has_verbose_on_page)
             .then(|| split_message(&state.render(), MAX_BODY_CHARS));
 
         #[allow(clippy::if_not_else, clippy::if_then_some_else_none)]
@@ -960,7 +960,7 @@ impl TurnTracker {
 
         for dest in &state.destinations {
             if let Some(msg_id) = dest.live_message_id {
-                if has_verbose_content && has_text {
+                if has_verbose_on_page && has_text {
                     // Edit the live message to show only tools/thinking.
                     if let Some(ref chunks) = summary_chunks
                         && let Some(first) = chunks.first()
