@@ -1097,6 +1097,60 @@ impl TurnTracker {
                         });
                     }
                 }
+            } else if dest.send_pending {
+                // The message was enqueued but the outbox hasn't sent it
+                // yet (message_id unknown).  Update the pending Send
+                // in-place to strip the cancel keyboard and set the final
+                // content so the message goes out in its completed form.
+                let final_text = if has_verbose_on_page && has_text {
+                    // Verbose + text: the pending message becomes the
+                    // tools/thinking summary (text goes as a separate Send
+                    // below).
+                    summary_chunks
+                        .as_ref()
+                        .and_then(|c| c.first().cloned())
+                        .unwrap_or_else(|| "…".to_owned())
+                } else if has_text {
+                    // Text only: the pending message becomes the full
+                    // rendered response.
+                    rendered_chunks
+                        .as_ref()
+                        .and_then(|c| c.first().cloned())
+                        .unwrap_or_else(|| "…".to_owned())
+                } else {
+                    // No text (tools-only turn): the pending message
+                    // becomes the tools summary.
+                    no_text_chunks
+                        .as_ref()
+                        .and_then(|c| c.first().cloned())
+                        .unwrap_or_else(|| "…".to_owned())
+                };
+
+                let keyboard = empty_keyboard();
+                outbox.update_pending_send(
+                    dest.chat_id,
+                    dest.thread_id,
+                    &final_text,
+                    Some(&keyboard),
+                );
+
+                // If verbose + text, the final assistant text still needs
+                // a separate message (same as the resolved-message case).
+                if has_verbose_on_page
+                    && has_text
+                    && let Some(ref chunks) = text_chunks
+                {
+                    for chunk in chunks {
+                        outbox.enqueue(OutboxOp::Send {
+                            chat_id: dest.chat_id,
+                            text: chunk.clone(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: None,
+                            message_thread_id: dest.thread_id,
+                            result_tx: None,
+                        });
+                    }
+                }
             } else if has_text {
                 let chunks = text_chunks.as_deref().unwrap_or(&[]);
                 for chunk in chunks {

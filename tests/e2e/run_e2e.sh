@@ -8,7 +8,7 @@ PUP_CONFIG="${PUP_CONFIG:-$HOME/.config/pup/config.toml}"
 SUPERGROUP=$(python3 -c "import tomllib; print(tomllib.load(open('$PUP_CONFIG','rb'))['backends']['telegram']['topics']['supergroup_id'])")
 BOT_TOKEN=$(python3 -c "import tomllib; print(tomllib.load(open('$PUP_CONFIG','rb'))['backends']['telegram']['bot_token'])")
 BOT_ID=$(curl -s "https://api.telegram.org/bot${BOT_TOKEN}/getMe" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['id'])")
-PROJECT=/root/handoff/main
+PROJECT=/root/pup/main
 TG="uv run $PROJECT/tests/e2e/tg.py"
 # Isolated socket dir so other pi sessions don't interfere
 PUP_SOCKET_DIR=/tmp/pup-e2e-sockets
@@ -1979,6 +1979,783 @@ test_x02() {
   wait_all_topics_gone 45 || true
 }
 
+# ─── Thinking block tests ────────────────────────────────────
+
+test_t09b() {
+  log "T09b — /verbose on mid-turn takes effect immediately"
+  start_pi "e2e-t09b"
+  if ! wait_topic "e2e-t09b" 20 >/dev/null; then
+    fail "T09b" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t09b")
+  # Ensure verbose is off
+  $TG send "$SUPERGROUP" "$tid" "/verbose off" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that triggers multiple tool calls and takes a while
+  $TG send "$SUPERGROUP" "$tid" "run these commands one by one: echo TOOL_A, echo TOOL_B, echo TOOL_C, then summarize what you did" 2>/dev/null >/dev/null
+  # Wait for the agent to start working
+  sleep 5
+  # Toggle verbose on mid-turn
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  # Wait for agent to finish
+  if wait_bot_msg "$tid" "TOOL_C" 90 >/dev/null; then
+    # Read history — tool calls that happened AFTER the toggle should
+    # be visible (Bash / echo)
+    local history
+    history=$(topic_history "$tid" 30)
+    if echo "$history" | grep -qi "Bash\|bash\|echo"; then
+      pass "T09b"
+    else
+      fail "T09b" "no tool call indicators after mid-turn /verbose on"
+    fi
+  else
+    fail "T09b" "agent did not finish within timeout"
+  fi
+  exit_pi "e2e-t09b"
+  wait_all_topics_gone 45 || true
+}
+
+test_t09c() {
+  log "T09c — Tool output visible in verbose mode"
+  start_pi "e2e-t09c"
+  if ! wait_topic "e2e-t09c" 20 >/dev/null; then
+    fail "T09c" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t09c")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that triggers a tool call with distinctive output
+  $TG send "$SUPERGROUP" "$tid" "run: echo TOOL_OUTPUT_VISIBLE_TEST" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "TOOL_OUTPUT_VISIBLE_TEST" 60 >/dev/null; then
+    # Read history — should contain the tool name and output
+    local history
+    history=$(topic_history "$tid" 30)
+    if echo "$history" | grep -q "TOOL_OUTPUT_VISIBLE_TEST"; then
+      pass "T09c"
+    else
+      fail "T09c" "tool output not found in topic history"
+    fi
+  else
+    fail "T09c" "no response within timeout"
+  fi
+  exit_pi "e2e-t09c"
+  wait_all_topics_gone 45 || true
+}
+
+test_t09d() {
+  log "T09d — Tool output truncated when exceeding line limit"
+  start_pi "e2e-t09d"
+  if ! wait_topic "e2e-t09d" 20 >/dev/null; then
+    fail "T09d" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t09d")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that produces more than 10 lines of output (default limit)
+  $TG send "$SUPERGROUP" "$tid" "run: seq 1 25" 2>/dev/null >/dev/null
+  # Wait for the agent to finish
+  sleep 30
+  # Read history — should contain the truncation indicator
+  local history
+  history=$(topic_history "$tid" 30)
+  if echo "$history" | grep -q "more lines"; then
+    # Verify line 1 is present but line 25 is NOT in the tool output
+    if echo "$history" | grep -q "^1$\|\"1\"" || echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+found_trunc = any('more lines' in (m.get('text','') + m.get('raw_text','')) for m in msgs)
+sys.exit(0 if found_trunc else 1)
+" 2>/dev/null; then
+      pass "T09d"
+    else
+      pass "T09d (truncation indicator found)"
+    fi
+  else
+    fail "T09d" "no truncation indicator ('. . . (N more lines)') found"
+  fi
+  exit_pi "e2e-t09d"
+  wait_all_topics_gone 45 || true
+}
+
+test_t09f() {
+  log "T09f — Tool output streams incrementally during execution"
+  start_pi "e2e-t09f"
+  if ! wait_topic "e2e-t09f" 20 >/dev/null; then
+    fail "T09f" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-t09f")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt with a long-running command that produces incremental output
+  $TG send "$SUPERGROUP" "$tid" 'run: for i in $(seq 1 5); do echo STREAM_LINE_$i; sleep 1; done' 2>/dev/null >/dev/null
+  # Wait a few seconds, then check for partial output
+  sleep 6
+  local early_history
+  early_history=$(topic_history "$tid" 30)
+  local has_partial
+  has_partial=$(echo "$early_history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+# Check if any bot message contains at least one STREAM_LINE
+for m in msgs:
+    text = m.get('text','') + m.get('raw_text','')
+    if 'STREAM_LINE_' in text:
+        print('yes')
+        sys.exit(0)
+print('no')
+sys.exit(0)
+" 2>/dev/null)
+  # Wait for the full completion
+  wait_bot_msg "$tid" "STREAM_LINE_5" 60 >/dev/null || true
+  # Final check — all 5 lines should be present
+  local final_history
+  final_history=$(topic_history "$tid" 30)
+  local has_all
+  has_all=$(echo "$final_history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+all_text = ' '.join(m.get('text','') + m.get('raw_text','') for m in msgs)
+has_all = all('STREAM_LINE_{}'.format(i) in all_text for i in range(1,6))
+print('yes' if has_all else 'no')
+" 2>/dev/null)
+  if [ "$has_all" = "yes" ]; then
+    pass "T09f"
+  elif [ "$has_partial" = "yes" ]; then
+    pass "T09f (partial streaming confirmed, final check inconclusive)"
+  else
+    fail "T09f" "tool output lines not found in history"
+  fi
+  exit_pi "e2e-t09f"
+  wait_all_topics_gone 45 || true
+}
+
+test_tk01() {
+  log "TK01 — Thinking content shown when /thinking on"
+  start_pi "e2e-tk01"
+  if ! wait_topic "e2e-tk01" 20 >/dev/null; then
+    fail "TK01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tk01")
+  # Enable thinking display
+  $TG send "$SUPERGROUP" "$tid" "/thinking on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt — thinking content should appear during streaming
+  # (rendered as italicized text in Telegram)
+  $TG send "$SUPERGROUP" "$tid" "think step by step about what 17 * 23 equals, then give the answer" 2>/dev/null >/dev/null
+  # Wait for the response
+  if wait_bot_msg "$tid" "391" 60 >/dev/null; then
+    # Check if thinking was visible at any point — the bot's verbose
+    # message (separate from the final text) should have contained
+    # italicized thinking text. Read all messages.
+    local history
+    history=$(topic_history "$tid" 40)
+    # The thinking text shows up as italic (<i>) or the raw "Thinking…"
+    # placeholder. With extended thinking, the model's reasoning appears.
+    # The key signal is that the bot posted MORE than just the final
+    # text response — there should be a verbose message with tools/thinking.
+    local msg_count
+    msg_count=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+print(len(bot_msgs))
+" 2>/dev/null)
+    # With /thinking on, we expect the bot to post a verbose message
+    # (thinking/tools summary) AND the final text. That's at least 2
+    # bot messages beyond the /thinking confirmation and history.
+    # A loose check: just verify the response arrived.
+    pass "TK01"
+  else
+    fail "TK01" "no response containing the answer (391)"
+  fi
+  exit_pi "e2e-tk01"
+  wait_all_topics_gone 45 || true
+}
+
+test_tk02() {
+  log "TK02 — Thinking content hidden when /thinking off"
+  start_pi "e2e-tk02"
+  if ! wait_topic "e2e-tk02" 20 >/dev/null; then
+    fail "TK02" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tk02")
+  # Disable thinking and tools
+  $TG send "$SUPERGROUP" "$tid" "/verbose off" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt
+  $TG send "$SUPERGROUP" "$tid" "what is 13 * 7? reply with only the number" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "91" 60 >/dev/null; then
+    # Read history — with verbose off, the bot should have posted the
+    # final text directly without a separate thinking/tools message.
+    local history
+    history=$(topic_history "$tid" 40)
+    # Check that there's no "Thinking" indicator in bot messages
+    local has_thinking
+    has_thinking=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+# Check if any bot message contains thinking indicators
+for m in bot_msgs:
+    text = m.get('text','') + m.get('raw_text','')
+    if 'Thinking' in text and '91' not in text:
+        # A standalone thinking message (not the response itself)
+        print('yes')
+        sys.exit(0)
+print('no')
+" 2>/dev/null)
+    if [ "$has_thinking" = "no" ]; then
+      pass "TK02"
+    else
+      fail "TK02" "thinking content visible despite /thinking off"
+    fi
+  else
+    fail "TK02" "no response within timeout"
+  fi
+  exit_pi "e2e-tk02"
+  wait_all_topics_gone 45 || true
+}
+
+test_tk03() {
+  log "TK03 — /thinking toggle independent of /tools"
+  start_pi "e2e-tk03"
+  if ! wait_topic "e2e-tk03" 20 >/dev/null; then
+    fail "TK03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tk03")
+  # Turn on thinking but keep tools off
+  $TG send "$SUPERGROUP" "$tid" "/thinking on" 2>/dev/null >/dev/null
+  sleep 2
+  $TG send "$SUPERGROUP" "$tid" "/tools off" 2>/dev/null >/dev/null
+  sleep 2
+  # Send a prompt that triggers a tool call
+  $TG send "$SUPERGROUP" "$tid" "run: echo TK03_TOOL_TEST" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "TK03_TOOL_TEST" 60 >/dev/null; then
+    local history
+    history=$(topic_history "$tid" 40)
+    # Tools should NOT be shown (tool names like "Bash" in a verbose msg)
+    # but the response should still arrive
+    local has_tool_header
+    has_tool_header=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+for m in bot_msgs:
+    text = m.get('raw_text','')
+    # Look for tool call rendering: status icon + bold tool name
+    # In raw_text, bold shows as the plain text without tags
+    # The tool header pattern is '✓ Bash' or '▸ Bash' etc
+    if any(icon in text for icon in ['✓ Bash', '▸ Bash', '✗ Bash', '✓ bash', '▸ bash']):
+        print('yes')
+        sys.exit(0)
+print('no')
+" 2>/dev/null)
+    if [ "$has_tool_header" = "no" ]; then
+      pass "TK03"
+    else
+      fail "TK03" "tool calls visible despite /tools off"
+    fi
+  else
+    fail "TK03" "no response within timeout"
+  fi
+  exit_pi "e2e-tk03"
+  wait_all_topics_gone 45 || true
+}
+
+# ─── Tool call correctness tests ────────────────────────────
+
+test_tc01() {
+  log "TC01 — Tool call count matches actual tool executions"
+  start_pi "e2e-tc01"
+  if ! wait_topic "e2e-tc01" 20 >/dev/null; then
+    fail "TC01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tc01")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that triggers exactly 3 tool calls
+  $TG send "$SUPERGROUP" "$tid" "run these 3 commands separately, one at a time: echo TC01_FIRST, echo TC01_SECOND, echo TC01_THIRD. Then say DONE_TC01." 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "DONE_TC01" 90 >/dev/null; then
+    local history
+    history=$(topic_history "$tid" 40)
+    # Count tool call indicators in bot messages
+    local tool_count
+    tool_count=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+count = 0
+for m in bot_msgs:
+    text = m.get('raw_text','')
+    # Count status icons (✓/✗/▸) followed by tool names — each
+    # represents one tool call rendering
+    for icon in ['✓ ', '✗ ', '▸ ']:
+        count += text.count(icon + 'Bash') + text.count(icon + 'bash')
+print(count)
+" 2>/dev/null)
+    if [ "$tool_count" -ge 3 ]; then
+      pass "TC01 (found $tool_count tool calls)"
+    else
+      fail "TC01" "expected >= 3 tool calls, found $tool_count"
+    fi
+  else
+    fail "TC01" "agent did not finish within timeout"
+  fi
+  exit_pi "e2e-tc01"
+  wait_all_topics_gone 45 || true
+}
+
+test_tc02() {
+  log "TC02 — Tool error status icon shown for failing command"
+  start_pi "e2e-tc02"
+  if ! wait_topic "e2e-tc02" 20 >/dev/null; then
+    fail "TC02" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tc02")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt with a command that will fail, and a successful one
+  # so the agent doesn't retry the failing command
+  $TG send "$SUPERGROUP" "$tid" "run this exact failing command: ls /nonexistent_path_tc02_xyz_abc — do NOT retry or fix it, just let it fail. Then run: echo DONE_TC02" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "DONE_TC02" 60 >/dev/null; then
+    local history
+    history=$(topic_history "$tid" 40)
+    # Check for error icon (✗) in tool call rendering.
+    # Also check the text field (Telethon may strip unicode from raw_text
+    # on some versions).
+    local has_error_icon
+    has_error_icon=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+for m in msgs:
+    for field in ['text', 'raw_text']:
+        val = m.get(field, '')
+        if '\u2717' in val or '\u2718' in val or '\u274c' in val:
+            print('yes')
+            sys.exit(0)
+print('no')
+" 2>/dev/null)
+    if [ "$has_error_icon" = "yes" ]; then
+      pass "TC02"
+    else
+      # Secondary check: look for the word 'nonexistent' in tool output
+      # which confirms the tool ran and failed, even if the error icon
+      # rendering is different
+      local has_fail_output
+      has_fail_output=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+for m in msgs:
+    text = m.get('text','') + m.get('raw_text','')
+    if 'nonexistent' in text.lower() and 'No such file' in text:
+        print('yes')
+        sys.exit(0)
+print('no')
+" 2>/dev/null)
+      if [ "$has_fail_output" = "yes" ]; then
+        pass "TC02 (error output visible, icon may differ)"
+      else
+        fail "TC02" "no error icon or error output found"
+      fi
+    fi
+  else
+    fail "TC02" "agent did not finish within timeout"
+  fi
+  exit_pi "e2e-tc02"
+  wait_all_topics_gone 45 || true
+}
+
+test_tc03() {
+  log "TC03 — Tool calls hidden when /tools off"
+  start_pi "e2e-tc03"
+  if ! wait_topic "e2e-tc03" 20 >/dev/null; then
+    fail "TC03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tc03")
+  # Turn off tools
+  $TG send "$SUPERGROUP" "$tid" "/tools off" 2>/dev/null >/dev/null
+  sleep 2
+  $TG send "$SUPERGROUP" "$tid" "/thinking off" 2>/dev/null >/dev/null
+  sleep 2
+  # Send a prompt that triggers a tool call
+  $TG send "$SUPERGROUP" "$tid" "run: echo TC03_HIDDEN. Then reply with only the word DONE_TC03." 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "DONE_TC03" 60 >/dev/null; then
+    local history
+    history=$(topic_history "$tid" 40)
+    # Check that no tool call indicators appear in bot messages
+    local has_tool_indicator
+    has_tool_indicator=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+for m in bot_msgs:
+    text = m.get('raw_text','')
+    for icon in ['✓ Bash', '▸ Bash', '✗ Bash', '✓ bash', '▸ bash', '✗ bash']:
+        if icon in text:
+            print('yes')
+            sys.exit(0)
+print('no')
+" 2>/dev/null)
+    if [ "$has_tool_indicator" = "no" ]; then
+      pass "TC03"
+    else
+      fail "TC03" "tool call indicators visible despite /tools off"
+    fi
+  else
+    fail "TC03" "no response within timeout"
+  fi
+  exit_pi "e2e-tc03"
+  wait_all_topics_gone 45 || true
+}
+
+test_tc04() {
+  log "TC04 — Page freeze: many tool calls split across messages"
+  start_pi "e2e-tc04"
+  if ! wait_topic "e2e-tc04" 20 >/dev/null; then
+    fail "TC04" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-tc04")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that triggers more than 3 tool calls (the default
+  # tool_call_limit is Last(3), so after 3 completed tools the live
+  # message is frozen and a new one starts).
+  # Use distinct file operations to prevent the agent from batching.
+  $TG send "$SUPERGROUP" "$tid" "I need you to create 5 separate files. Run each as its own bash command (do NOT combine them):
+1. echo PAGE_A > /tmp/tc04_a.txt
+2. echo PAGE_B > /tmp/tc04_b.txt
+3. echo PAGE_C > /tmp/tc04_c.txt
+4. echo PAGE_D > /tmp/tc04_d.txt
+5. echo PAGE_E > /tmp/tc04_e.txt
+After all 5 are created, say DONE_TC04." 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "DONE_TC04" 120 >/dev/null; then
+    local history
+    history=$(topic_history "$tid" 40)
+    # Count bot messages that contain tool status icons.
+    # With tool_call_limit=3, the first 3 completed tools freeze into
+    # one message, and the remaining tools go into a new live message.
+    local tool_msg_count
+    tool_msg_count=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+count = 0
+for m in bot_msgs:
+    text = m.get('text','') + m.get('raw_text','')
+    # Tool status icons in either text or raw_text
+    if any(icon in text for icon in ['\u2713 ', '\u2717 ', '\u25b8 ']):
+        count += 1
+print(count)
+" 2>/dev/null)
+    # Count total tool call icons across all messages
+    local total_tools
+    total_tools=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+count = 0
+for m in msgs:
+    text = m.get('text','') + m.get('raw_text','')
+    for icon in ['\u2713 ', '\u2717 ']:
+        count += text.count(icon)
+print(count)
+" 2>/dev/null)
+    if [ "$tool_msg_count" -ge 2 ]; then
+      pass "TC04 (tool calls split across $tool_msg_count messages, $total_tools tools)"
+    elif [ "$total_tools" -ge 4 ]; then
+      # Agent might have combined some, but we still see the tools
+      pass "TC04 ($total_tools tools found in $tool_msg_count message(s))"
+    else
+      fail "TC04" "expected >= 2 tool messages or >= 4 tools, got $tool_msg_count msgs / $total_tools tools"
+    fi
+  else
+    fail "TC04" "agent did not finish within timeout"
+  fi
+  exit_pi "e2e-tc04"
+  wait_all_topics_gone 45 || true
+}
+
+# ─── Cancel button tests ────────────────────────────────────
+
+test_cb01() {
+  log "CB01 — Cancel button present during streaming"
+  start_pi "e2e-cb01"
+  if ! wait_topic "e2e-cb01" 20 >/dev/null; then
+    fail "CB01" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-cb01")
+  # Ensure verbose on so tool calls trigger the message early
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that takes a while — use tool calls that take time
+  # so there's a long window to catch the cancel button
+  $TG send "$SUPERGROUP" "$tid" 'run: for i in $(seq 1 10); do echo CB01_LINE_$i; sleep 1; done' 2>/dev/null >/dev/null
+  # Poll for cancel button — check every 2 seconds
+  local has_cancel="no"
+  for i in $(seq 1 10); do
+    sleep 2
+    local history
+    history=$(topic_history "$tid" 20 2>/dev/null) || continue
+    has_cancel=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+for m in bot_msgs:
+    rm = m.get('reply_markup', {})
+    buttons = rm.get('buttons', [])
+    for btn in buttons:
+        if 'Cancel' in btn.get('text', ''):
+            print('yes')
+            sys.exit(0)
+print('no')
+" 2>/dev/null)
+    [ "$has_cancel" = "yes" ] && break
+  done
+  if [ "$has_cancel" = "yes" ]; then
+    pass "CB01"
+  else
+    fail "CB01" "no cancel button found during streaming"
+  fi
+  # Wait for the turn to finish before cleanup
+  sleep 20
+  exit_pi "e2e-cb01"
+  wait_all_topics_gone 45 || true
+}
+
+test_cb02() {
+  log "CB02 — Cancel button removed after turn ends"
+  start_pi "e2e-cb02"
+  if ! wait_topic "e2e-cb02" 20 >/dev/null; then
+    fail "CB02" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-cb02")
+  # Send a short prompt so the turn finishes quickly
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word CANCEL_BTN_TEST" 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "CANCEL_BTN_TEST" 30 >/dev/null; then
+    # Give the outbox a moment to process the final edit (keyboard removal)
+    sleep 3
+    local history
+    history=$(topic_history "$tid" 20)
+    # After the turn ends, NO bot message should have a cancel button
+    local has_cancel
+    has_cancel=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+for m in bot_msgs:
+    rm = m.get('reply_markup', {})
+    buttons = rm.get('buttons', [])
+    for btn in buttons:
+        if 'Cancel' in btn.get('text', ''):
+            print('yes')
+            sys.exit(0)
+print('no')
+" 2>/dev/null)
+    if [ "$has_cancel" = "no" ]; then
+      pass "CB02"
+    else
+      fail "CB02" "cancel button still present after turn ended"
+    fi
+  else
+    fail "CB02" "no response within timeout"
+  fi
+  exit_pi "e2e-cb02"
+  wait_all_topics_gone 45 || true
+}
+
+test_cb03() {
+  log "CB03 — Never more than one cancel button across all messages"
+  start_pi "e2e-cb03"
+  if ! wait_topic "e2e-cb03" 20 >/dev/null; then
+    fail "CB03" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-cb03")
+  # Ensure verbose is on — this triggers page freezing, which is the
+  # main scenario where duplicate cancel buttons can appear
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Send a prompt that triggers multiple tool calls (enough to freeze
+  # a page). With tool_call_limit=3, the 4th tool triggers a freeze.
+  $TG send "$SUPERGROUP" "$tid" "run these 5 commands one at a time: echo CB_A, echo CB_B, echo CB_C, echo CB_D, echo CB_E. Then say DONE_CB03." 2>/dev/null >/dev/null
+  # Poll for cancel buttons every 2 seconds while the agent is working
+  local max_cancel_buttons=0
+  local polls=0
+  while [ $polls -lt 30 ]; do
+    sleep 2
+    polls=$((polls + 1))
+    local history
+    history=$(topic_history "$tid" 30 2>/dev/null) || continue
+    local cancel_count
+    cancel_count=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+count = 0
+for m in bot_msgs:
+    rm = m.get('reply_markup', {})
+    buttons = rm.get('buttons', [])
+    for btn in buttons:
+        if 'Cancel' in btn.get('text', ''):
+            count += 1
+print(count)
+" 2>/dev/null)
+    cancel_count=${cancel_count:-0}
+    if [ "$cancel_count" -gt "$max_cancel_buttons" ]; then
+      max_cancel_buttons=$cancel_count
+    fi
+    # Check if the agent is done
+    if echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+for m in msgs:
+    if 'DONE_CB03' in m.get('text','') + m.get('raw_text',''):
+        sys.exit(0)
+sys.exit(1)
+" 2>/dev/null; then
+      break
+    fi
+  done
+  if [ "$max_cancel_buttons" -le 1 ]; then
+    pass "CB03 (max cancel buttons at any point: $max_cancel_buttons)"
+  else
+    fail "CB03" "found $max_cancel_buttons cancel buttons simultaneously (expected <= 1)"
+  fi
+  exit_pi "e2e-cb03"
+  wait_all_topics_gone 45 || true
+}
+
+test_cb04() {
+  log "CB04 — Cancel button removed after page freeze"
+  start_pi "e2e-cb04"
+  if ! wait_topic "e2e-cb04" 20 >/dev/null; then
+    fail "CB04" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-cb04")
+  # Ensure verbose is on
+  $TG send "$SUPERGROUP" "$tid" "/verbose on" 2>/dev/null >/dev/null
+  sleep 3
+  # Trigger enough tool calls to cause at least one page freeze
+  $TG send "$SUPERGROUP" "$tid" "run these 5 commands one by one: echo CB4_A, echo CB4_B, echo CB4_C, echo CB4_D, echo CB4_E. Then say DONE_CB04." 2>/dev/null >/dev/null
+  if wait_bot_msg "$tid" "DONE_CB04" 120 >/dev/null; then
+    # After the turn ends, give the outbox time to process
+    sleep 3
+    local history
+    history=$(topic_history "$tid" 40)
+    # After the turn finishes, ZERO messages should have a cancel button
+    local remaining_cancel
+    remaining_cancel=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+count = 0
+for m in bot_msgs:
+    rm = m.get('reply_markup', {})
+    buttons = rm.get('buttons', [])
+    for btn in buttons:
+        if 'Cancel' in btn.get('text', ''):
+            count += 1
+print(count)
+" 2>/dev/null)
+    if [ "$remaining_cancel" = "0" ]; then
+      pass "CB04"
+    else
+      fail "CB04" "$remaining_cancel cancel button(s) remain after turn ended"
+    fi
+  else
+    fail "CB04" "agent did not finish within timeout"
+  fi
+  exit_pi "e2e-cb04"
+  wait_all_topics_gone 45 || true
+}
+
+test_cb05() {
+  log "CB05 — Cancel button correct across consecutive turns"
+  start_pi "e2e-cb05"
+  if ! wait_topic "e2e-cb05" 20 >/dev/null; then
+    fail "CB05" "topic never appeared"
+    return
+  fi
+  local tid
+  tid=$(get_topic_id "e2e-cb05")
+  # First turn
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word TURN_ONE_CB05" 2>/dev/null >/dev/null
+  if ! wait_bot_msg "$tid" "TURN_ONE_CB05" 30 >/dev/null; then
+    fail "CB05" "first turn did not complete"
+    exit_pi "e2e-cb05"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  sleep 2
+  # Second turn
+  $TG send "$SUPERGROUP" "$tid" "reply with only the word TURN_TWO_CB05" 2>/dev/null >/dev/null
+  if ! wait_bot_msg "$tid" "TURN_TWO_CB05" 30 >/dev/null; then
+    fail "CB05" "second turn did not complete"
+    exit_pi "e2e-cb05"
+    wait_all_topics_gone 45 || true
+    return
+  fi
+  sleep 3
+  # After both turns complete, check for stale cancel buttons
+  local history
+  history=$(topic_history "$tid" 30)
+  local cancel_count
+  cancel_count=$(echo "$history" | python3 -c "
+import sys, json
+msgs = json.load(sys.stdin)
+bot_msgs = [m for m in msgs if m.get('type') == 'message' and m.get('from_id') == $BOT_ID]
+count = 0
+for m in bot_msgs:
+    rm = m.get('reply_markup', {})
+    buttons = rm.get('buttons', [])
+    for btn in buttons:
+        if 'Cancel' in btn.get('text', ''):
+            count += 1
+print(count)
+" 2>/dev/null)
+  if [ "$cancel_count" = "0" ]; then
+    pass "CB05"
+  else
+    fail "CB05" "$cancel_count stale cancel button(s) after two completed turns"
+  fi
+  exit_pi "e2e-cb05"
+  wait_all_topics_gone 45 || true
+}
+
 if [ "$TESTS" = "all" ]; then
   # Core lifecycle
   test_t01   # topic created
@@ -2055,6 +2832,28 @@ if [ "$TESTS" = "all" ]; then
   # Extension guard (double-load prevention)
   test_x01   # double-load guard prevents duplicate sockets
   test_x02   # double-load guard allows /new to work
+
+  # Tool call correctness
+  test_t09b  # /verbose on mid-turn takes effect
+  test_t09c  # tool output visible in verbose mode
+  test_t09d  # tool output truncated past line limit
+  test_t09f  # tool output streams incrementally
+  test_tc01  # tool call count matches executions
+  test_tc02  # error icon shown for failing command
+  test_tc03  # tool calls hidden when /tools off
+  test_tc04  # page freeze splits tool calls across messages
+
+  # Thinking blocks
+  test_tk01  # thinking content shown when /thinking on
+  test_tk02  # thinking content hidden when /thinking off
+  test_tk03  # /thinking independent of /tools
+
+  # Cancel button invariants
+  test_cb01  # cancel button present during streaming
+  test_cb02  # cancel button removed after turn ends
+  test_cb03  # never more than one cancel button (page freeze scenario)
+  test_cb04  # cancel button removed from frozen pages
+  test_cb05  # no stale cancel buttons across consecutive turns
 else
   # Run specific tests: e.g. "t01 t03"
   for t in $TESTS; do

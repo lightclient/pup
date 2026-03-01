@@ -369,6 +369,49 @@ impl Outbox {
         });
     }
 
+    /// Update a pending Send operation in the queue.
+    ///
+    /// Scans the queue for a Send matching `(chat_id, thread_id)` and
+    /// updates its text and reply_markup in-place.  Used by `end_turn`
+    /// to strip the cancel keyboard from messages that haven't been sent
+    /// yet (their message_id is unknown, so we can't enqueue an Edit).
+    ///
+    /// Returns `true` if a matching Send was found and updated.
+    pub fn update_pending_send(
+        &mut self,
+        chat_id: i64,
+        thread_id: Option<i64>,
+        new_text: &str,
+        new_reply_markup: Option<&serde_json::Value>,
+    ) -> bool {
+        // Drain the heap, update the first match, rebuild.
+        let entries: Vec<HeapEntry> = std::mem::take(&mut self.queue).into_vec();
+        let mut found = false;
+        let updated: Vec<HeapEntry> = entries
+            .into_iter()
+            .map(|mut entry| {
+                if !found
+                    && let OutboxOp::Send {
+                        chat_id: ref cid,
+                        message_thread_id: ref tid,
+                        ref mut text,
+                        ref mut reply_markup,
+                        ..
+                    } = entry.op
+                    && *cid == chat_id
+                    && *tid == thread_id
+                {
+                    new_text.clone_into(text);
+                    *reply_markup = new_reply_markup.cloned();
+                    found = true;
+                }
+                entry
+            })
+            .collect();
+        self.queue = BinaryHeap::from(updated);
+        found
+    }
+
     /// Number of pending operations.
     pub fn len(&self) -> usize {
         self.queue.len() + self.pending_edits.len()
