@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::bot::BotClient;
+use crate::outbox::ChatBudget;
 
 /// How long to wait after a session disconnects before deleting its topic.
 /// If a new session with the same working directory connects within this
@@ -124,10 +125,13 @@ pub struct TopicsManager {
     /// Last known session name per working directory.
     /// Persisted so names survive pi and pup restarts.
     cwd_names: HashMap<String, String>,
+    /// Shared per-chat rate limit budget. All API calls targeting the
+    /// supergroup must consume from this before calling the Telegram API.
+    budget: ChatBudget,
 }
 
 impl TopicsManager {
-    pub fn new(chat_id: i64, state_path: PathBuf) -> Self {
+    pub fn new(chat_id: i64, state_path: PathBuf, budget: ChatBudget) -> Self {
         let state = Self::load_state(&state_path);
 
         let thread_sessions: HashMap<i64, String> = state
@@ -157,6 +161,7 @@ impl TopicsManager {
             state_path,
             pending_deletions: HashMap::new(),
             cwd_names: state.cwd_names,
+            budget,
         }
     }
 
@@ -272,6 +277,7 @@ impl TopicsManager {
 
             for thread_id in &stale_threads {
                 info!(thread_id, "deleting stale topic");
+                self.budget.wait_and_consume(self.chat_id).await;
                 match bot.delete_forum_topic(self.chat_id, *thread_id).await {
                     Ok(_) => {
                         info!(thread_id, "stale topic deleted");
@@ -381,6 +387,7 @@ impl TopicsManager {
             }
 
             // Verify it still exists by attempting a rename.
+            self.budget.wait_and_consume(self.chat_id).await;
             match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
                 Ok(_) => {
                     // Topic still alive — reuse it.
@@ -426,6 +433,7 @@ impl TopicsManager {
         let name = self.topic_name(info).await;
         info!(session_id = %info.session_id, topic_name = %name, "creating topic");
 
+        self.budget.wait_and_consume(self.chat_id).await;
         let topic = bot.create_forum_topic(self.chat_id, &name).await?;
         let thread_id = topic.message_thread_id;
 
@@ -455,6 +463,7 @@ impl TopicsManager {
         self.save_state();
 
         info!(session_id, thread_id, "deleting topic");
+        self.budget.wait_and_consume(self.chat_id).await;
         match bot.delete_forum_topic(self.chat_id, thread_id).await {
             Ok(_) => {}
             Err(e) => {
@@ -632,6 +641,7 @@ impl TopicsManager {
 
         info!(session_id = %info.session_id, thread_id, new_name = %name, "renaming topic");
 
+        self.budget.wait_and_consume(self.chat_id).await;
         match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
             Ok(_) => {
                 self.thread_names.insert(thread_id, name);
@@ -678,7 +688,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_with_session_name() {
-        let mut mgr = TopicsManager::new(-1001234, test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path(), ChatBudget::new());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: Some("myproject".to_owned()),
@@ -693,7 +703,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_from_cwd() {
-        let mut mgr = TopicsManager::new(-1001234, test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path(), ChatBudget::new());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: None,
@@ -708,7 +718,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_collision() {
-        let mut mgr = TopicsManager::new(-1001234, test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, test_state_path(), ChatBudget::new());
         let info1 = SessionInfo {
             session_id: "aaa".to_owned(),
             session_name: Some("myproject".to_owned()),

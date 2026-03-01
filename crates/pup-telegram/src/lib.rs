@@ -182,9 +182,9 @@ impl TelegramBackend {
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
-            config
-                .supergroup_id
-                .map(|id| TopicsManager::new(id, config.topics_state_path.clone()))
+            config.supergroup_id.map(|id| {
+                TopicsManager::new(id, config.topics_state_path.clone(), outbox.chat_budget())
+            })
         } else {
             None
         };
@@ -274,8 +274,10 @@ impl TelegramBackend {
             .as_ref()
             .expect("topics checked above")
             .chat_id();
+        let budget = self.outbox.chat_budget();
         for (session_id, thread_id) in expired {
             info!(session_id = %session_id, thread_id, "deleting expired topic");
+            budget.wait_and_consume(chat_id).await;
             if let Err(e) = self.bot.delete_forum_topic(chat_id, thread_id).await {
                 warn!(
                     session_id = %session_id,

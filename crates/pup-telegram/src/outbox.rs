@@ -147,6 +147,19 @@ impl ChatBudget {
             .or_insert_with(|| TokenBucket::new(DEFAULT_CHAT_BUDGET))
             .try_consume()
     }
+
+    /// Wait until a token is available for `chat_id`, then consume it.
+    ///
+    /// Polls every 500ms. Used by callers that must complete (e.g. topic
+    /// management) rather than skip or defer like typing indicators.
+    pub async fn wait_and_consume(&self, chat_id: i64) {
+        loop {
+            if self.try_consume(chat_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
 }
 
 impl Default for ChatBudget {
