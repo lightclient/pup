@@ -5,7 +5,7 @@ mod tracing_setup;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use pup_claude::injector::{ClaudeCommand, ClaudeService, SessionRegistry};
-use pup_core::{ChatBackend, IncomingMessage, SessionEvent, SessionManager};
+use pup_core::{IncomingMessage, SessionEvent, SessionManager};
 use pup_telegram::TelegramBackend;
 use tokio::sync::{mpsc, watch};
 use tracing::{error, info, warn};
@@ -72,57 +72,17 @@ async fn main() -> Result<()> {
     // ── Initialize Telegram backend ─────────────────────────────
 
     if let Some(tg_config) = config.telegram_config() {
-        let (event_tx, mut event_rx) = mpsc::channel::<SessionEvent>(256);
+        let (event_tx, event_rx) = mpsc::channel::<SessionEvent>(256);
         backend_txs.push(event_tx);
 
         let incoming_tx_clone = incoming_tx.clone();
         let shutdown_rx_clone = shutdown_rx.clone();
 
         tokio::spawn(async move {
-            let mut backend = TelegramBackend::new(tg_config);
-
-            // Initialize.
-            if let Err(e) = backend.init().await {
-                error!(error = %e, "telegram backend init failed");
-                return;
-            }
-
-            info!("telegram backend started");
-
-            // Main backend loop.
-            loop {
-                let mut shutdown_watch = shutdown_rx_clone.clone();
-                tokio::select! {
-                    // Handle session events.
-                    Some(event) = event_rx.recv() => {
-                        if let Err(e) = backend.handle_event(event).await {
-                            error!(error = %e, "telegram handle_event failed");
-                        }
-                    }
-                    // Poll for incoming Telegram messages.
-                    result = backend.recv_incoming() => {
-                        match result {
-                            Ok(Some(msg)) => {
-                                let _ = incoming_tx_clone.send(msg).await;
-                            }
-                            Ok(None) => {
-                                info!("telegram backend shut down");
-                                break;
-                            }
-                            Err(e) => {
-                                error!(error = %e, "telegram recv_incoming failed");
-                            }
-                        }
-                    }
-                    // Shutdown.
-                    _ = shutdown_watch.changed() => {
-                        if *shutdown_watch.borrow() {
-                            let _ = backend.shutdown().await;
-                            break;
-                        }
-                    }
-                }
-            }
+            let backend = TelegramBackend::new(tg_config);
+            backend
+                .run(event_rx, incoming_tx_clone, shutdown_rx_clone)
+                .await;
         });
     } else {
         info!("no telegram backend configured");

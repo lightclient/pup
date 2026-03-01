@@ -1284,9 +1284,56 @@ impl ChatBackend for TelegramBackend {
     }
 
     async fn handle_event(&mut self, event: SessionEvent) -> Result<()> {
-        // Check for expired pending topic deletions on every event.
         self.check_pending_deletions().await;
+        self.process_event(event).await?;
+        while self.outbox.flush_one().await {}
+        Ok(())
+    }
 
+    async fn recv_incoming(&mut self) -> Result<Option<IncomingMessage>> {
+        // Legacy polling path — kept for the trait but unused when
+        // `run()` is used.  See `run()` for the concurrent version.
+        loop {
+            self.check_pending_deletions().await;
+
+            match self.bot.get_updates(self.update_offset, 1).await {
+                Ok(updates) => {
+                    for update in updates {
+                        if update.update_id >= self.update_offset {
+                            self.update_offset = update.update_id + 1;
+                        }
+                        self.handle_update(update).await;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to poll Telegram updates");
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+
+            while self.outbox.flush_one().await {}
+
+            if let Some(ref mut rx) = self.incoming_rx {
+                match rx.try_recv() {
+                    Ok(msg) => return Ok(Some(msg)),
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
+                }
+            }
+        }
+    }
+
+    async fn shutdown(&mut self) -> Result<()> {
+        self.shutdown_inner().await
+    }
+}
+
+impl TelegramBackend {
+    /// Core event handling without outbox flush or deletion checks.
+    ///
+    /// Called by `run()` (timer-based flush) and `handle_event` (sync flush).
+    #[allow(clippy::too_many_lines)]
+    async fn process_event(&mut self, event: SessionEvent) -> Result<()> {
         match event {
             SessionEvent::Connected { ref info } => {
                 self.sessions.push(info.clone());
@@ -1487,8 +1534,6 @@ impl ChatBackend for TelegramBackend {
                 // keyboard) goes through even if a recent content edit just ran.
                 self.outbox.clear_edit_cooldown();
                 self.turn_tracker.end_turn(session_id, &mut self.outbox);
-                // Flush any remaining outbox operations.
-                while self.outbox.flush_one().await {}
             }
             SessionEvent::MessageStart { .. } => {
                 // Nothing to do — the turn tracker already has the message.
@@ -1603,65 +1648,133 @@ impl ChatBackend for TelegramBackend {
             }
         }
 
-        // Flush outbox after each event batch.
-        while self.outbox.flush_one().await {}
-
         Ok(())
     }
 
-    async fn recv_incoming(&mut self) -> Result<Option<IncomingMessage>> {
-        loop {
-            // Check for expired pending topic deletions (~once per second).
-            self.check_pending_deletions().await;
+    /// Run the Telegram backend with internal concurrency.
+    ///
+    /// Replaces the `ChatBackend` trait's alternating `handle_event` /
+    /// `recv_incoming` model with a single `select!` loop where:
+    ///
+    ///   - A dedicated task long-polls Telegram for updates (non-blocking)
+    ///   - Session events are processed immediately when available
+    ///   - The outbox flushes on a timer instead of blocking after events
+    ///   - Incoming user messages are forwarded continuously
+    ///
+    /// This method takes ownership; the backend runs until shutdown.
+    pub async fn run(
+        mut self,
+        mut event_rx: mpsc::Receiver<SessionEvent>,
+        incoming_tx: mpsc::Sender<IncomingMessage>,
+        mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    ) {
+        if let Err(e) = self.init().await {
+            tracing::error!(error = %e, "telegram backend init failed");
+            return;
+        }
 
-            // Short poll (1s) so the outer select! loop can preempt us
-            // between iterations to process session events (agent
-            // responses, typing indicators, etc.).
-            match self.bot.get_updates(self.update_offset, 1).await {
-                Ok(updates) => {
-                    for update in updates {
-                        if update.update_id >= self.update_offset {
-                            self.update_offset = update.update_id + 1;
+        info!("telegram backend started");
+
+        // Spawn a dedicated Telegram update poller.
+        //
+        // Long-polls with a 5-second timeout so updates arrive
+        // promptly without burning CPU.  The channel buffers batches
+        // for the main select! loop.
+        let (update_tx, mut update_rx) = mpsc::channel::<Vec<Update>>(16);
+        {
+            let bot = self.bot.clone();
+            let mut offset = self.update_offset;
+            tokio::spawn(async move {
+                loop {
+                    match bot.get_updates(offset, 5).await {
+                        Ok(updates) => {
+                            for u in &updates {
+                                if u.update_id >= offset {
+                                    offset = u.update_id + 1;
+                                }
+                            }
+                            if !updates.is_empty() && update_tx.send(updates).await.is_err() {
+                                break;
+                            }
                         }
+                        Err(e) => {
+                            warn!(error = %e, "telegram poller: failed to get updates");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        }
+                    }
+                }
+                debug!("telegram update poller exiting");
+            });
+        }
+
+        // Outbox flush timer: every 50ms.  `flush_one` has its own
+        // internal rate limiting (global 33ms min interval, per-chat
+        // token bucket, per-message edit cooldown) so calling it
+        // frequently is safe — it returns immediately when blocked.
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Pending topic-deletion check (~1/sec).
+        let mut deletion_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        deletion_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                biased; // prioritize events and updates over timers
+
+                // ── Session events from the session manager ─────
+                Some(event) = event_rx.recv() => {
+                    if let Err(e) = self.process_event(event).await {
+                        tracing::error!(error = %e, "telegram handle_event failed");
+                    }
+                }
+
+                // ── Telegram updates from the dedicated poller ──
+                Some(updates) = update_rx.recv() => {
+                    for update in updates {
                         self.handle_update(update).await;
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "failed to poll Telegram updates");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                // ── Outbox drain ────────────────────────────────
+                _ = flush_tick.tick() => {
+                    self.outbox.flush_one().await;
+                }
+
+                // ── Pending topic-deletion check ────────────────
+                _ = deletion_tick.tick() => {
+                    self.check_pending_deletions().await;
+                }
+
+                // ── Shutdown ────────────────────────────────────
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        let _ = self.shutdown_inner().await;
+                        break;
+                    }
                 }
             }
 
-            // Flush any outbox messages enqueued by handle_update
-            // (e.g. interactive prompts for commands like /name).
-            while self.outbox.flush_one().await {}
-
-            // Drain any incoming messages generated by handle_update.
+            // Forward any queued incoming messages to the session manager.
             if let Some(ref mut rx) = self.incoming_rx {
-                match rx.try_recv() {
-                    Ok(msg) => return Ok(Some(msg)),
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        // No messages — loop back for another short poll.
-                        // The select! in the main loop can preempt us at
-                        // the next .await (the getUpdates call).
+                while let Ok(msg) = rx.try_recv() {
+                    if incoming_tx.send(msg).await.is_err() {
+                        break;
                     }
-                    Err(mpsc::error::TryRecvError::Disconnected) => return Ok(None),
                 }
             }
         }
+
+        info!("telegram backend stopped");
     }
 
-    async fn shutdown(&mut self) -> Result<()> {
+    async fn shutdown_inner(&mut self) -> Result<()> {
         info!("shutting down telegram backend");
 
-        // Cancel any pending topic deletions so their mappings are
-        // preserved across pup restarts.  If the sessions are still
-        // alive when pup comes back, their topics will be reused.
         if let Some(ref mut topics) = self.topics {
             topics.cancel_all_pending();
         }
 
-        // Best-effort flush of outbox.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while !self.outbox.is_empty() && tokio::time::Instant::now() < deadline {
             if !self.outbox.flush_one().await {
