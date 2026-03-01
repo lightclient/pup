@@ -197,13 +197,38 @@ struct TurnState {
     streaming_complete: bool,
 }
 
+/// Find the byte position just past the last sentence-ending punctuation
+/// that is followed by a space (e.g. `". "`, `"! "`, `"? "`).
+///
+/// Returns `None` when no such boundary exists.
+fn rfind_sentence_end(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    // Need at least 2 bytes for "X " where X is punctuation.
+    if bytes.len() < 2 {
+        return None;
+    }
+    // Walk backwards looking for `. `, `! `, `? `.
+    for i in (0..bytes.len() - 1).rev() {
+        if (bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?') && bytes[i + 1] == b' ' {
+            return Some(i + 2); // include the punctuation and the space
+        }
+    }
+    None
+}
+
 impl TurnState {
-    /// Return the streaming text to display, snapped to paragraph boundaries.
+    /// Return the streaming text to display, snapped to a natural boundary.
     ///
-    /// During active streaming, only text up to (and including) the last
-    /// `\n\n` is returned so that Telegram edits don't cut off mid-sentence.
-    /// If no paragraph break exists yet the full text is returned so the
-    /// first paragraph streams naturally.
+    /// During active streaming we trim back to the last "clean" break so
+    /// that Telegram edits never show a half-finished sentence.  The
+    /// hierarchy (best → worst) is:
+    ///
+    ///  1. Paragraph break (`\n\n`)
+    ///  2. Line break (`\n`) — catches bullet lists, headings, etc.
+    ///  3. Sentence-ending punctuation followed by a space (`. `, `! `, `? `)
+    ///
+    /// If none of those exist the full (short) buffer is returned so the
+    /// very first sentence still streams naturally.
     ///
     /// Once the streaming message is complete (`streaming_complete` is set),
     /// the full text is always returned.
@@ -211,11 +236,28 @@ impl TurnState {
         if self.streaming_complete {
             return &self.streaming_text;
         }
-        if let Some(pos) = self.streaming_text.rfind("\n\n") {
-            &self.streaming_text[..pos + 2]
-        } else {
-            &self.streaming_text
+
+        let text = &self.streaming_text;
+
+        // 1. Paragraph break — strongest signal.
+        if let Some(pos) = text.rfind("\n\n") {
+            return &text[..pos + 2];
         }
+
+        // 2. Line break — bullet lists, numbered items, headings.
+        if let Some(pos) = text.rfind('\n') {
+            return &text[..=pos];
+        }
+
+        // 3. Sentence-ending punctuation followed by a space.
+        //    Search backwards for `. `, `! `, or `? `.
+        if let Some(pos) = rfind_sentence_end(text) {
+            return &text[..pos];
+        }
+
+        // Nothing found — show what we have (first sentence still
+        // streaming in).
+        text
     }
 
     /// Tools on the current page (from `page_start` to end).
@@ -1374,7 +1416,7 @@ mod tests {
         assert!(rendered.contains("<b>Bash</b>"));
     }
 
-    // ── display_text paragraph buffering ────────────────────────
+    // ── display_text natural-break buffering ──────────────────────
 
     fn make_text_state(text: &str, complete: bool) -> TurnState {
         make_render_state(
@@ -1390,26 +1432,83 @@ mod tests {
         )
     }
 
+    // ── rfind_sentence_end unit tests ───────────────────────────
+
     #[test]
-    fn display_text_no_paragraph_break_shows_all() {
-        let state = make_text_state("Hello world, still writing", false);
-        assert_eq!(state.display_text(), "Hello world, still writing");
+    fn sentence_end_period_space() {
+        assert_eq!(rfind_sentence_end("Hello world. Next"), Some(13));
     }
 
     #[test]
-    fn display_text_with_paragraph_break_snaps_to_boundary() {
-        let state = make_text_state("First paragraph.\n\nSecond paragraph being wri", false);
+    fn sentence_end_exclamation() {
+        assert_eq!(rfind_sentence_end("Wow! Next"), Some(5));
+    }
+
+    #[test]
+    fn sentence_end_question() {
+        assert_eq!(rfind_sentence_end("Really? Yes"), Some(8));
+    }
+
+    #[test]
+    fn sentence_end_none_when_no_space_after() {
+        assert_eq!(rfind_sentence_end("end."), None);
+    }
+
+    #[test]
+    fn sentence_end_none_empty() {
+        assert_eq!(rfind_sentence_end(""), None);
+    }
+
+    #[test]
+    fn sentence_end_picks_last() {
+        assert_eq!(rfind_sentence_end("A. B. C still wri"), Some(6));
+    }
+
+    // ── display_text ────────────────────────────────────────────
+
+    #[test]
+    fn display_text_no_break_shows_all() {
+        // Very first sentence still streaming — nothing to snap to.
+        let state = make_text_state("Hello world still writing", false);
+        assert_eq!(state.display_text(), "Hello world still writing");
+    }
+
+    #[test]
+    fn display_text_paragraph_break() {
+        let state = make_text_state("First paragraph.\n\nSecond being wri", false);
         assert_eq!(state.display_text(), "First paragraph.\n\n");
     }
 
     #[test]
-    fn display_text_multiple_paragraphs_shows_all_complete() {
+    fn display_text_line_break() {
+        // No paragraph break, but a single newline (e.g. bullet list).
+        // Snaps to the last complete line.
+        let state = make_text_state("- item one\n- item two still wr", false);
+        assert_eq!(state.display_text(), "- item one\n");
+    }
+
+    #[test]
+    fn display_text_line_break_preferred_over_sentence() {
+        // Both a line break and sentence end — line break wins (higher priority).
+        let state = make_text_state("Done sentence. More text\nBullet still wr", false);
+        assert_eq!(state.display_text(), "Done sentence. More text\n");
+    }
+
+    #[test]
+    fn display_text_sentence_boundary() {
+        // No line/paragraph break, but a sentence boundary exists.
+        let state = make_text_state("First sentence. Second sentence still wri", false);
+        assert_eq!(state.display_text(), "First sentence. ");
+    }
+
+    #[test]
+    fn display_text_multiple_paragraphs() {
         let state = make_text_state("Para 1.\n\nPara 2.\n\nPara 3 still writing", false);
         assert_eq!(state.display_text(), "Para 1.\n\nPara 2.\n\n");
     }
 
     #[test]
-    fn display_text_text_ending_with_break_shows_all() {
+    fn display_text_ending_with_break() {
         let state = make_text_state("Complete paragraph.\n\n", false);
         assert_eq!(state.display_text(), "Complete paragraph.\n\n");
     }
@@ -1431,9 +1530,9 @@ mod tests {
 
     #[test]
     fn render_uses_display_text_not_full_streaming_text() {
-        let state = make_text_state("Done paragraph.\n\nPartial next", false);
+        let state = make_text_state("Done sentence.\n\nPartial next", false);
         let rendered = state.render_parts(true);
-        assert!(rendered.contains("Done paragraph."));
+        assert!(rendered.contains("Done sentence."));
         assert!(!rendered.contains("Partial next"));
     }
 
