@@ -468,8 +468,10 @@ impl TurnState {
             dest.try_resolve_message_id();
 
             // Freeze the current live message (remove keyboard).
+            // Use urgent priority so this edit is processed before the
+            // next ensure_message Send, preventing dual cancel buttons.
             if let Some(msg_id) = dest.live_message_id {
-                outbox.enqueue(OutboxOp::Edit {
+                outbox.enqueue_edit_urgent(OutboxOp::Edit {
                     chat_id: dest.chat_id,
                     message_id: msg_id,
                     text: frozen_display.clone(),
@@ -1028,10 +1030,12 @@ impl TurnTracker {
             if let Some(msg_id) = dest.live_message_id {
                 if has_verbose_on_page && has_text {
                     // Edit the live message to show only tools/thinking.
+                    // Urgent so the keyboard removal goes through before
+                    // the next turn's cancel-button message.
                     if let Some(ref chunks) = summary_chunks
                         && let Some(first) = chunks.first()
                     {
-                        outbox.enqueue(OutboxOp::Edit {
+                        outbox.enqueue_edit_urgent(OutboxOp::Edit {
                             chat_id: dest.chat_id,
                             message_id: msg_id,
                             text: first.clone(),
@@ -1057,7 +1061,7 @@ impl TurnTracker {
                     // No verbose content on this page: just remove keyboard.
                     if let Some(ref chunks) = rendered_chunks {
                         if let Some(first) = chunks.first() {
-                            outbox.enqueue(OutboxOp::Edit {
+                            outbox.enqueue_edit_urgent(OutboxOp::Edit {
                                 chat_id: dest.chat_id,
                                 message_id: msg_id,
                                 text: first.clone(),
@@ -1081,7 +1085,7 @@ impl TurnTracker {
                     if let Some(ref chunks) = no_text_chunks
                         && let Some(first) = chunks.first()
                     {
-                        outbox.enqueue(OutboxOp::Edit {
+                        outbox.enqueue_edit_urgent(OutboxOp::Edit {
                             chat_id: dest.chat_id,
                             message_id: msg_id,
                             text: first.clone(),

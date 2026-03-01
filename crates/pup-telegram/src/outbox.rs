@@ -326,6 +326,36 @@ impl Outbox {
         }
     }
 
+    /// Enqueue an edit at Send priority in the main queue.
+    ///
+    /// Bypasses the coalescing edit map so the edit is processed
+    /// before any new Send operations queued after it. Used for
+    /// keyboard-removal edits that must complete before the next
+    /// cancel-button message is sent.
+    pub fn enqueue_edit_urgent(&mut self, op: OutboxOp) {
+        // Remove any coalesced edit for the same message so it
+        // doesn't overwrite this one later.
+        if let OutboxOp::Edit {
+            chat_id,
+            message_id,
+            ..
+        } = &op
+        {
+            let key = (*chat_id, *message_id);
+            if self.pending_edits.entries.remove(&key).is_some() {
+                self.pending_edits.order.retain(|k| *k != key);
+            }
+        }
+
+        let seq = self.seq_counter;
+        self.seq_counter += 1;
+        self.queue.push(HeapEntry {
+            op,
+            priority: OpPriority::Send, // same priority as sends
+            seq,
+        });
+    }
+
     /// Number of pending operations.
     pub fn len(&self) -> usize {
         self.queue.len() + self.pending_edits.len()
