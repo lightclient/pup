@@ -44,6 +44,9 @@ pub(crate) struct DisplayConfig {
     /// Show tool call details.
     #[serde(default)]
     pub tools: Option<bool>,
+    /// Display mode: "compact" (default) or "full".
+    #[serde(default)]
+    pub mode: DisplayModeConfig,
     #[serde(default = "default_history_turns")]
     pub history_turns: usize,
     /// How many tool calls to keep in the rendered message.
@@ -58,12 +61,37 @@ pub(crate) struct DisplayConfig {
     pub tool_output_lines: ToolOutputLinesValue,
 }
 
+/// Display mode config value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DisplayModeConfig {
+    #[default]
+    Compact,
+    Full,
+}
+
+impl<'de> Deserialize<'de> for DisplayModeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_ascii_lowercase().as_str() {
+            "compact" => Ok(Self::Compact),
+            "full" => Ok(Self::Full),
+            _ => Err(serde::de::Error::custom(format!(
+                "unknown display mode \"{s}\", expected \"compact\" or \"full\""
+            ))),
+        }
+    }
+}
+
 impl Default for DisplayConfig {
     fn default() -> Self {
         Self {
             verbose: false,
             thinking: None,
             tools: None,
+            mode: DisplayModeConfig::default(),
             history_turns: 5,
             tool_calls: default_tool_calls(),
             tool_output_lines: default_tool_output_lines(),
@@ -360,6 +388,11 @@ impl Config {
             }
         };
 
+        let display_mode = match self.display.mode {
+            DisplayModeConfig::Compact => pup_telegram::turn_tracker::DisplayMode::Compact,
+            DisplayModeConfig::Full => pup_telegram::turn_tracker::DisplayMode::Full,
+        };
+
         Some(pup_telegram::TelegramConfig {
             bot_token: tg.bot_token.clone(),
             allowed_user_ids: tg.allowed_user_ids.clone(),
@@ -376,6 +409,7 @@ impl Config {
             voice: tg.voice,
             tool_call_limit,
             tool_output_lines,
+            display_mode,
         })
     }
 }
@@ -603,5 +637,72 @@ allowed_user_ids = [12345678]
             tg.tool_output_lines,
             pup_telegram::turn_tracker::ToolOutputLines::First(0)
         );
+    }
+
+    #[test]
+    fn test_display_mode_default() {
+        let toml = r#"
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.display.mode, DisplayModeConfig::Compact);
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.display_mode,
+            pup_telegram::turn_tracker::DisplayMode::Compact
+        );
+    }
+
+    #[test]
+    fn test_display_mode_compact() {
+        let toml = r#"
+[display]
+mode = "compact"
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.display.mode, DisplayModeConfig::Compact);
+    }
+
+    #[test]
+    fn test_display_mode_full() {
+        let toml = r#"
+[display]
+mode = "full"
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let config: Config = toml::from_str(toml).expect("parse");
+        assert_eq!(config.display.mode, DisplayModeConfig::Full);
+        let tg = config.telegram_config().expect("telegram config");
+        assert_eq!(
+            tg.display_mode,
+            pup_telegram::turn_tracker::DisplayMode::Full
+        );
+    }
+
+    #[test]
+    fn test_display_mode_invalid() {
+        let toml = r#"
+[display]
+mode = "fancy"
+
+[backends.telegram]
+enabled = true
+bot_token = "123456:ABC"
+allowed_user_ids = [12345678]
+"#;
+        let result: Result<Config, _> = toml::from_str(toml);
+        assert!(result.is_err());
     }
 }

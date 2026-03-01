@@ -9,6 +9,19 @@ use crate::render::{
     MAX_BODY_CHARS, cancel_keyboard, empty_keyboard, escape_html, split_message, to_telegram_html,
 };
 
+/// Display mode for verbose turn rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DisplayMode {
+    /// Full tool output and thinking inline, multi-message page freezing.
+    /// This is the legacy/"temporal" mode.
+    #[default]
+    Full,
+    /// Compact one-line-per-tool progress indicator during the turn.
+    /// No tool output shown, no page freezing. Final text sent as a
+    /// separate message when the turn ends.
+    Compact,
+}
+
 /// How many completed tool calls to accumulate before freezing the
 /// current message and starting a new one below it.
 ///
@@ -186,6 +199,8 @@ struct TurnState {
     tool_call_limit: ToolCallLimit,
     /// How many lines of tool output to show per tool call.
     tool_output_lines: ToolOutputLines,
+    /// Display mode (Full or Compact).
+    display_mode: DisplayMode,
     /// Tracked tool calls in order.
     tools: Vec<TrackedTool>,
     /// Index into `tools` where the current page starts.
@@ -404,7 +419,89 @@ impl TurnState {
 
     /// Render the full live-message content (tools + thinking + text).
     fn render(&self) -> String {
-        self.render_parts(true)
+        match self.display_mode {
+            DisplayMode::Compact => self.render_compact(),
+            DisplayMode::Full => self.render_parts(true),
+        }
+    }
+
+    /// Render a compact one-line-per-tool progress indicator.
+    ///
+    /// No tool output is shown inline — just the tool name, a short arg
+    /// summary, and a result summary (line count or "error").
+    /// Thinking is shown as a one-line indicator at the top.
+    /// Streaming text is NOT shown (it goes as a separate message at
+    /// turn end).
+    fn render_compact(&self) -> String {
+        let mut parts = Vec::new();
+
+        // Thinking indicator.
+        if self.show_thinking
+            && (self.thinking || !self.thinking_text.is_empty())
+            && self.streaming_text.is_empty()
+        {
+            if self.thinking_text.is_empty() {
+                parts.push("⏳ <i>Thinking…</i>".to_owned());
+            } else {
+                const MAX_PREVIEW: usize = 100;
+                let preview = if self.thinking_text.len() > MAX_PREVIEW {
+                    let end = self.thinking_text.floor_char_boundary(MAX_PREVIEW);
+                    format!("⏳ <i>{}…</i>", escape_html(&self.thinking_text[..end]))
+                } else {
+                    format!("⏳ <i>{}</i>", escape_html(&self.thinking_text))
+                };
+                parts.push(preview);
+            }
+        }
+
+        // One line per tool call.
+        if self.show_tools {
+            for tool in &self.tools {
+                use std::fmt::Write;
+                let status = if !tool.done {
+                    "▸ "
+                } else if tool.is_error {
+                    "✗ "
+                } else {
+                    "✓ "
+                };
+                let mut line = format!("{status}<b>{}</b>", escape_html(&tool.tool_name));
+                // Short arg summary.
+                if let Some(cmd) = tool.args.get("command").and_then(|v| v.as_str()) {
+                    let short = if cmd.len() > 60 {
+                        let end = cmd.floor_char_boundary(60);
+                        format!("{}…", &cmd[..end])
+                    } else {
+                        cmd.to_owned()
+                    };
+                    let _ = write!(line, " <code>{}</code>", escape_html(&short));
+                } else if let Some(path) = tool.args.get("path").and_then(|v| v.as_str()) {
+                    let _ = write!(line, " <code>{}</code>", escape_html(path));
+                }
+                // Result summary (only when done).
+                if tool.done && !tool.content.is_empty() {
+                    let line_count = tool.content.lines().count();
+                    if tool.is_error {
+                        line.push_str(" <i>(error)</i>");
+                    } else if line_count > 0 {
+                        let _ = write!(line, " <i>({line_count} lines)</i>");
+                    }
+                }
+                parts.push(line);
+            }
+        }
+
+        if parts.is_empty() {
+            "…".to_owned()
+        } else {
+            parts.join("\n")
+        }
+    }
+
+    /// Render compact summary for the final frozen state (no keyboard).
+    /// Same as `render_compact` but used at turn end.
+    fn render_compact_summary(&self) -> String {
+        self.render_compact()
     }
 
     /// Enqueue an edit for the live message in all destinations.
@@ -519,6 +616,8 @@ pub struct TurnTracker {
     tool_call_limit: ToolCallLimit,
     /// How many lines of tool output to show per tool call.
     tool_output_lines: ToolOutputLines,
+    /// Display mode for verbose rendering.
+    display_mode: DisplayMode,
 }
 
 impl TurnTracker {
@@ -532,6 +631,15 @@ impl TurnTracker {
             session_tools: HashMap::new(),
             tool_call_limit: ToolCallLimit::default(),
             tool_output_lines: ToolOutputLines::default(),
+            display_mode: DisplayMode::default(),
+        }
+    }
+
+    /// Set the display mode.
+    pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        self.display_mode = mode;
+        for state in self.turns.values_mut() {
+            state.display_mode = mode;
         }
     }
 
@@ -668,6 +776,7 @@ impl TurnTracker {
                 show_tools: self.is_tools(session_id),
                 tool_call_limit: self.tool_call_limit,
                 tool_output_lines: self.tool_output_lines,
+                display_mode: self.display_mode,
                 tools: Vec::new(),
                 page_start: 0,
                 last_display_len: 0,
@@ -782,6 +891,10 @@ impl TurnTracker {
         let Some(state) = self.turns.get_mut(session_id) else {
             return;
         };
+        // Compact mode never freezes pages — everything stays in one message.
+        if state.display_mode == DisplayMode::Compact {
+            return;
+        }
         if state.page_full() {
             state.freeze_and_advance(outbox);
         }
@@ -999,6 +1112,142 @@ impl TurnTracker {
             dest.try_resolve_message_id();
         }
 
+        // ── Compact mode ──────────────────────────────────────────
+        // In compact mode the live message is a progress indicator.
+        // At turn end it becomes the final summary, and the assistant
+        // text (if any) is sent as a separate message below.
+        if state.display_mode == DisplayMode::Compact {
+            let has_verbose = (state.show_tools && !state.tools.is_empty())
+                || (state.show_thinking && !state.thinking_text.is_empty());
+            let has_text = !state.streaming_text.is_empty();
+
+            let summary = if has_verbose {
+                state.render_compact_summary()
+            } else {
+                String::new()
+            };
+
+            let text_chunks = if has_text {
+                let html = to_telegram_html(&state.streaming_text);
+                if html.is_empty() {
+                    None
+                } else {
+                    Some(split_message(&html, MAX_BODY_CHARS))
+                }
+            } else {
+                None
+            };
+
+            for dest in &state.destinations {
+                if let Some(msg_id) = dest.live_message_id {
+                    if has_verbose {
+                        // Edit live message to final summary (no keyboard).
+                        outbox.enqueue_edit_urgent(OutboxOp::Edit {
+                            chat_id: dest.chat_id,
+                            message_id: msg_id,
+                            text: summary.clone(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: Some(empty_keyboard()),
+                        });
+                        // Send final text as separate message.
+                        if let Some(ref chunks) = text_chunks {
+                            for chunk in chunks {
+                                outbox.enqueue(OutboxOp::Send {
+                                    chat_id: dest.chat_id,
+                                    text: chunk.clone(),
+                                    parse_mode: Some("HTML".to_owned()),
+                                    reply_markup: None,
+                                    message_thread_id: dest.thread_id,
+                                    result_tx: None,
+                                });
+                            }
+                        }
+                    } else if has_text {
+                        // No verbose content, just finalize text.
+                        let html = to_telegram_html(&state.streaming_text);
+                        let chunks = split_message(&html, MAX_BODY_CHARS);
+                        if let Some(first) = chunks.first() {
+                            outbox.enqueue_edit_urgent(OutboxOp::Edit {
+                                chat_id: dest.chat_id,
+                                message_id: msg_id,
+                                text: first.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: Some(empty_keyboard()),
+                            });
+                        }
+                        for chunk in chunks.iter().skip(1) {
+                            outbox.enqueue(OutboxOp::Send {
+                                chat_id: dest.chat_id,
+                                text: chunk.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: dest.thread_id,
+                                result_tx: None,
+                            });
+                        }
+                    } else {
+                        // No text, no verbose — just remove keyboard.
+                        outbox.enqueue_edit_urgent(OutboxOp::Edit {
+                            chat_id: dest.chat_id,
+                            message_id: msg_id,
+                            text: summary.clone(),
+                            parse_mode: Some("HTML".to_owned()),
+                            reply_markup: Some(empty_keyboard()),
+                        });
+                    }
+                } else if dest.send_pending {
+                    // Pending send — update in-place.
+                    let final_text = if has_verbose {
+                        summary.clone()
+                    } else if has_text {
+                        let html = to_telegram_html(&state.streaming_text);
+                        let chunks = split_message(&html, MAX_BODY_CHARS);
+                        chunks.first().cloned().unwrap_or_else(|| "…".to_owned())
+                    } else {
+                        summary.clone()
+                    };
+                    let keyboard = empty_keyboard();
+                    outbox.update_pending_send(
+                        dest.chat_id,
+                        dest.thread_id,
+                        &final_text,
+                        Some(&keyboard),
+                    );
+                    if has_verbose
+                        && has_text
+                        && let Some(ref chunks) = text_chunks
+                    {
+                        for chunk in chunks {
+                            outbox.enqueue(OutboxOp::Send {
+                                chat_id: dest.chat_id,
+                                text: chunk.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: dest.thread_id,
+                                result_tx: None,
+                            });
+                        }
+                    }
+                } else if has_text {
+                    // No live message at all — just send the text.
+                    if let Some(ref chunks) = text_chunks {
+                        for chunk in chunks {
+                            outbox.enqueue(OutboxOp::Send {
+                                chat_id: dest.chat_id,
+                                text: chunk.clone(),
+                                parse_mode: Some("HTML".to_owned()),
+                                reply_markup: None,
+                                message_thread_id: dest.thread_id,
+                                result_tx: None,
+                            });
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // ── Full mode ────────────────────────────────────────────
         // Check for verbose content on the *current page* only.
         // Earlier pages were already frozen into their own messages.
         let has_verbose_on_page = (state.show_tools && state.page_start < state.tools.len())
@@ -1309,6 +1558,7 @@ mod tests {
             show_tools,
             tool_call_limit,
             tool_output_lines,
+            display_mode: DisplayMode::Full,
             tools,
             page_start: 0,
             last_display_len: 0,
@@ -2051,5 +2301,266 @@ mod tests {
         assert!(frozen.contains("out-b"));
         assert!(!frozen.contains("Third"));
         assert!(!frozen.contains("out-c"));
+    }
+
+    // ── Compact mode rendering tests ──────────────────────────
+
+    fn make_compact_state(
+        show_thinking: bool,
+        show_tools: bool,
+        tools: Vec<TrackedTool>,
+        streaming_text: &str,
+        thinking: bool,
+        thinking_text: &str,
+    ) -> TurnState {
+        TurnState {
+            session_id: "s1".to_owned(),
+            destinations: vec![],
+            streaming_text: streaming_text.to_owned(),
+            thinking,
+            thinking_text: thinking_text.to_owned(),
+            last_edit: Instant::now(),
+            dirty: false,
+            show_thinking,
+            show_tools,
+            tool_call_limit: ToolCallLimit::All,
+            tool_output_lines: ToolOutputLines::First(10),
+            display_mode: DisplayMode::Compact,
+            tools,
+            page_start: 0,
+            last_display_len: 0,
+            streaming_complete: false,
+        }
+    }
+
+    #[test]
+    fn compact_thinking_only() {
+        let state = make_compact_state(true, true, vec![], "", true, "");
+        let rendered = state.render();
+        assert_eq!(rendered, "⏳ <i>Thinking…</i>");
+    }
+
+    #[test]
+    fn compact_thinking_with_text() {
+        let state = make_compact_state(true, true, vec![], "", true, "Let me analyze this");
+        let rendered = state.render();
+        assert!(rendered.contains("⏳"));
+        assert!(rendered.contains("Let me analyze this"));
+    }
+
+    #[test]
+    fn compact_thinking_truncated() {
+        let long = "x".repeat(200);
+        let state = make_compact_state(true, true, vec![], "", true, &long);
+        let rendered = state.render();
+        assert!(rendered.contains("…</i>"));
+        // Should be truncated to ~100 chars.
+        assert!(rendered.len() < 200);
+    }
+
+    #[test]
+    fn compact_running_tool() {
+        let state = make_compact_state(
+            false,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "echo hello"}),
+                content: String::new(),
+                is_error: false,
+                done: false,
+            }],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        assert!(rendered.contains("▸ <b>Bash</b>"));
+        assert!(rendered.contains("echo hello"));
+        // No output shown.
+        assert!(!rendered.contains("lines"));
+    }
+
+    #[test]
+    fn compact_done_tool_shows_line_count() {
+        let state = make_compact_state(
+            false,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "foo\nbar\nbaz\n".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        assert!(rendered.contains("✓ <b>Bash</b>"));
+        assert!(rendered.contains("(3 lines)"));
+        // No raw output shown.
+        assert!(!rendered.contains("foo"));
+        assert!(!rendered.contains("bar"));
+    }
+
+    #[test]
+    fn compact_error_tool() {
+        let state = make_compact_state(
+            false,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "false"}),
+                content: "exit code 1".to_owned(),
+                is_error: true,
+                done: true,
+            }],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        assert!(rendered.contains("✗ <b>Bash</b>"));
+        assert!(rendered.contains("(error)"));
+    }
+
+    #[test]
+    fn compact_multiple_tools() {
+        let state = make_compact_state(
+            false,
+            true,
+            vec![
+                TrackedTool {
+                    tool_call_id: "t1".to_owned(),
+                    tool_name: "Bash".to_owned(),
+                    args: serde_json::json!({"command": "echo hello"}),
+                    content: "hello\n".to_owned(),
+                    is_error: false,
+                    done: true,
+                },
+                TrackedTool {
+                    tool_call_id: "t2".to_owned(),
+                    tool_name: "Read".to_owned(),
+                    args: serde_json::json!({"path": "src/main.rs"}),
+                    content: String::new(),
+                    is_error: false,
+                    done: false,
+                },
+            ],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        assert!(rendered.contains("✓ <b>Bash</b>"));
+        assert!(rendered.contains("▸ <b>Read</b>"));
+        assert!(rendered.contains("src/main.rs"));
+        // Lines are \n-separated, not \n\n.
+        assert!(!rendered.contains("\n\n"));
+    }
+
+    #[test]
+    fn compact_thinking_plus_tools() {
+        let state = make_compact_state(
+            true,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "file.txt\n".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+            "",
+            true,
+            "Analyzing the codebase",
+        );
+        let rendered = state.render();
+        // Thinking first, then tool.
+        let thinking_pos = rendered.find("⏳").expect("thinking indicator");
+        let tool_pos = rendered.find("✓").expect("done tool marker");
+        assert!(thinking_pos < tool_pos);
+    }
+
+    #[test]
+    fn compact_no_streaming_text_during_turn() {
+        // Even with streaming text, compact mode doesn't show it.
+        let state = make_compact_state(
+            false,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "file.txt\n".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+            "Here is the result...",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        // Tool is shown.
+        assert!(rendered.contains("✓ <b>Bash</b>"));
+        // Streaming text is NOT shown in compact render.
+        assert!(!rendered.contains("Here is the result"));
+    }
+
+    #[test]
+    fn compact_command_truncation() {
+        let long_cmd = "x".repeat(100);
+        let state = make_compact_state(
+            false,
+            true,
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": long_cmd}),
+                content: String::new(),
+                is_error: false,
+                done: false,
+            }],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        assert!(rendered.contains("…</code>"));
+    }
+
+    #[test]
+    fn compact_empty_state() {
+        let state = make_compact_state(false, false, vec![], "", false, "");
+        let rendered = state.render();
+        assert_eq!(rendered, "…");
+    }
+
+    #[test]
+    fn compact_tools_hidden_when_show_tools_false() {
+        let state = make_compact_state(
+            false,
+            false, // show_tools = false
+            vec![TrackedTool {
+                tool_call_id: "t1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                args: serde_json::json!({"command": "ls"}),
+                content: "file.txt\n".to_owned(),
+                is_error: false,
+                done: true,
+            }],
+            "",
+            false,
+            "",
+        );
+        let rendered = state.render();
+        // No tool shown when show_tools is false.
+        assert_eq!(rendered, "…");
     }
 }

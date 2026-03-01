@@ -131,6 +131,8 @@ pub struct TelegramConfig {
     pub tool_call_limit: turn_tracker::ToolCallLimit,
     /// How many lines of tool output to show per tool call.
     pub tool_output_lines: turn_tracker::ToolOutputLines,
+    /// Display mode (compact or full).
+    pub display_mode: turn_tracker::DisplayMode,
 }
 
 /// The Telegram chat backend.
@@ -178,6 +180,7 @@ impl TelegramBackend {
         turn_tracker.set_default_tools(config.tools);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
         turn_tracker.set_tool_output_lines(config.tool_output_lines);
+        turn_tracker.set_display_mode(config.display_mode);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         let topics = if config.topics_enabled {
@@ -217,6 +220,7 @@ impl TelegramBackend {
         turn_tracker.set_default_tools(config.tools);
         turn_tracker.set_tool_call_limit(config.tool_call_limit);
         turn_tracker.set_tool_output_lines(config.tool_output_lines);
+        turn_tracker.set_display_mode(config.display_mode);
         let (incoming_tx, incoming_rx) = mpsc::channel(64);
 
         Self {
@@ -1924,6 +1928,7 @@ mod tests {
             voice: false,
             tool_call_limit: turn_tracker::ToolCallLimit::default(),
             tool_output_lines: turn_tracker::ToolOutputLines::default(),
+            display_mode: turn_tracker::DisplayMode::Full,
         }
     }
 
