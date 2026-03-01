@@ -113,6 +113,8 @@ pub struct TopicsManager {
     known_threads: HashSet<i64>,
     /// Track topic names to detect collisions within a run.
     topic_names: HashMap<String, u32>,
+    /// thread_id → current topic name (as last set via API).
+    thread_names: HashMap<i64, String>,
     /// Last scanned `update_id`.
     scan_checkpoint: i64,
     /// Path to the JSON state file.
@@ -150,6 +152,7 @@ impl TopicsManager {
             thread_sessions,
             known_threads: state.known_threads,
             topic_names: HashMap::new(),
+            thread_names: HashMap::new(),
             scan_checkpoint: state.scan_checkpoint,
             state_path,
             pending_deletions: HashMap::new(),
@@ -350,8 +353,8 @@ impl TopicsManager {
     /// Create or reuse a topic for a session.
     ///
     /// If a persisted mapping exists and the topic is still alive in Telegram,
-    /// reuses it (renaming to the current name). Otherwise creates a new one.
-    /// Returns `(thread_id, reused)`.
+    /// reuses it (renaming only if the name changed). Otherwise creates a new
+    /// one.  Returns `(thread_id, reused)`.
     pub async fn create_topic(
         &mut self,
         bot: &BotClient,
@@ -360,12 +363,30 @@ impl TopicsManager {
         // Check for an existing persisted topic.
         if let Some(&thread_id) = self.session_topics.get(&info.session_id) {
             let name = self.topic_name(info).await;
+
+            // If the name hasn't changed, skip the API call entirely.
+            if self
+                .thread_names
+                .get(&thread_id)
+                .is_some_and(|n| n == &name)
+            {
+                self.thread_sessions
+                    .insert(thread_id, info.session_id.clone());
+                debug!(
+                    session_id = %info.session_id,
+                    thread_id,
+                    "reusing existing topic (name unchanged)"
+                );
+                return Ok((thread_id, true));
+            }
+
             // Verify it still exists by attempting a rename.
             match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
                 Ok(_) => {
                     // Topic still alive — reuse it.
                     self.thread_sessions
                         .insert(thread_id, info.session_id.clone());
+                    self.thread_names.insert(thread_id, name.clone());
                     info!(
                         session_id = %info.session_id,
                         thread_id,
@@ -378,6 +399,7 @@ impl TopicsManager {
                     // Name unchanged — topic still exists, reuse it.
                     self.thread_sessions
                         .insert(thread_id, info.session_id.clone());
+                    self.thread_names.insert(thread_id, name);
                     debug!(
                         session_id = %info.session_id,
                         thread_id,
@@ -395,6 +417,7 @@ impl TopicsManager {
                     );
                     self.session_topics.remove(&info.session_id);
                     self.thread_sessions.remove(&thread_id);
+                    self.thread_names.remove(&thread_id);
                     self.known_threads.remove(&thread_id);
                 }
             }
@@ -410,6 +433,7 @@ impl TopicsManager {
             .insert(info.session_id.clone(), thread_id);
         self.thread_sessions
             .insert(thread_id, info.session_id.clone());
+        self.thread_names.insert(thread_id, name);
         self.known_threads.insert(thread_id);
 
         self.save_state();
@@ -426,6 +450,7 @@ impl TopicsManager {
         };
 
         self.thread_sessions.remove(&thread_id);
+        self.thread_names.remove(&thread_id);
         self.known_threads.remove(&thread_id);
         self.save_state();
 
@@ -588,18 +613,35 @@ impl TopicsManager {
     }
 
     /// Rename a topic when session info changes.
+    ///
+    /// Skips the API call if the name already matches what we last set.
     pub async fn rename_topic(&mut self, bot: &BotClient, info: &SessionInfo) -> Result<()> {
         let Some(&thread_id) = self.session_topics.get(&info.session_id) else {
             return Ok(());
         };
 
         let name = self.topic_name(info).await;
+
+        if self
+            .thread_names
+            .get(&thread_id)
+            .is_some_and(|n| n == &name)
+        {
+            return Ok(());
+        }
+
         info!(session_id = %info.session_id, thread_id, new_name = %name, "renaming topic");
 
         match bot.edit_forum_topic(self.chat_id, thread_id, &name).await {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                self.thread_names.insert(thread_id, name);
+                Ok(())
+            }
             // Name unchanged — not an error.
-            Err(e) if e.to_string().contains("TOPIC_NOT_MODIFIED") => Ok(()),
+            Err(e) if e.to_string().contains("TOPIC_NOT_MODIFIED") => {
+                self.thread_names.insert(thread_id, name);
+                Ok(())
+            }
             Err(e) => Err(e),
         }
     }
