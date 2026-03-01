@@ -345,7 +345,11 @@ impl TopicsManager {
             }
         };
 
-        let full_base = format!("{} {base}", self.topic_icon);
+        let full_base = if self.topic_icon.is_empty() {
+            base.clone()
+        } else {
+            format!("{} {base}", self.topic_icon)
+        };
 
         let count = self.topic_names.entry(base).or_insert(0);
         *count += 1;
@@ -646,7 +650,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_topic_name_with_session_name() {
-        let mut mgr = TopicsManager::new(-1001234, "📎".to_owned(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: Some("myproject".to_owned()),
@@ -656,12 +660,12 @@ mod tests {
             streaming: false,
             partial_text: None,
         };
-        assert_eq!(mgr.topic_name(&info).await, "📎 myproject");
+        assert_eq!(mgr.topic_name(&info).await, "myproject");
     }
 
     #[tokio::test]
     async fn test_topic_name_from_cwd() {
-        let mut mgr = TopicsManager::new(-1001234, "📎".to_owned(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
         let info = SessionInfo {
             session_id: "abc123".to_owned(),
             session_name: None,
@@ -671,12 +675,12 @@ mod tests {
             streaming: false,
             partial_text: None,
         };
-        assert_eq!(mgr.topic_name(&info).await, "📎 foo");
+        assert_eq!(mgr.topic_name(&info).await, "foo");
     }
 
     #[tokio::test]
     async fn test_topic_name_collision() {
-        let mut mgr = TopicsManager::new(-1001234, "📎".to_owned(), test_state_path());
+        let mut mgr = TopicsManager::new(-1001234, String::new(), test_state_path());
         let info1 = SessionInfo {
             session_id: "aaa".to_owned(),
             session_name: Some("myproject".to_owned()),
@@ -695,7 +699,22 @@ mod tests {
             streaming: false,
             partial_text: None,
         };
-        assert_eq!(mgr.topic_name(&info1).await, "📎 myproject");
-        assert_eq!(mgr.topic_name(&info2).await, "📎 myproject (2)");
+        assert_eq!(mgr.topic_name(&info1).await, "myproject");
+        assert_eq!(mgr.topic_name(&info2).await, "myproject (2)");
+    }
+
+    #[tokio::test]
+    async fn test_topic_name_with_icon_prefix() {
+        let mut mgr = TopicsManager::new(-1001234, "🤖".to_owned(), test_state_path());
+        let info = SessionInfo {
+            session_id: "abc123".to_owned(),
+            session_name: Some("myproject".to_owned()),
+            cwd: "/home/user/code".to_owned(),
+            model: None,
+            history: vec![],
+            streaming: false,
+            partial_text: None,
+        };
+        assert_eq!(mgr.topic_name(&info).await, "🤖 myproject");
     }
 }

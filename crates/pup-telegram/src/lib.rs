@@ -1118,8 +1118,10 @@ impl TelegramBackend {
                     continue;
                 }
 
-                // Check for forum_topic_created service messages with our icon.
-                if let Some(ref ftc) = msg.forum_topic_created
+                // Check for forum_topic_created service messages with our icon prefix.
+                // When no icon is configured, skip discovery — rely on persisted state.
+                if !topic_icon.is_empty()
+                    && let Some(ref ftc) = msg.forum_topic_created
                     && ftc.name.starts_with(topic_icon)
                     && let Some(thread_id) = msg.message_thread_id
                 {

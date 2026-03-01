@@ -295,7 +295,7 @@ fn default_true() -> bool {
 }
 
 fn default_topic_icon() -> String {
-    "📎".to_owned()
+    String::new()
 }
 
 fn default_max_message_length() -> usize {
@@ -455,7 +455,7 @@ enabled = true
 [backends.telegram.topics]
 enabled = true
 supergroup_id = -1001234567890
-topic_icon = "📎"
+# topic_icon = "📎"  # optional prefix for topic names (empty by default)
 
 [backends.telegram.display]
 max_message_length = 3500
